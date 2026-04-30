@@ -26,6 +26,7 @@ bench/format-shape/
   scripts/run_bcftools_bench.sh bcftools threaded timing runner
   scripts/run_bcftools_command_bench.sh broader bcftools command runner
   scripts/run_bcftools_command_bench_stream.sh checksum-only large-output runner
+  scripts/run_bcftools_ad_hoc_bench.sh repeat-capable checksum runner
   results/                   generated timing logs and BCF outputs
 ```
 
@@ -246,6 +247,35 @@ timings.tsv   name, command, threads, mode, real/user/sys
 checks.tsv    baseline-vs-plan cmp status, including skipped_no_samples
 commands.tsv  command descriptions captured with the result directory
 ```
+
+Run repeatable ad hoc bcftools operations on the CCDG 10k slice:
+
+```sh
+BCFTOOLS=/path/to/bcftools \
+OUTDIR=bench/format-shape/large/results-bcftools-ccdg10k-ad-hoc \
+REPS=5 \
+  bash bench/format-shape/scripts/run_bcftools_ad_hoc_bench.sh
+```
+
+The ad hoc runner streams every command through `cksum`, alternates
+baseline/planned order across repetitions, and records:
+
+```text
+timings.tsv   mean-ready raw real/user/sys rows for each repetition
+checks.tsv    baseline-vs-plan checksum status for each repetition
+checksums.tsv output checksums and byte counts
+metadata.tsv  input, binary, sample, and repeat metadata
+```
+
+The latest local CCDG 10k ad hoc run is recorded in:
+
+```text
+bench/format-shape/large/results-bcftools-ccdg10k-ad-hoc/summary.md
+```
+
+It covered full BCF conversion, two-sample conversion, site-only view/query,
+two-sample and all-sample GT queries, `bcftools stats`, and a two-sample
+GT-expression filter.  All 40 streamed baseline-vs-plan comparisons were `ok`.
 
 For very large inputs, use the streaming checksum variant.  It runs the same
 command families but pipes output through `cksum` and compares checksums instead
