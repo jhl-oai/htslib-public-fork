@@ -248,7 +248,7 @@ checks.tsv    baseline-vs-plan cmp status, including skipped_no_samples
 commands.tsv  command descriptions captured with the result directory
 ```
 
-Run repeatable ad hoc bcftools operations on the CCDG 10k slice:
+Run repeatable ad hoc bcftools operations on a single input:
 
 ```sh
 BCFTOOLS=/path/to/bcftools \
@@ -264,18 +264,32 @@ baseline/planned order across repetitions, and records:
 timings.tsv   mean-ready raw real/user/sys rows for each repetition
 checks.tsv    baseline-vs-plan checksum status for each repetition
 checksums.tsv output checksums and byte counts
-metadata.tsv  input, binary, sample, and repeat metadata
+metadata.tsv  input, binary, sample, repeat, thread, and resume metadata
 ```
 
-The latest local CCDG 10k ad hoc run is recorded in:
+Set `THREADS_LIST="0 2 4"` to run `bcftools view` command shapes with
+`--threads 2` and `--threads 4` in addition to unthreaded mode.  Query and stats
+commands remain unthreaded and are recorded with `threads=0`.  If a long run is
+interrupted, rerun the same command with `RESUME=1`; completed mode rows are
+left intact and only missing rows are appended.
+
+The latest local threaded ad hoc runs are recorded in:
+
+```text
+bench/format-shape/large/results-bcftools-ccdg10k-ad-hoc-threaded/summary.md
+bench/format-shape/large/results-bcftools-1000g-gt-ad-hoc-threaded/summary.md
+```
+
+They cover full BCF conversion, two-sample conversion, site-only view/query,
+two-sample and all-sample GT queries, `bcftools stats`, and a two-sample
+GT-expression filter.  Each threaded result set has 80 streamed
+baseline-vs-plan comparisons, all `ok`.
+
+The earlier unthreaded CCDG 10k run is retained in:
 
 ```text
 bench/format-shape/large/results-bcftools-ccdg10k-ad-hoc/summary.md
 ```
-
-It covered full BCF conversion, two-sample conversion, site-only view/query,
-two-sample and all-sample GT queries, `bcftools stats`, and a two-sample
-GT-expression filter.  All 40 streamed baseline-vs-plan comparisons were `ok`.
 
 For very large inputs, use the streaming checksum variant.  It runs the same
 command families but pipes output through `cksum` and compares checksums instead
