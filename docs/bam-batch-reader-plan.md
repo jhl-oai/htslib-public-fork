@@ -127,6 +127,30 @@ the tiny highcov/ONT slices.  It now clears the local "not slower than BGZF
 The next step is a real tool-facing batch consumer that can convert this
 internal record-view surface into end-to-end samtools speedups.
 
+## Samtools Consumer Experiment
+
+A sibling `samtools` branch, `feature/bam-batch-reader-consumer`, adds an
+opt-in `samtools view -c` batch consumer compiled with
+`HTS_BAM_BATCH_READER_CONSUMER` and run under `HTS_BAM_BATCH_READER=1`.
+It only handles streaming BAM count mode with simple flag/MAPQ filters; complex
+filters and output modes fall back to the existing `sam_read1()` path.
+
+Median-of-five local timings from `/tmp/samtools_batch_view_bench.tsv`:
+
+```text
+samtools view -c, lower is better
+
+Input                         BGZF -@1  Batch -@1  BGZF -@4  Batch -@4  BGZF -@8  Batch -@8
+HG00096.exome.chr20.bam          0.59s      0.57s      0.28s      0.18s      0.28s      0.15s
+HG00096.lowcov.chr20_10-20Mb     0.16s      0.16s      0.07s      0.06s      0.07s      0.05s
+HG00096.highcov.chr20_10-11Mb    0.22s      0.21s      0.06s      0.06s      0.05s      0.04s
+HG002.ont_ul.chr20_10-10.2Mb     0.04s      0.05s      0.02s      0.02s      0.01s      0.02s
+```
+
+The end-to-end count consumer is neutral at one thread, faster on the larger
+short-read slices with `-@`, and still dominated by timing noise on the tiny
+ONT slice.
+
 ## Benchmark Gate
 
 Compare the batch consumer against serial `sam_read1()`, existing BGZF `-@`,
