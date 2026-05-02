@@ -1452,7 +1452,7 @@ int bgzf_decode_block_data(BGZF *fp, bgzf_block_data_t *block)
     size_t dlen = BGZF_MAX_BLOCK_SIZE;
     int ret;
 
-    if (!fp || !block || block->hit_eof)
+    if (!block || block->hit_eof)
         return block && block->hit_eof ? 0 : -1;
 
     crc = le_to_u32(block->comp_data + block->comp_len - 8);
@@ -1460,7 +1460,8 @@ int bgzf_decode_block_data(BGZF *fp, bgzf_block_data_t *block)
                           block->comp_data + 18, block->comp_len - 18,
                           crc);
     if (ret != 0) {
-        fp->errcode |= BGZF_ERR_ZLIB;
+        if (fp)
+            fp->errcode |= BGZF_ERR_ZLIB;
         block->errcode = BGZF_ERR_ZLIB;
         hts_log_debug("Inflate block operation failed for "
                       "block at offset %"PRId64": %s",
@@ -1469,6 +1470,19 @@ int bgzf_decode_block_data(BGZF *fp, bgzf_block_data_t *block)
     }
 
     block->uncomp_len = (int)dlen;
+    return 0;
+}
+
+int bgzf_block_data_update_index(BGZF *fp, bgzf_block_data_t *block)
+{
+    if (!fp || !block)
+        return -1;
+    fp->last_block_eof = (block->uncomp_len == 0);
+    if (block->uncomp_len && fp->idx_build_otf) {
+        if (bgzf_index_add_block(fp) < 0)
+            return -1;
+        fp->idx->ublock_addr += block->uncomp_len;
+    }
     return 0;
 }
 
@@ -1484,13 +1498,10 @@ int bgzf_read_block_data(BGZF *fp, bgzf_block_data_t *block)
             return 0;
         if (bgzf_decode_block_data(fp, block) < 0)
             return -1;
-        fp->last_block_eof = (block->uncomp_len == 0);
+        if (bgzf_block_data_update_index(fp, block) < 0)
+            return -1;
         if (block->uncomp_len == 0)
             continue;
-        if (fp->idx_build_otf) {
-            bgzf_index_add_block(fp);
-            fp->idx->ublock_addr += block->uncomp_len;
-        }
         return 0;
     }
 }

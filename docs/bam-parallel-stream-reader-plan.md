@@ -127,16 +127,55 @@ an experiment rather than a product feature.
   record.
 - Added non-strict fallback coverage for the case where stream-reader activation
   declines because BGZF threading is already active.
+- Added ordered parallel BGZF block decompression behind the same
+  `HTS_BAM_STREAM_READER=1` opt-in.  `hts_set_threads()` creates one
+  reader-owned pool; `HTS_OPT_THREAD_POOL` borrows the caller's pool; neither
+  path creates BGZF `fp->mt`.
+- Compressed BGZF reads remain on the caller thread.  Workers only inflate
+  independent BGZF blocks into per-job buffers; the ordered drain is the only
+  code that updates visible `BGZF` error/index/position state.
+- Added `HTS_BAM_STREAM_PARSE=1` as a separate experimental gate for parse
+  batches.  Initial parse batches were correct but slower than current BGZF
+  `-@` because they copy raw frame bytes and allocate decoded `bam1_t` records
+  before moving them into the caller's `bam1_t`.
 
 Verification so far:
 
 ```sh
 make -j4 libhts.a test/sam
 ./test/sam
+./test/test_bgzf test/bgziptest.txt
 ./test/test_view -p /tmp/htslib_stream_base.sam DATA/HG00096.highcov.chr20_10-11Mb.bam
 HTS_BAM_STREAM_READER=1 HTS_BAM_STREAM_READER_REQUIRE=1 \
   HTS_BAM_STREAM_READER_CHUNK=7 \
   ./test/test_view -p /tmp/htslib_stream_on.sam DATA/HG00096.highcov.chr20_10-11Mb.bam
 cmp /tmp/htslib_stream_base.sam /tmp/htslib_stream_on.sam
+HTS_BAM_STREAM_READER=1 HTS_BAM_STREAM_READER_REQUIRE=1 \
+  ./test/test_view -@4 -p /tmp/htslib_stream_threaded.sam DATA/HG00096.highcov.chr20_10-11Mb.bam
+cmp /tmp/htslib_stream_base.sam /tmp/htslib_stream_threaded.sam
+HTS_BAM_STREAM_READER=1 HTS_BAM_STREAM_READER_REQUIRE=1 \
+  HTS_BAM_STREAM_PARSE=1 \
+  ./test/test_view -@4 -p /tmp/htslib_stream_parse.sam DATA/HG00096.highcov.chr20_10-11Mb.bam
+cmp /tmp/htslib_stream_base.sam /tmp/htslib_stream_parse.sam
 git diff --check
 ```
+
+Smoke benchmark notes on `HG00096.exome.chr20.bam` with `test_view -B`:
+
+- Single-run smoke on this checkout: BGZF `-@4` 0.27s, stream `-@4`
+  0.26s, parse `-@4` 0.37s; BGZF `-@8` 0.27s, stream `-@8` 0.28s,
+  parse `-@8` 0.35s.
+- Parallel BGZF inflate alone is roughly at parity in this slice, but not a
+  product-level win yet.
+- The first parse-batch implementation is slower and should stay experimental
+  until it can avoid raw frame copies and per-record allocation churn.
+
+Next likely useful parse design:
+
+- Frame records as references into ordered decompressed block buffers plus a
+  small carry buffer, instead of copying every raw frame into a parse-job byte
+  buffer.
+- Let parse jobs own the decompressed block results they reference, then move
+  parsed `bam1_t` payloads into the caller on ordered drain.
+- Keep the current `HTS_BAM_STREAM_PARSE=1` implementation as a correctness
+  scaffold, not as the product path.
