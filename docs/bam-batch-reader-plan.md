@@ -120,23 +120,40 @@ make test
 git diff --check
 ```
 
-Repeated median-of-five benchmark notes from `/tmp/bam_batch_bench.tsv`:
+Repeated median-of-five benchmark notes from the local BAM corpus:
 
 ```text
 test_view -B, lower is better
 
-Input                         BGZF -@4  Batch -@4  BGZF -@8  Batch -@8
-HG00096.exome.chr20.bam          0.28s      0.20s      0.28s      0.16s
-HG00096.lowcov.chr20_10-20Mb     0.09s      0.06s      0.08s      0.06s
-HG00096.highcov.chr20_10-11Mb    0.07s      0.07s      0.06s      0.06s
-HG002.ont_ul.chr20_10-10.2Mb     0.03s      0.03s      0.02s      0.02s
+Input                         BGZF -@1  Batch -@1  BGZF -@4  Batch -@4  BGZF -@8  Batch -@8
+HG00096.exome.chr20.bam          0.60s      0.59s      0.25s      0.18s      0.25s      0.16s
+HG00096.lowcov.chr20_10-20Mb     0.16s      0.17s      0.07s      0.05s      0.07s      0.05s
+HG00096.highcov.chr20_10-11Mb    0.21s      0.21s      0.06s      0.06s      0.05s      0.04s
+HG002.ont_ul.chr20_10-10.2Mb     0.05s      0.05s      0.01s      0.02s      0.01s      0.01s
 ```
 
 The current slice is faster on the medium short-read workloads and neutral on
-the tiny highcov/ONT slices.  It clears the local "not slower than BGZF `-@`"
-benchmark sweep, but only the larger exome slice reaches roughly 1.5x.  Fusing
-header TID validation into descriptor construction removes the remaining
-validation pass over views, but did not materially move this local benchmark.
+the tiny highcov/ONT slices.  The larger exome slice reaches roughly 1.5x at
+`-@8`, while the tiny ONT slice remains timing-noise dominated and can miss a
+strict "not slower" gate at `-@4`.
+
+The previous transparent stream/parse prototype on `feature/bam-throughput-product`
+was benchmarked with the same `test_view -B` shape:
+
+```text
+test_view -B old stream/parse prototype, lower is better
+
+Input                         BGZF -@1  Stream -@1  BGZF -@4  Stream -@4  BGZF -@8  Stream -@8
+HG00096.exome.chr20.bam          0.63s       0.68s      0.25s       0.23s      0.25s       0.23s
+HG00096.lowcov.chr20_10-20Mb     0.17s       0.19s      0.07s       0.07s      0.07s       0.07s
+HG00096.highcov.chr20_10-11Mb    0.23s       0.25s      0.07s       0.09s      0.05s       0.08s
+HG002.ont_ul.chr20_10-10.2Mb     0.05s       0.05s      0.01s       0.02s      0.01s       0.02s
+```
+
+That comparison preserves the earlier conclusion: transparent `sam_read1()`
+parallel parsing does not compose cleanly with the existing one-record-at-a-time
+materialization contract, so the batch reader is the better direction for
+tool-facing throughput work.
 
 ## Samtools Consumer Experiment
 
