@@ -98,6 +98,13 @@ static inline size_t sam_bam_batch_record_aux_len(
 int sam_bam_read_batch(htsFile *fp, sam_hdr_t *h, bam_batch_t *batch);
 void sam_bam_batch_destroy(bam_batch_t *batch);
 int sam_bam_batch_record_to_bam1(const bam_batch_record_t *record, bam1_t *bam);
+// Computes CIGAR query length from a batch-lifetime record view.  If query_len
+// is NULL, this only validates decode-sensitive CIGAR state.  Long-CIGAR CG
+// candidates are materialized into scratch, which must be non-NULL for those
+// records and may be overwritten.
+int sam_bam_batch_record_query_len(const bam_batch_record_t *record,
+                                   bam1_t *scratch, int include_hard_clip,
+                                   hts_pos_t *query_len);
 
 // Fastq state
 int fastq_state_set(samFile *fp, enum hts_fmt_option opt, ...);

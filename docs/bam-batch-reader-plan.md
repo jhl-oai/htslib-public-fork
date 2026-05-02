@@ -91,6 +91,9 @@ reader:
 - `sam_internal.h` also provides record-view accessors for qname, CIGAR, seq,
   qual, and aux offsets, allowing simple consumers to evaluate filters beyond
   core flag/MAPQ fields while still avoiding full materialization.
+- `sam_bam_batch_record_query_len()` computes query length directly from raw
+  record views, selectively materializing long-CIGAR `CG` candidates into a
+  caller-provided scratch `bam1_t` to preserve normal decode semantics.
 - Descriptor construction is fused into the frame scan for batch reads, so the
   batch path no longer scans each raw frame once to count and again to build
   record views.
@@ -150,9 +153,9 @@ Median-of-five local timings from `/tmp/samtools_batch_view_bench.tsv`:
 samtools view -c, lower is better
 
 Input                         BGZF -@1  Batch -@1  BGZF -@4  Batch -@4  BGZF -@8  Batch -@8
-HG00096.exome.chr20.bam          0.60s      0.62s      0.28s      0.21s      0.28s      0.18s
-HG00096.lowcov.chr20_10-20Mb     0.16s      0.17s      0.07s      0.06s      0.08s      0.05s
-HG00096.highcov.chr20_10-11Mb    0.22s      0.22s      0.06s      0.06s      0.05s      0.05s
+HG00096.exome.chr20.bam          0.60s      0.62s      0.27s      0.20s      0.28s      0.19s
+HG00096.lowcov.chr20_10-20Mb     0.17s      0.17s      0.07s      0.06s      0.08s      0.05s
+HG00096.highcov.chr20_10-11Mb    0.22s      0.22s      0.06s      0.06s      0.05s      0.04s
 HG002.ont_ul.chr20_10-10.2Mb     0.05s      0.05s      0.02s      0.02s      0.01s      0.02s
 ```
 
@@ -169,9 +172,9 @@ samtools view -c -m 75, lower is better
 
 Input                         BGZF -@4  Batch -@4  BGZF -@8  Batch -@8
 HG00096.exome.chr20.bam          0.28s      0.20s      0.28s      0.19s
-HG00096.lowcov.chr20_10-20Mb     0.07s      0.05s      0.07s      0.06s
+HG00096.lowcov.chr20_10-20Mb     0.07s      0.06s      0.07s      0.05s
 HG00096.highcov.chr20_10-11Mb    0.06s      0.06s      0.05s      0.05s
-HG002.ont_ul.chr20_10-10.2Mb     0.01s      0.02s      0.01s      0.02s
+HG002.ont_ul.chr20_10-10.2Mb     0.02s      0.02s      0.01s      0.02s
 ```
 
 This extends the fast path beyond core-only predicates while keeping the same

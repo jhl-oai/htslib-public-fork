@@ -5109,6 +5109,66 @@ int sam_bam_batch_record_to_bam1(const bam_batch_record_t *record, bam1_t *bam)
                             block_len, record->frame + 4);
 }
 
+static int bam_batch_record_cg_candidate(const bam_batch_record_t *record)
+{
+    const uint8_t *cigar = sam_bam_batch_record_cigar(record);
+    uint32_t first;
+
+    if (record->core.n_cigar == 0 || record->core.tid < 0 ||
+        record->core.pos < 0)
+        return 0;
+    first = le_to_u32(cigar);
+    return first == (((uint32_t)record->core.l_qseq << BAM_CIGAR_SHIFT) |
+                     BAM_CSOFT_CLIP);
+}
+
+int sam_bam_batch_record_query_len(const bam_batch_record_t *record,
+                                   bam1_t *scratch, int include_hard_clip,
+                                   hts_pos_t *query_len)
+{
+    const uint8_t *cigar;
+    hts_pos_t cigar_qlen = 0, filter_qlen = 0;
+    int is_cg, k, n_cigar;
+
+    if (!record)
+        return -1;
+
+    is_cg = bam_batch_record_cg_candidate(record);
+    if (is_cg) {
+        if (!scratch || sam_bam_batch_record_to_bam1(record, scratch) < 0)
+            return -1;
+        cigar = (const uint8_t *)bam_get_cigar(scratch);
+        n_cigar = scratch->core.n_cigar;
+    } else {
+        cigar = sam_bam_batch_record_cigar(record);
+        n_cigar = record->core.n_cigar;
+    }
+
+    for (k = 0; k < n_cigar; k++) {
+        uint32_t c = is_cg ? bam_get_cigar(scratch)[k]
+                           : le_to_u32(cigar + ((size_t)k << 2));
+        int op = bam_cigar_op(c);
+
+        if (bam_cigar_type(op) & 1)
+            cigar_qlen += bam_cigar_oplen(c);
+        if (query_len && ((bam_cigar_type(op) & 1) ||
+                          (include_hard_clip && op == BAM_CHARD_CLIP)))
+            filter_qlen += bam_cigar_oplen(c);
+    }
+
+    if (record->core.n_cigar > 0 && record->core.l_qseq > 0 &&
+        !(record->core.flag & BAM_FUNMAP) &&
+        cigar_qlen != record->core.l_qseq) {
+        int qname_len = record->core.l_qname > 0 ? record->core.l_qname - 1 : 0;
+        hts_log_error("CIGAR and query sequence lengths differ for %.*s",
+                      qname_len, sam_bam_batch_record_qname(record));
+        return -1;
+    }
+    if (query_len)
+        *query_len = filter_qlen;
+    return 0;
+}
+
 static bam_stream_reader_t *bam_batch_reader_get(htsFile *fp)
 {
     if (!fp || !fp->is_bgzf || !fp->fp.bgzf)

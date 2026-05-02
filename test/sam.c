@@ -2574,6 +2574,7 @@ static void read_bam_batch_hash(const char *path, int hts_threads,
             const uint8_t *qual = sam_bam_batch_record_qual(rec);
             const uint8_t *aux = sam_bam_batch_record_aux(rec);
             size_t aux_len = sam_bam_batch_record_aux_len(rec);
+            hts_pos_t batch_qlen = 0, materialized_qlen = 0;
             int k;
 
             VERIFY(rec->frame >= batch.data &&
@@ -2616,6 +2617,17 @@ static void read_bam_batch_hash(const char *path, int hts_threads,
                        memcmp(aux, bam_get_aux(materialized), aux_len) == 0,
                        "BAM batch aux differs after materialization");
             }
+            VERIFY(sam_bam_batch_record_query_len(rec, materialized, 1,
+                                                  &batch_qlen) >= 0,
+                   "failed to compute BAM batch query length");
+            for (k = 0; k < materialized->core.n_cigar; k++) {
+                uint32_t c = bam_get_cigar(materialized)[k];
+                if ((bam_cigar_type(bam_cigar_op(c)) & 1) ||
+                    bam_cigar_op(c) == BAM_CHARD_CLIP)
+                    materialized_qlen += bam_cigar_oplen(c);
+            }
+            VERIFY(batch_qlen == materialized_qlen,
+                   "BAM batch query length differs after materialization");
             materialized_hash =
                 ordered_reader_record_hash(materialized_hash, materialized);
             materialized_count++;
