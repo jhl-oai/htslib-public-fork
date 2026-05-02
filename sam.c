@@ -35,6 +35,8 @@ DEALINGS IN THE SOFTWARE.  */
 #include <assert.h>
 #include <signal.h>
 #include <inttypes.h>
+#include <limits.h>
+#include <pthread.h>
 #include <unistd.h>
 #include <regex.h>
 
@@ -842,8 +844,8 @@ int bam_read1(BGZF *fp, bam1_t *b)
     if (bam_tag2cigar(b, 0, 0) < 0)
         return -4;
 
-    // TODO: consider making this conditional
-    if (c->n_cigar > 0) { // recompute "bin" and check CIGAR-qlen consistency
+    if (c->n_cigar > 0) {
+        // recompute "bin" and check CIGAR-qlen consistency
         hts_pos_t rlen, qlen;
         bam_cigar2rqlens(c->n_cigar, bam_get_cigar(b), &rlen, &qlen);
         if ((b->core.flag & BAM_FUNMAP) || rlen == 0) rlen = 1;
@@ -927,6 +929,149 @@ int bam_write1(BGZF *fp, const bam1_t *b)
     return ok? 4 + block_len : -1;
 }
 
+static int bgzf_raw_read_exact(BGZF *fp, void *data, size_t length)
+{
+    uint8_t *dst = (uint8_t *) data;
+
+    while (length > 0) {
+        ssize_t n = bgzf_raw_read(fp, dst, length);
+        if (n <= 0) {
+            if (n == 0)
+                errno = EIO;
+            return -1;
+        }
+        dst += n;
+        length -= n;
+    }
+    return 0;
+}
+
+static int bam_bgzf_header_is_valid(const uint8_t header[18])
+{
+    return header[0] == 31 && header[1] == 139 && header[2] == 8
+        && (header[3] & 4) != 0
+        && le_to_u16(header + 10) == 6
+        && header[12] == 'B' && header[13] == 'C'
+        && le_to_u16(header + 14) == 2;
+}
+
+static int bam_bgzf_is_eof_marker(const uint8_t *block, uint16_t block_len)
+{
+    static const uint8_t eof_marker[28] = {
+        0x1f, 0x8b, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0xff, 0x06, 0x00, 0x42, 0x43, 0x02, 0x00,
+        0x1b, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00
+    };
+
+    return block_len == sizeof(eof_marker) &&
+        memcmp(block, eof_marker, sizeof(eof_marker)) == 0;
+}
+
+int sam_bam_raw_copy_blocks(htsFile *in, htsFile *out)
+{
+    const size_t buf_size = 1024 * 1024;
+    BGZF *ib = NULL, *ob = NULL;
+    uint8_t *buf = NULL;
+    int ret = -1;
+
+    if (!in || !out || in->is_write || !out->is_write ||
+        in->format.format != bam || out->format.format != bam ||
+        !in->is_bgzf || !out->is_bgzf || !in->fp.bgzf || !out->fp.bgzf) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    ib = in->fp.bgzf;
+    ob = out->fp.bgzf;
+    if (ib->mt || ob->mt || ib->is_gzip || ob->is_gzip ||
+        !ib->is_compressed || !ob->is_compressed ||
+        ob->compress_level != Z_DEFAULT_COMPRESSION ||
+        out->idx || ob->idx || ob->idx_build_otf) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (ib->block_offset < ib->block_length) {
+        int available = ib->block_length - ib->block_offset;
+        uint8_t *src = (uint8_t *) ib->uncompressed_block + ib->block_offset;
+
+        if (bgzf_write(ob, src, available) != available)
+            return -1;
+        ib->block_offset = ib->block_length;
+    }
+
+    if (bgzf_flush(ob) < 0)
+        return -1;
+
+    buf = malloc(BGZF_MAX_BLOCK_SIZE > buf_size ? BGZF_MAX_BLOCK_SIZE : buf_size);
+    if (!buf)
+        return -1;
+
+    for (;;) {
+        uint8_t header[18];
+        uint16_t block_len;
+        uint32_t isize;
+        ssize_t n = bgzf_raw_read(ib, header, sizeof(header));
+
+        if (n < 0) {
+            break;
+        } else if (n == 0) {
+            hts_log_error("BGZF EOF marker is absent in raw BAM block copy");
+            errno = EIO;
+            break;
+        } else if (n != sizeof(header)) {
+            hts_log_error("Truncated BGZF header in raw BAM block copy");
+            errno = EIO;
+            break;
+        }
+        if (!bam_bgzf_header_is_valid(header)) {
+            hts_log_error("Invalid BGZF header in raw BAM block copy");
+            errno = EFTYPE;
+            break;
+        }
+
+        block_len = le_to_u16(header + 16) + 1;
+        if (block_len < 26) {
+            hts_log_error("Invalid BGZF block length in raw BAM block copy");
+            errno = EFTYPE;
+            break;
+        }
+
+        memcpy(buf, header, sizeof(header));
+        if (bgzf_raw_read_exact(ib, buf + sizeof(header),
+                                block_len - sizeof(header)) < 0) {
+            hts_log_error("Truncated BGZF block in raw BAM block copy");
+            break;
+        }
+
+        isize = le_to_u32(buf + block_len - 4);
+        if (isize == 0) {
+            uint8_t trailing;
+
+            if (!bam_bgzf_is_eof_marker(buf, block_len)) {
+                hts_log_error("Invalid BGZF EOF marker in raw BAM block copy");
+                errno = EFTYPE;
+                break;
+            }
+            n = bgzf_raw_read(ib, &trailing, 1);
+            if (n == 0) {
+                ret = 0;
+            } else if (n > 0) {
+                hts_log_error("Trailing data after BGZF EOF marker in raw BAM block copy");
+                errno = EFTYPE;
+            }
+            break;
+        }
+
+        if (bgzf_raw_write(ob, buf, block_len) != block_len)
+            break;
+    }
+
+    free(buf);
+    return ret;
+}
+
 /*
  * Write a BAM file and append to the in-memory index simultaneously.
  */
@@ -937,6 +1082,7 @@ static int bam_write_idx1(htsFile *fp, const sam_hdr_t *h, const bam1_t *b) {
         return bam_write1(bfp, b);
 
     uint32_t block_len = b->l_data - b->core.l_extranul + 32;
+    if (b->core.n_cigar > 0xffff) block_len += 16;
     if (bgzf_flush_try(bfp, 4 + block_len) < 0)
         return -1;
     if (!bfp->mt)
@@ -3764,6 +3910,725 @@ int sam_set_threads(htsFile *fp, int nthreads) {
     return 0;
 }
 
+/*
+ * Experimental ordered BAM partition reader.
+ *
+ * This is deliberately internal and opt-in.  It uses index-derived virtual
+ * offsets to split a coordinate-sorted BAM into non-overlapping file spans,
+ * parses those spans on worker file handles, and drains completed spans in
+ * file-offset order so sam_read1() callers still see one ordered stream.
+ */
+#define BAM_ORDERED_READER_MAGIC 0x626f7264u
+#define BAM_ORDERED_READER_DEFAULT_THREADS 4
+#define BAM_ORDERED_READER_TARGET_JOBS_PER_THREAD 16
+#define BAM_ORDERED_READER_MAX_AHEAD_PER_THREAD 2
+
+typedef struct bam_ordered_job_t {
+    uint64_t beg;
+    uint64_t end;
+} bam_ordered_job_t;
+
+typedef struct bam_ordered_batch_t {
+    bam1_t *records;
+    int n_records;
+    int m_records;
+} bam_ordered_batch_t;
+
+typedef struct bam_ordered_result_t {
+    int ready;
+    int ret;
+    bam_ordered_batch_t batch;
+} bam_ordered_result_t;
+
+typedef struct bam_ordered_reader_t {
+    uint32_t magic;
+    char *fn;
+    bam_ordered_job_t *jobs;
+    int n_jobs;
+    int next_job;
+    int drain_job;
+    int max_inflight;
+
+    pthread_t *threads;
+    int n_threads;
+    int n_threads_started;
+    int active_workers;
+    int closing;
+    int error;
+
+    bam_ordered_result_t *results;
+    bam_ordered_batch_t curr;
+    int curr_job;
+    int curr_idx;
+
+    pthread_mutex_t mutex;
+    pthread_cond_t result_c;
+    pthread_cond_t space_c;
+} bam_ordered_reader_t;
+
+static int bam_ordered_env_enabled(void)
+{
+    const char *env = getenv("HTS_BAM_ORDERED_READER");
+    return env && *env && strcmp(env, "0") != 0;
+}
+
+static int bam_ordered_env_strict(void)
+{
+    const char *env = getenv("HTS_BAM_ORDERED_READER_REQUIRE");
+    return env && *env && strcmp(env, "0") != 0;
+}
+
+static int bam_ordered_env_threads(void)
+{
+    const char *env = getenv("HTS_BAM_ORDERED_READER_THREADS");
+    char *end = NULL;
+    long n;
+
+    if (!env || !*env)
+        return BAM_ORDERED_READER_DEFAULT_THREADS;
+
+    errno = 0;
+    n = strtol(env, &end, 10);
+    if (errno || end == env || *end || n < 1 || n > INT_MAX / 2)
+        return BAM_ORDERED_READER_DEFAULT_THREADS;
+    return (int)n;
+}
+
+static void bam_ordered_batch_init_record_slots(bam1_t *records, int beg,
+                                                int end)
+{
+    int i;
+
+    for (i = beg; i < end; i++)
+        bam_set_mempolicy(&records[i], BAM_USER_OWNS_STRUCT);
+}
+
+static void bam_ordered_batch_destroy(bam_ordered_batch_t *batch)
+{
+    int i;
+
+    if (!batch)
+        return;
+    if (batch->records) {
+        for (i = 0; i < batch->m_records; i++)
+            bam_destroy1(&batch->records[i]);
+    }
+    free(batch->records);
+    memset(batch, 0, sizeof(*batch));
+}
+
+static int bam_ordered_move1(bam1_t *dst, bam1_t *src)
+{
+    uint32_t dst_policy = bam_get_mempolicy(dst);
+
+    if ((dst_policy & BAM_USER_OWNS_DATA) == 0)
+        free(dst->data);
+
+    dst->core = src->core;
+    dst->id = src->id;
+    dst->data = src->data;
+    dst->l_data = src->l_data;
+    dst->m_data = src->m_data;
+    bam_set_mempolicy(dst, dst_policy & BAM_USER_OWNS_STRUCT);
+
+    src->data = NULL;
+    src->l_data = 0;
+    src->m_data = 0;
+    return 0;
+}
+
+static bam1_t *bam_ordered_batch_next_record(bam_ordered_batch_t *batch)
+{
+    if (batch->n_records == batch->m_records) {
+        int new_m;
+        bam1_t *new_records;
+
+        if (batch->m_records > INT_MAX / 2) {
+            errno = ENOMEM;
+            return NULL;
+        }
+        new_m = batch->m_records ? batch->m_records * 2 : 256;
+        if ((size_t)new_m > SIZE_MAX / sizeof(*new_records)) {
+            errno = ENOMEM;
+            return NULL;
+        }
+
+        new_records = realloc(batch->records,
+                              (size_t)new_m * sizeof(*new_records));
+        if (!new_records) {
+            errno = ENOMEM;
+            return NULL;
+        }
+        memset(new_records + batch->m_records, 0,
+               (size_t)(new_m - batch->m_records) * sizeof(*new_records));
+        bam_ordered_batch_init_record_slots(new_records, batch->m_records,
+                                            new_m);
+        batch->records = new_records;
+        batch->m_records = new_m;
+    }
+
+    return &batch->records[batch->n_records];
+}
+
+static int bam_ordered_uint64_cmp(const void *a, const void *b)
+{
+    uint64_t va = *(const uint64_t *)a;
+    uint64_t vb = *(const uint64_t *)b;
+
+    return va > vb ? 1 : va < vb ? -1 : 0;
+}
+
+static int bam_ordered_append_offset(uint64_t **offsets, int *n_offsets,
+                                     int *m_offsets, uint64_t offset)
+{
+    uint64_t *new_offsets;
+    int new_m;
+
+    if (*n_offsets == *m_offsets) {
+        new_m = *m_offsets ? (*m_offsets > INT_MAX / 2
+                              ? INT_MAX : *m_offsets * 2) : 1024;
+        if (new_m == *m_offsets ||
+            (size_t)new_m > SIZE_MAX / sizeof(*new_offsets)) {
+            errno = ENOMEM;
+            return -1;
+        }
+        new_offsets = realloc(*offsets,
+                              (size_t)new_m * sizeof(*new_offsets));
+        if (!new_offsets) {
+            errno = ENOMEM;
+            return -1;
+        }
+        *offsets = new_offsets;
+        *m_offsets = new_m;
+    }
+
+    (*offsets)[(*n_offsets)++] = offset;
+    return 0;
+}
+
+static uint64_t bam_ordered_voff_block_span(uint64_t beg, uint64_t end)
+{
+    uint64_t beg_block = beg >> 16;
+    uint64_t end_block = end >> 16;
+
+    return end_block > beg_block ? end_block - beg_block : 1;
+}
+
+static int bam_ordered_append_job(bam_ordered_job_t **jobs, int *n_jobs,
+                                  int *m_jobs, uint64_t beg, uint64_t end)
+{
+    bam_ordered_job_t *new_jobs;
+    int new_m;
+
+    if (end <= beg)
+        return 0;
+
+    if (*n_jobs == *m_jobs) {
+        new_m = *m_jobs ? (*m_jobs > INT_MAX / 2 ? INT_MAX : *m_jobs * 2)
+                        : 1024;
+        if (new_m == *m_jobs ||
+            (size_t)new_m > SIZE_MAX / sizeof(*new_jobs)) {
+            errno = ENOMEM;
+            return -1;
+        }
+        new_jobs = realloc(*jobs, (size_t)new_m * sizeof(*new_jobs));
+        if (!new_jobs) {
+            errno = ENOMEM;
+            return -1;
+        }
+        *jobs = new_jobs;
+        *m_jobs = new_m;
+    }
+
+    (*jobs)[*n_jobs].beg = beg;
+    (*jobs)[*n_jobs].end = end;
+    (*n_jobs)++;
+    return 0;
+}
+
+static int bam_ordered_build_offsets(sam_hdr_t *hdr, const hts_idx_t *idx,
+                                     uint64_t **offsets, int *n_offsets)
+{
+    uint64_t *out = NULL;
+    int n = 0, m = 0;
+    int tid, i, j;
+
+    *offsets = NULL;
+    *n_offsets = 0;
+
+    for (tid = 0; tid < sam_hdr_nref(hdr); tid++) {
+        uint64_t *ref_offsets = NULL;
+        int n_ref_offsets = 0;
+
+        if (!hts_idx_ref_has_data(idx, tid))
+            continue;
+        if (hts_idx_get_ref_file_offsets(idx, tid, &ref_offsets,
+                                         &n_ref_offsets) < 0)
+            goto fail;
+        for (i = 0; i < n_ref_offsets; i++) {
+            if (bam_ordered_append_offset(&out, &n, &m,
+                                          ref_offsets[i]) < 0) {
+                free(ref_offsets);
+                goto fail;
+            }
+        }
+        free(ref_offsets);
+    }
+
+    if (n < 2) {
+        free(out);
+        return 1;
+    }
+
+    qsort(out, (size_t)n, sizeof(*out), bam_ordered_uint64_cmp);
+    for (i = 1, j = 0; i < n; i++) {
+        if (out[i] != out[j])
+            out[++j] = out[i];
+    }
+    n = j + 1;
+    if (n < 2) {
+        free(out);
+        return 1;
+    }
+
+    *offsets = out;
+    *n_offsets = n;
+    return 0;
+
+fail:
+    free(out);
+    *offsets = NULL;
+    *n_offsets = 0;
+    return -1;
+}
+
+static int bam_ordered_build_jobs(sam_hdr_t *hdr, const hts_idx_t *idx,
+                                  int n_threads,
+                                  bam_ordered_job_t **jobs, int *n_jobs)
+{
+    uint64_t *offsets = NULL;
+    uint64_t total_span = 0, span_per_job, span;
+    int n_offsets = 0, m_jobs = 0;
+    int64_t target_jobs;
+    int i, ret;
+
+    *jobs = NULL;
+    *n_jobs = 0;
+
+    ret = bam_ordered_build_offsets(hdr, idx, &offsets, &n_offsets);
+    if (ret != 0)
+        return ret;
+
+    for (i = 1; i < n_offsets; i++) {
+        span = bam_ordered_voff_block_span(offsets[i - 1], offsets[i]);
+        if (UINT64_MAX - total_span < span)
+            total_span = UINT64_MAX;
+        else
+            total_span += span;
+    }
+
+    target_jobs = (int64_t)n_threads * BAM_ORDERED_READER_TARGET_JOBS_PER_THREAD;
+    if (target_jobs < 1)
+        target_jobs = 1;
+    span_per_job = total_span / (uint64_t)target_jobs +
+        (total_span % (uint64_t)target_jobs != 0);
+    if (span_per_job < 1)
+        span_per_job = 1;
+
+    for (i = 0; i + 1 < n_offsets;) {
+        int end_i = i + 1;
+        uint64_t start = offsets[i];
+
+        while (end_i + 1 < n_offsets &&
+               bam_ordered_voff_block_span(start, offsets[end_i]) <
+                   span_per_job)
+            end_i++;
+
+        if (bam_ordered_append_job(jobs, n_jobs, &m_jobs, start,
+                                   offsets[end_i]) < 0)
+            goto fail;
+        i = end_i;
+    }
+
+    if (bam_ordered_append_job(jobs, n_jobs, &m_jobs,
+                               offsets[n_offsets - 1], UINT64_MAX) < 0)
+        goto fail;
+
+    free(offsets);
+    return *n_jobs > 0 ? 0 : 1;
+
+fail:
+    free(offsets);
+    free(*jobs);
+    *jobs = NULL;
+    *n_jobs = 0;
+    return -1;
+}
+
+static int bam_ordered_claim_job(bam_ordered_reader_t *reader)
+{
+    int job = -1;
+
+    pthread_mutex_lock(&reader->mutex);
+    while (!reader->closing && !reader->error &&
+           reader->next_job < reader->n_jobs &&
+           reader->next_job >= reader->drain_job + reader->max_inflight)
+        pthread_cond_wait(&reader->space_c, &reader->mutex);
+
+    if (!reader->closing && !reader->error && reader->next_job < reader->n_jobs)
+        job = reader->next_job++;
+    pthread_mutex_unlock(&reader->mutex);
+
+    return job;
+}
+
+static void bam_ordered_set_error(bam_ordered_reader_t *reader)
+{
+    pthread_mutex_lock(&reader->mutex);
+    reader->error = 1;
+    pthread_cond_broadcast(&reader->result_c);
+    pthread_cond_broadcast(&reader->space_c);
+    pthread_mutex_unlock(&reader->mutex);
+}
+
+static int bam_ordered_is_closing(bam_ordered_reader_t *reader)
+{
+    int closing;
+
+    pthread_mutex_lock(&reader->mutex);
+    closing = reader->closing;
+    pthread_mutex_unlock(&reader->mutex);
+    return closing;
+}
+
+static int bam_ordered_complete_job(bam_ordered_reader_t *reader, int job_id,
+                                    bam_ordered_batch_t *batch, int ret)
+{
+    pthread_mutex_lock(&reader->mutex);
+    if (reader->closing) {
+        pthread_mutex_unlock(&reader->mutex);
+        bam_ordered_batch_destroy(batch);
+        return -1;
+    }
+
+    reader->results[job_id].batch = *batch;
+    reader->results[job_id].ret = ret;
+    reader->results[job_id].ready = 1;
+    memset(batch, 0, sizeof(*batch));
+    pthread_cond_broadcast(&reader->result_c);
+    pthread_mutex_unlock(&reader->mutex);
+    return 0;
+}
+
+static void bam_ordered_worker_done(bam_ordered_reader_t *reader)
+{
+    pthread_mutex_lock(&reader->mutex);
+    reader->active_workers--;
+    pthread_cond_broadcast(&reader->result_c);
+    pthread_mutex_unlock(&reader->mutex);
+}
+
+static int bam_ordered_process_job(bam_ordered_reader_t *reader, htsFile *fp,
+                                   sam_hdr_t *hdr,
+                                   const bam_ordered_job_t *job,
+                                   bam_ordered_batch_t *batch)
+{
+    int ret, records_since_close_check = 0;
+
+    if (!fp->is_bgzf || !fp->fp.bgzf) {
+        errno = EINVAL;
+        return -2;
+    }
+    if (bgzf_seek(fp->fp.bgzf, (int64_t)job->beg, SEEK_SET) < 0)
+        return -2;
+
+    while (job->end == UINT64_MAX ||
+           (uint64_t)bgzf_tell(fp->fp.bgzf) < job->end) {
+        bam1_t *rec;
+
+        if (records_since_close_check >= 1024) {
+            records_since_close_check = 0;
+            if (bam_ordered_is_closing(reader))
+                break;
+        }
+
+        rec = bam_ordered_batch_next_record(batch);
+        if (!rec)
+            return -2;
+
+        ret = bam_read1(fp->fp.bgzf, rec);
+        if (ret < 0)
+            return ret == -1 ? 0 : -2;
+
+        if (hdr && (rec->core.tid >= hdr->n_targets || rec->core.tid < -1 ||
+                    rec->core.mtid >= hdr->n_targets || rec->core.mtid < -1)) {
+            errno = ERANGE;
+            return -3;
+        }
+        batch->n_records++;
+        records_since_close_check++;
+    }
+
+    return 0;
+}
+
+static void *bam_ordered_worker_main(void *arg)
+{
+    bam_ordered_reader_t *reader = (bam_ordered_reader_t *)arg;
+    htsFile *fp = NULL;
+    sam_hdr_t *hdr = NULL;
+    int job_id;
+
+    fp = sam_open(reader->fn, "rb");
+    if (!fp)
+        goto fail;
+    hdr = sam_hdr_read(fp);
+    if (!hdr)
+        goto fail;
+
+    while ((job_id = bam_ordered_claim_job(reader)) >= 0) {
+        bam_ordered_batch_t batch = {0};
+        int ret = bam_ordered_process_job(reader, fp, hdr,
+                                          &reader->jobs[job_id], &batch);
+        if (ret < 0) {
+            bam_ordered_batch_destroy(&batch);
+            goto fail;
+        }
+        if (bam_ordered_complete_job(reader, job_id, &batch, ret) < 0)
+            goto done;
+    }
+
+done:
+    sam_hdr_destroy(hdr);
+    if (fp)
+        sam_close(fp);
+    bam_ordered_worker_done(reader);
+    return NULL;
+
+fail:
+    sam_hdr_destroy(hdr);
+    if (fp)
+        sam_close(fp);
+    bam_ordered_set_error(reader);
+    bam_ordered_worker_done(reader);
+    return NULL;
+}
+
+static void bam_ordered_reader_destroy(bam_ordered_reader_t *reader)
+{
+    int i;
+
+    if (!reader)
+        return;
+
+    pthread_mutex_lock(&reader->mutex);
+    reader->closing = 1;
+    pthread_cond_broadcast(&reader->result_c);
+    pthread_cond_broadcast(&reader->space_c);
+    pthread_mutex_unlock(&reader->mutex);
+
+    for (i = 0; i < reader->n_threads_started; i++)
+        pthread_join(reader->threads[i], NULL);
+
+    for (i = 0; i < reader->n_jobs; i++)
+        bam_ordered_batch_destroy(&reader->results[i].batch);
+    bam_ordered_batch_destroy(&reader->curr);
+
+    pthread_cond_destroy(&reader->space_c);
+    pthread_cond_destroy(&reader->result_c);
+    pthread_mutex_destroy(&reader->mutex);
+    free(reader->results);
+    free(reader->threads);
+    free(reader->jobs);
+    free(reader->fn);
+    free(reader);
+}
+
+int sam_bam_state_destroy(htsFile *fp)
+{
+    bam_ordered_reader_t *reader;
+
+    if (!fp || !fp->state)
+        return 0;
+
+    reader = (bam_ordered_reader_t *)fp->state;
+    if (reader->magic != BAM_ORDERED_READER_MAGIC)
+        return 0;
+
+    fp->state = NULL;
+    bam_ordered_reader_destroy(reader);
+    return 0;
+}
+
+static bam_ordered_reader_t *bam_ordered_reader_open(htsFile *fp,
+                                                     sam_hdr_t *hdr)
+{
+    bam_ordered_reader_t *reader = NULL;
+    hts_idx_t *idx = NULL;
+    char *fnidx = NULL;
+    int64_t cur;
+    int n_threads, i;
+    int mutex_init = 0, result_c_init = 0, space_c_init = 0;
+
+    if (!fp || !hdr || !fp->fn || hisremote(fp->fn) || !fp->is_bgzf ||
+        !fp->fp.bgzf || fp->fp.bgzf->is_gzip)
+        return NULL;
+
+    n_threads = bam_ordered_env_threads();
+    if (!hts_idx_check_local(fp->fn, HTS_FMT_BAI, &fnidx))
+        return NULL;
+    idx = sam_index_load2(fp, fp->fn, fnidx);
+    free(fnidx);
+    fnidx = NULL;
+    if (!idx)
+        return NULL;
+
+    reader = calloc(1, sizeof(*reader));
+    if (!reader)
+        goto fail;
+    reader->magic = BAM_ORDERED_READER_MAGIC;
+    reader->curr_job = -1;
+    reader->n_threads = n_threads;
+    reader->max_inflight = n_threads * BAM_ORDERED_READER_MAX_AHEAD_PER_THREAD;
+    if (reader->max_inflight < 1)
+        reader->max_inflight = 1;
+    reader->fn = strdup(fp->fn);
+    if (!reader->fn)
+        goto fail;
+
+    if (bam_ordered_build_jobs(hdr, idx, n_threads, &reader->jobs,
+                               &reader->n_jobs) != 0)
+        goto fail;
+    hts_idx_destroy(idx);
+    idx = NULL;
+
+    if (reader->n_jobs < n_threads) {
+        errno = 0;
+        goto fail;
+    }
+
+    cur = bgzf_tell(fp->fp.bgzf);
+    if (cur < 0 || (uint64_t)cur > reader->jobs[0].beg) {
+        errno = 0;
+        goto fail;
+    }
+
+    reader->results = calloc((size_t)reader->n_jobs,
+                             sizeof(*reader->results));
+    reader->threads = calloc((size_t)n_threads, sizeof(*reader->threads));
+    if (!reader->results || !reader->threads)
+        goto fail;
+
+    if (pthread_mutex_init(&reader->mutex, NULL) != 0)
+        goto fail;
+    mutex_init = 1;
+    if (pthread_cond_init(&reader->result_c, NULL) != 0)
+        goto fail;
+    result_c_init = 1;
+    if (pthread_cond_init(&reader->space_c, NULL) != 0)
+        goto fail;
+    space_c_init = 1;
+
+    for (i = 0; i < n_threads; i++) {
+        pthread_mutex_lock(&reader->mutex);
+        reader->active_workers++;
+        pthread_mutex_unlock(&reader->mutex);
+        if (pthread_create(&reader->threads[i], NULL,
+                           bam_ordered_worker_main, reader) != 0) {
+            pthread_mutex_lock(&reader->mutex);
+            reader->active_workers--;
+            pthread_mutex_unlock(&reader->mutex);
+            goto fail;
+        }
+        reader->n_threads_started++;
+    }
+
+    return reader;
+
+fail:
+    free(fnidx);
+    hts_idx_destroy(idx);
+    if (reader) {
+        if (mutex_init) {
+            pthread_mutex_lock(&reader->mutex);
+            reader->closing = 1;
+            reader->error = 1;
+            if (result_c_init)
+                pthread_cond_broadcast(&reader->result_c);
+            if (space_c_init)
+                pthread_cond_broadcast(&reader->space_c);
+            pthread_mutex_unlock(&reader->mutex);
+        }
+        for (i = 0; i < reader->n_threads_started; i++)
+            pthread_join(reader->threads[i], NULL);
+        if (space_c_init)
+            pthread_cond_destroy(&reader->space_c);
+        if (result_c_init)
+            pthread_cond_destroy(&reader->result_c);
+        if (mutex_init)
+            pthread_mutex_destroy(&reader->mutex);
+        if (reader->results) {
+            int j;
+            for (j = 0; j < reader->n_jobs; j++)
+                bam_ordered_batch_destroy(&reader->results[j].batch);
+        }
+        free(reader->results);
+        free(reader->threads);
+        free(reader->jobs);
+        free(reader->fn);
+        free(reader);
+    }
+    return NULL;
+}
+
+static int bam_ordered_reader_next(bam_ordered_reader_t *reader, bam1_t *b)
+{
+    for (;;) {
+        bam_ordered_result_t *res;
+
+        if (reader->curr_job >= 0 &&
+            reader->curr_idx < reader->curr.n_records) {
+            bam_ordered_move1(b, &reader->curr.records[reader->curr_idx++]);
+            return 0;
+        }
+
+        if (reader->curr_job >= 0) {
+            bam_ordered_batch_destroy(&reader->curr);
+            reader->curr_job = -1;
+            reader->curr_idx = 0;
+            pthread_mutex_lock(&reader->mutex);
+            reader->drain_job++;
+            pthread_cond_broadcast(&reader->space_c);
+            pthread_mutex_unlock(&reader->mutex);
+        }
+
+        pthread_mutex_lock(&reader->mutex);
+        while (!reader->error && reader->drain_job < reader->n_jobs &&
+               !reader->results[reader->drain_job].ready)
+            pthread_cond_wait(&reader->result_c, &reader->mutex);
+
+        if (reader->error) {
+            pthread_mutex_unlock(&reader->mutex);
+            return -2;
+        }
+        if (reader->drain_job >= reader->n_jobs) {
+            pthread_mutex_unlock(&reader->mutex);
+            return -1;
+        }
+
+        res = &reader->results[reader->drain_job];
+        reader->curr = res->batch;
+        reader->curr_job = reader->drain_job;
+        reader->curr_idx = 0;
+        memset(&res->batch, 0, sizeof(res->batch));
+        res->ready = 0;
+        pthread_mutex_unlock(&reader->mutex);
+
+        if (res->ret < 0)
+            return res->ret;
+    }
+}
+
 #define UMI_TAGS 5
 typedef struct {
     kstring_t name;
@@ -4130,6 +4995,20 @@ static int fastq_parse1(htsFile *fp, bam1_t *b) {
 
 // Internal component of sam_read1 below
 static inline int sam_read1_bam(htsFile *fp, sam_hdr_t *h, bam1_t *b) {
+    if (fp->state) {
+        bam_ordered_reader_t *reader = (bam_ordered_reader_t *)fp->state;
+        if (reader->magic == BAM_ORDERED_READER_MAGIC)
+            return bam_ordered_reader_next(reader, b);
+    } else if (bam_ordered_env_enabled()) {
+        bam_ordered_reader_t *reader = bam_ordered_reader_open(fp, h);
+        if (reader) {
+            fp->state = reader;
+            return bam_ordered_reader_next(reader, b);
+        }
+        if (bam_ordered_env_strict())
+            return -2;
+    }
+
     int ret = bam_read1(fp->fp.bgzf, b);
     if (h && ret >= 0) {
         if (b->core.tid  >= h->n_targets || b->core.tid  < -1 ||

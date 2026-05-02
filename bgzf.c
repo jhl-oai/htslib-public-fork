@@ -34,6 +34,7 @@
 #include <assert.h>
 #include <pthread.h>
 #include <sys/types.h>
+#include <sys/time.h>
 #include <inttypes.h>
 #include <zlib.h>
 
@@ -138,6 +139,7 @@ typedef struct bgzf_mtaux_t {
     // I/O thread.
     pthread_t io_task;
     pthread_mutex_t job_pool_m;
+    pthread_cond_t job_pool_c;
     int jobs_pending; // number of jobs waiting
     int flush_pending;
     void *free_block;
@@ -156,7 +158,18 @@ typedef struct bgzf_mtaux_t {
     hts_idx_t *hts_idx;
     uint64_t block_number, block_written;
     hts_idx_cache_t idx_cache;
+
+#ifdef HAVE_LIBDEFLATE
+    struct libdeflate_compressor **ld_compressors;
+    int *ld_compressor_levels;
+    struct libdeflate_decompressor **ld_decompressors;
+#endif
 } mtaux_t;
+
+#ifdef HAVE_LIBDEFLATE
+static void mt_free_libdeflate(mtaux_t *mt);
+#endif
+static int bgzf_mt_default_queue_size(int n_threads);
 #endif
 
 typedef struct
@@ -558,7 +571,55 @@ uint32_t hts_crc32(uint32_t crc, const void *buf, size_t len) {
     return libdeflate_crc32(crc, buf, len);
 }
 
-int bgzf_compress(void *_dst, size_t *dlen, const void *src, size_t slen, int level)
+static int bgzf_compress_with_libdeflate(void *_dst, size_t *dlen,
+                                         const void *src, size_t slen,
+                                         int level,
+                                         struct libdeflate_compressor **z_cache,
+                                         int *z_level)
+{
+    uint8_t *dst = (uint8_t*)_dst;
+    struct libdeflate_compressor *z = NULL;
+
+    level = level > 0 ? level : 6; // libdeflate doesn't honour -1 as default
+    // NB levels go up to 12 here.
+    int lvl_map[] = {0,1,2,3,5,6,7,8,10,12};
+    level = lvl_map[level>9 ?9 :level];
+
+    if (z_cache) {
+        if (!*z_cache || (z_level && *z_level != level)) {
+            libdeflate_free_compressor(*z_cache);
+            *z_cache = libdeflate_alloc_compressor(level);
+            if (z_level)
+                *z_level = level;
+        }
+        z = *z_cache;
+    } else {
+        z = libdeflate_alloc_compressor(level);
+    }
+    if (!z) return -1;
+
+    // Raw deflate
+    size_t clen =
+        libdeflate_deflate_compress(z, src, slen,
+                                    dst + BLOCK_HEADER_LENGTH,
+                                    *dlen - BLOCK_HEADER_LENGTH - BLOCK_FOOTER_LENGTH);
+
+    if (!z_cache)
+        libdeflate_free_compressor(z);
+
+    if (clen <= 0) {
+        hts_log_error("Call to libdeflate_deflate_compress failed");
+        return -1;
+    }
+
+    *dlen = clen + BLOCK_HEADER_LENGTH + BLOCK_FOOTER_LENGTH;
+    return 0;
+}
+
+static int bgzf_compress_cached(void *_dst, size_t *dlen,
+                                const void *src, size_t slen, int level,
+                                struct libdeflate_compressor **z_cache,
+                                int *z_level)
 {
     if (slen == 0) {
         // EOF block
@@ -580,28 +641,9 @@ int bgzf_compress(void *_dst, size_t *dlen, const void *src, size_t slen, int le
         *dlen = slen+5 + BLOCK_HEADER_LENGTH + BLOCK_FOOTER_LENGTH;
 
     } else {
-        level = level > 0 ? level : 6; // libdeflate doesn't honour -1 as default
-        // NB levels go up to 12 here.
-        int lvl_map[] = {0,1,2,3,5,6,7,8,10,12};
-        level = lvl_map[level>9 ?9 :level];
-        struct libdeflate_compressor *z = libdeflate_alloc_compressor(level);
-        if (!z) return -1;
-
-        // Raw deflate
-        size_t clen =
-            libdeflate_deflate_compress(z, src, slen,
-                                        dst + BLOCK_HEADER_LENGTH,
-                                        *dlen - BLOCK_HEADER_LENGTH - BLOCK_FOOTER_LENGTH);
-
-        if (clen <= 0) {
-            hts_log_error("Call to libdeflate_deflate_compress failed");
-            libdeflate_free_compressor(z);
+        if (bgzf_compress_with_libdeflate(_dst, dlen, src, slen, level,
+                                          z_cache, z_level) < 0)
             return -1;
-        }
-
-        *dlen = clen + BLOCK_HEADER_LENGTH + BLOCK_FOOTER_LENGTH;
-
-        libdeflate_free_compressor(z);
     }
 
     // write the header
@@ -613,6 +655,11 @@ int bgzf_compress(void *_dst, size_t *dlen, const void *src, size_t slen, int le
     packInt32((uint8_t*)&dst[*dlen - 8], crc);
     packInt32((uint8_t*)&dst[*dlen - 4], slen);
     return 0;
+}
+
+int bgzf_compress(void *_dst, size_t *dlen, const void *src, size_t slen, int level)
+{
+    return bgzf_compress_cached(_dst, dlen, src, slen, level, NULL, NULL);
 }
 
 #else
@@ -727,17 +774,26 @@ static int deflate_block(BGZF *fp, int block_length)
 
 #ifdef HAVE_LIBDEFLATE
 
-static int bgzf_uncompress(uint8_t *dst, size_t *dlen,
-                           const uint8_t *src, size_t slen,
-                           uint32_t expected_crc) {
-    struct libdeflate_decompressor *z = libdeflate_alloc_decompressor();
+static int bgzf_uncompress_with_libdeflate(uint8_t *dst, size_t *dlen,
+                                           const uint8_t *src, size_t slen,
+                                           uint32_t expected_crc,
+                                           struct libdeflate_decompressor **z_cache) {
+    struct libdeflate_decompressor *z = NULL;
+    if (z_cache) {
+        if (!*z_cache)
+            *z_cache = libdeflate_alloc_decompressor();
+        z = *z_cache;
+    } else {
+        z = libdeflate_alloc_decompressor();
+    }
     if (!z) {
         hts_log_error("Call to libdeflate_alloc_decompressor failed");
         return -1;
     }
 
     int ret = libdeflate_deflate_decompress(z, src, slen, dst, *dlen, dlen);
-    libdeflate_free_decompressor(z);
+    if (!z_cache)
+        libdeflate_free_decompressor(z);
 
     if (ret != LIBDEFLATE_SUCCESS) {
         hts_log_error("Inflate operation failed: %d", ret);
@@ -755,6 +811,12 @@ static int bgzf_uncompress(uint8_t *dst, size_t *dlen,
     }
 
     return 0;
+}
+
+static int bgzf_uncompress(uint8_t *dst, size_t *dlen,
+                           const uint8_t *src, size_t slen,
+                           uint32_t expected_crc) {
+    return bgzf_uncompress_with_libdeflate(dst, dlen, src, slen, expected_crc, NULL);
 }
 
 #else
@@ -1331,9 +1393,22 @@ static void *bgzf_encode_func(void *arg) {
     bgzf_job *j = (bgzf_job *)arg;
 
     j->comp_len = BGZF_MAX_BLOCK_SIZE;
+#ifdef HAVE_LIBDEFLATE
+    int worker = hts_tpool_worker_id(j->fp->mt->pool);
+    struct libdeflate_compressor **z_cache =
+        worker >= 0 && worker < j->fp->mt->n_threads
+        ? &j->fp->mt->ld_compressors[worker] : NULL;
+    int *z_level =
+        worker >= 0 && worker < j->fp->mt->n_threads
+        ? &j->fp->mt->ld_compressor_levels[worker] : NULL;
+    int ret = bgzf_compress_cached(j->comp_data, &j->comp_len,
+                                   j->uncomp_data, j->uncomp_len,
+                                   j->fp->compress_level, z_cache, z_level);
+#else
     int ret = bgzf_compress(j->comp_data, &j->comp_len,
                             j->uncomp_data, j->uncomp_len,
                             j->fp->compress_level);
+#endif
     if (ret != 0)
         j->errcode |= BGZF_ERR_ZLIB;
 
@@ -1375,8 +1450,18 @@ static void *bgzf_decode_func(void *arg) {
 
     j->uncomp_len = BGZF_MAX_BLOCK_SIZE;
     uint32_t crc = le_to_u32((uint8_t *)j->comp_data + j->comp_len-8);
+#ifdef HAVE_LIBDEFLATE
+    int worker = hts_tpool_worker_id(j->fp->mt->pool);
+    struct libdeflate_decompressor **z_cache =
+        worker >= 0 && worker < j->fp->mt->n_threads
+        ? &j->fp->mt->ld_decompressors[worker] : NULL;
+    int ret = bgzf_uncompress_with_libdeflate(j->uncomp_data, &j->uncomp_len,
+                                              j->comp_data+18, j->comp_len-18,
+                                              crc, z_cache);
+#else
     int ret = bgzf_uncompress(j->uncomp_data, &j->uncomp_len,
                               j->comp_data+18, j->comp_len-18, crc);
+#endif
     if (ret != 0)
         j->errcode |= BGZF_ERR_ZLIB;
 
@@ -1457,6 +1542,7 @@ static void *bgzf_mt_writer(void *vp) {
         pthread_mutex_lock(&mt->job_pool_m);
         pool_free(mt->job_pool, j);
         mt->jobs_pending--;
+        pthread_cond_signal(&mt->job_pool_c);
         pthread_mutex_unlock(&mt->job_pool_m);
     }
 
@@ -1469,6 +1555,9 @@ static void *bgzf_mt_writer(void *vp) {
 
  err:
     hts_tpool_process_destroy(mt->out_queue);
+    pthread_mutex_lock(&mt->job_pool_m);
+    pthread_cond_broadcast(&mt->job_pool_c);
+    pthread_mutex_unlock(&mt->job_pool_m);
     return (void *)-1;
 }
 
@@ -1485,11 +1574,7 @@ static void *bgzf_mt_writer(void *vp) {
 int bgzf_mt_read_block(BGZF *fp, bgzf_job *j)
 {
     uint8_t header[BLOCK_HEADER_LENGTH], *compressed_block;
-    int count, block_length, remaining;
-
-    // NOTE: Guaranteed to be compressed as we block multi-threading in
-    // uncompressed mode.  However it may be gzip compression instead
-    // of bgzf.
+    int count, block_length;
 
     // Reading compressed file
     int64_t block_address;
@@ -1497,7 +1582,6 @@ int bgzf_mt_read_block(BGZF *fp, bgzf_job *j)
 
     j->block_address = block_address;  // in case we exit with j->errcode
 
-    if (fp->cache_size && load_block_from_cache(fp, block_address)) return 0;
     count = hpeek(fp->fp, header, sizeof(header));
     if (count == 0) // no data read
         return -1;
@@ -1512,20 +1596,14 @@ int bgzf_mt_read_block(BGZF *fp, bgzf_job *j)
         return -1;
     }
 
-    count = hread(fp->fp, header, sizeof(header));
-    if (count != sizeof(header)) // no data read
-        return -1;
-
     block_length = unpackInt16((uint8_t*)&header[16]) + 1; // +1 because when writing this number, we used "-1"
     if (block_length < BLOCK_HEADER_LENGTH) {
         j->errcode |= BGZF_ERR_HEADER;
         return -1;
     }
     compressed_block = (uint8_t*)j->comp_data;
-    memcpy(compressed_block, header, BLOCK_HEADER_LENGTH);
-    remaining = block_length - BLOCK_HEADER_LENGTH;
-    count = hread(fp->fp, &compressed_block[BLOCK_HEADER_LENGTH], remaining);
-    if (count != remaining) {
+    count = hread(fp->fp, compressed_block, block_length);
+    if (count != block_length) {
         j->errcode |= BGZF_ERR_IO;
         return -1;
     }
@@ -1739,7 +1817,7 @@ restart:
 
 int bgzf_thread_pool(BGZF *fp, hts_tpool *pool, int qsize) {
     // No gain from multi-threading when not compressed
-    if (!fp->is_compressed)
+    if (!fp->is_compressed || fp->is_gzip)
         return 0;
     if (fp->mt)
         return -2;  //already exists!
@@ -1752,7 +1830,7 @@ int bgzf_thread_pool(BGZF *fp, hts_tpool *pool, int qsize) {
     mt->pool = pool;
     mt->n_threads = hts_tpool_size(pool);
     if (!qsize)
-        qsize = mt->n_threads*2;
+        qsize = bgzf_mt_default_queue_size(mt->n_threads);
     if (!(mt->out_queue = hts_tpool_process_init(mt->pool, qsize, 0)))
         goto err;
     hts_tpool_process_ref_incr(mt->out_queue);
@@ -1761,7 +1839,21 @@ int bgzf_thread_pool(BGZF *fp, hts_tpool *pool, int qsize) {
     if (!mt->job_pool)
         goto err;
 
+#ifdef HAVE_LIBDEFLATE
+    if (fp->is_write) {
+        mt->ld_compressors = calloc(mt->n_threads, sizeof(*mt->ld_compressors));
+        mt->ld_compressor_levels = calloc(mt->n_threads, sizeof(*mt->ld_compressor_levels));
+        if (!mt->ld_compressors || !mt->ld_compressor_levels)
+            goto err;
+    } else {
+        mt->ld_decompressors = calloc(mt->n_threads, sizeof(*mt->ld_decompressors));
+        if (!mt->ld_decompressors)
+            goto err;
+    }
+#endif
+
     pthread_mutex_init(&mt->job_pool_m, NULL);
+    pthread_cond_init(&mt->job_pool_c, NULL);
     pthread_mutex_init(&mt->command_m, NULL);
     pthread_mutex_init(&mt->idx_m, NULL);
     pthread_cond_init(&mt->command_c, NULL);
@@ -1775,6 +1867,15 @@ int bgzf_thread_pool(BGZF *fp, hts_tpool *pool, int qsize) {
     return 0;
 
  err:
+#ifdef HAVE_LIBDEFLATE
+    mt_free_libdeflate(mt);
+#endif
+    if (mt->job_pool)
+        pool_destroy(mt->job_pool);
+    if (mt->out_queue) {
+        hts_tpool_process_ref_decr(mt->out_queue);
+        hts_tpool_process_destroy(mt->out_queue);
+    }
     free(mt);
     fp->mt = NULL;
     return -1;
@@ -1801,6 +1902,27 @@ int bgzf_mt(BGZF *fp, int n_threads, int n_sub_blks)
 
     return 0;
 }
+
+#ifdef HAVE_LIBDEFLATE
+static void mt_free_libdeflate(mtaux_t *mt)
+{
+    int i;
+    if (mt->ld_compressors) {
+        for (i = 0; i < mt->n_threads; i++)
+            libdeflate_free_compressor(mt->ld_compressors[i]);
+        free(mt->ld_compressors);
+        mt->ld_compressors = NULL;
+    }
+    free(mt->ld_compressor_levels);
+    mt->ld_compressor_levels = NULL;
+    if (mt->ld_decompressors) {
+        for (i = 0; i < mt->n_threads; i++)
+            libdeflate_free_decompressor(mt->ld_decompressors[i]);
+        free(mt->ld_decompressors);
+        mt->ld_decompressors = NULL;
+    }
+}
+#endif
 
 static int mt_destroy(mtaux_t *mt)
 {
@@ -1829,6 +1951,7 @@ static int mt_destroy(mtaux_t *mt)
     ret = retval != NULL ? -1 : ret;
 
     pthread_mutex_destroy(&mt->job_pool_m);
+    pthread_cond_destroy(&mt->job_pool_c);
     pthread_mutex_destroy(&mt->command_m);
     pthread_mutex_destroy(&mt->idx_m);
     pthread_cond_destroy(&mt->command_c);
@@ -1838,6 +1961,9 @@ static int mt_destroy(mtaux_t *mt)
     if (mt->own_pool)
         hts_tpool_destroy(mt->pool);
 
+#ifdef HAVE_LIBDEFLATE
+    mt_free_libdeflate(mt);
+#endif
     pool_destroy(mt->job_pool);
 
     if (mt->idx_cache.e)
@@ -1847,6 +1973,23 @@ static int mt_destroy(mtaux_t *mt)
     fflush(stderr);
 
     return ret;
+}
+
+static int bgzf_mt_default_queue_size(int n_threads)
+{
+    char *end = NULL;
+    long qsize;
+    const char *env = getenv("HTS_BGZF_QUEUE_SIZE");
+
+    if (env && *env) {
+        errno = 0;
+        qsize = strtol(env, &end, 10);
+        if (errno == 0 && end && *end == '\0' && qsize > 0 && qsize <= INT_MAX)
+            return (int) qsize;
+        hts_log_debug("Ignoring invalid HTS_BGZF_QUEUE_SIZE value \"%s\"", env);
+    }
+
+    return n_threads * 2;
 }
 
 static int mt_queue(BGZF *fp)
@@ -1890,6 +2033,7 @@ static int mt_queue(BGZF *fp)
     job_cleanup(j);
     pthread_mutex_lock(&mt->job_pool_m);
     mt->jobs_pending--;
+    pthread_cond_signal(&mt->job_pool_c);
     pthread_mutex_unlock(&mt->job_pool_m);
     return -1;
 }
@@ -1908,9 +2052,16 @@ static int mt_flush_queue(BGZF *fp)
     while (mt->jobs_pending != 0) {
         if ((shutdown = hts_tpool_process_is_shutdown(mt->out_queue)))
             break;
-        pthread_mutex_unlock(&mt->job_pool_m);
-        hts_usleep(10000); // FIXME: replace by condition variable
-        pthread_mutex_lock(&mt->job_pool_m);
+        struct timeval now;
+        struct timespec timeout;
+        gettimeofday(&now, NULL);
+        timeout.tv_sec = now.tv_sec;
+        timeout.tv_nsec = (now.tv_usec + 10000) * 1000;
+        if (timeout.tv_nsec >= 1000000000) {
+            timeout.tv_sec++;
+            timeout.tv_nsec -= 1000000000;
+        }
+        pthread_cond_timedwait(&mt->job_pool_c, &mt->job_pool_m, &timeout);
     }
     pthread_mutex_unlock(&mt->job_pool_m);
 

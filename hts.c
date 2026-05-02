@@ -1646,9 +1646,14 @@ int hts_close(htsFile *fp)
 
     switch (fp->format.format) {
     case binary_format:
-    case bam:
     case bcf:
         ret = bgzf_close(fp->fp.bgzf);
+        break;
+
+    case bam:
+        if (fp->state)
+            ret = sam_bam_state_destroy(fp);
+        ret |= bgzf_close(fp->fp.bgzf);
         break;
 
     case cram:
@@ -3137,6 +3142,141 @@ uint64_t hts_idx_get_n_no_coor(const hts_idx_t* idx)
 {
     if (idx->fmt == HTS_FMT_CRAI) return 0;
     return idx->n_no_coor;
+}
+
+int hts_idx_ref_has_data(const hts_idx_t *idx, int tid)
+{
+    bidx_t *bidx;
+
+    if (!idx || idx->fmt == HTS_FMT_CRAI || tid < 0 || tid >= idx->n)
+        return 0;
+
+    bidx = idx->bidx[tid];
+    return bidx && kh_size(bidx) > 0;
+}
+
+static int uint64_cmp(const void *a, const void *b)
+{
+    uint64_t va = *(const uint64_t *)a;
+    uint64_t vb = *(const uint64_t *)b;
+
+    return va > vb ? 1 : va < vb ? -1 : 0;
+}
+
+static int add_file_offset(uint64_t **offsets, int *n, int *m,
+                           uint64_t offset)
+{
+    if (*n == *m) {
+        int new_m = *m ? (*m > INT_MAX / 2 ? INT_MAX : *m * 2) : 256;
+        uint64_t *new_offsets;
+
+        if (new_m == *m ||
+            (size_t)new_m > SIZE_MAX / sizeof(*new_offsets)) {
+            errno = ENOMEM;
+            return -1;
+        }
+
+        new_offsets = realloc(*offsets, (size_t)new_m * sizeof(*new_offsets));
+        if (!new_offsets) {
+            errno = ENOMEM;
+            return -1;
+        }
+
+        *offsets = new_offsets;
+        *m = new_m;
+    }
+
+    (*offsets)[(*n)++] = offset;
+    return 0;
+}
+
+int hts_idx_get_ref_file_offsets(const hts_idx_t *idx, int tid,
+                                 uint64_t **offsets, int *n_offsets)
+{
+    bidx_t *bidx;
+    lidx_t *lidx;
+    khint_t k;
+    uint64_t beg, end;
+    uint64_t *out = NULL;
+    int n = 0, m = 0;
+    int i, j;
+
+    if (!offsets || !n_offsets) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    *offsets = NULL;
+    *n_offsets = 0;
+
+    if (!idx || idx->fmt == HTS_FMT_CRAI || tid < 0 || tid >= idx->n)
+        return 0;
+
+    bidx = idx->bidx[tid];
+    if (!bidx)
+        return 0;
+
+    k = kh_get(bin, bidx, META_BIN(idx));
+    if (k == kh_end(bidx) || kh_value(bidx, k).n < 1)
+        return 0;
+
+    beg = kh_value(bidx, k).list[0].u;
+    end = kh_value(bidx, k).list[0].v;
+    if (end <= beg)
+        return 0;
+
+    if (add_file_offset(&out, &n, &m, beg) < 0 ||
+        add_file_offset(&out, &n, &m, end) < 0)
+        goto fail;
+
+    if (idx->lidx) {
+        lidx = &idx->lidx[tid];
+        for (i = 0; i < lidx->n; i++) {
+            uint64_t offset = lidx->offset[i];
+            if (offset != (uint64_t)-1 && offset > beg && offset < end &&
+                add_file_offset(&out, &n, &m, offset) < 0)
+                goto fail;
+        }
+    }
+
+    for (k = kh_begin(bidx); k != kh_end(bidx); k++) {
+        bins_t *bin;
+
+        if (!kh_exist(bidx, k) || kh_key(bidx, k) >= idx->n_bins)
+            continue;
+
+        bin = &kh_value(bidx, k);
+        for (i = 0; i < bin->n; i++) {
+            if (bin->list[i].u > beg && bin->list[i].u < end &&
+                add_file_offset(&out, &n, &m, bin->list[i].u) < 0)
+                goto fail;
+            if (bin->list[i].v > beg && bin->list[i].v < end &&
+                add_file_offset(&out, &n, &m, bin->list[i].v) < 0)
+                goto fail;
+        }
+    }
+
+    qsort(out, (size_t)n, sizeof(*out), uint64_cmp);
+    for (i = 1, j = 0; i < n; i++) {
+        if (out[i] != out[j])
+            out[++j] = out[i];
+    }
+    n = j + 1;
+
+    if (n < 2) {
+        free(out);
+        return 0;
+    }
+
+    *offsets = out;
+    *n_offsets = n;
+    return 0;
+
+fail:
+    free(out);
+    *offsets = NULL;
+    *n_offsets = 0;
+    return -1;
 }
 
 /****************

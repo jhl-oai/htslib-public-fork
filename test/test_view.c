@@ -36,6 +36,7 @@ DEALINGS IN THE SOFTWARE.  */
 #include "../htslib/sam.h"
 #include "../htslib/vcf.h"
 #include "../htslib/hts_log.h"
+#include "../sam_internal.h"
 
 struct opts {
     char *fn_ref;
@@ -110,6 +111,22 @@ int sam_loop(int argc, char **argv, int optind, struct opts *opts, htsFile *in, 
             fprintf(stderr, "Failed to initialise index\n");
             goto fail;
         }
+    }
+
+    if (getenv("HTS_BAM_RAW_BGZF_COPY") &&
+        in->format.format == bam && out->format.format == bam &&
+        in->is_bgzf && out->is_bgzf &&
+        !opts->benchmark && !opts->index && !opts->nreads &&
+        (opts->flag & WRITE_BINARY_COMP) &&
+        !(opts->flag & WRITE_UNCOMPRESSED) && opts->clevel < 0 &&
+        opts->nthreads == 0 && optind + 1 == argc) {
+        if (sam_bam_raw_copy_blocks(in, out) < 0) {
+            fprintf(stderr, "Error copying raw BGZF BAM blocks.\n");
+            goto fail;
+        }
+        bam_destroy1(b);
+        sam_hdr_destroy(h);
+        return 0;
     }
 
     if (optind + 1 < argc && !(opts->flag & READ_COMPRESSED)) { // BAM input and has a region

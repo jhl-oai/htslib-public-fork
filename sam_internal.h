@@ -34,8 +34,10 @@ extern "C" {
 
 // Used internally in the SAM format multi-threading.
 int sam_state_destroy(samFile *fp);
+int sam_bam_state_destroy(samFile *fp);
 int sam_set_thread_pool(htsFile *fp, htsThreadPool *p);
 int sam_set_threads(htsFile *fp, int nthreads);
+int sam_bam_raw_copy_blocks(htsFile *in, htsFile *out);
 
 // Fastq state
 int fastq_state_set(samFile *fp, enum hts_fmt_option opt, ...);
