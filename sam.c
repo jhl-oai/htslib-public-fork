@@ -4033,6 +4033,7 @@ typedef struct bam_stream_parse_job_t {
 } bam_stream_parse_job_t;
 
 static int bam_ordered_env_enabled(void);
+static int bam_batch_env_enabled(void);
 static int bam_stream_env_enabled(void);
 static int bam_stream_parse_env_enabled(void);
 
@@ -4045,6 +4046,18 @@ static int bam_stream_env_strict(void)
 static int bam_stream_env_enabled(void)
 {
     const char *env = getenv("HTS_BAM_STREAM_READER");
+    return env && *env && strcmp(env, "0") != 0;
+}
+
+static int bam_batch_env_enabled(void)
+{
+    const char *env = getenv("HTS_BAM_BATCH_READER");
+    return env && *env && strcmp(env, "0") != 0;
+}
+
+static int bam_batch_env_strict(void)
+{
+    const char *env = getenv("HTS_BAM_BATCH_READER_REQUIRE");
     return env && *env && strcmp(env, "0") != 0;
 }
 
@@ -4951,10 +4964,150 @@ static int bam_stream_reader_next(bam_stream_reader_t *reader, bam1_t *b)
     return bam_stream_reader_next_serial(reader, b);
 }
 
+void sam_bam_batch_destroy(bam_batch_t *batch)
+{
+    if (!batch)
+        return;
+    if (batch->impl)
+        bam_stream_parse_job_free(batch->impl);
+    memset(batch, 0, sizeof(*batch));
+}
+
+static bam_stream_reader_t *bam_batch_reader_get(htsFile *fp)
+{
+    if (!fp || !fp->is_bgzf || !fp->fp.bgzf)
+        return NULL;
+
+    if (fp->state) {
+        uint32_t magic = *(uint32_t *)fp->state;
+
+        if (magic == BAM_STREAM_READER_MAGIC)
+            return (bam_stream_reader_t *)fp->state;
+        if (magic == BAM_DEFERRED_THREADS_MAGIC) {
+            bam_deferred_threads_t *cfg =
+                (bam_deferred_threads_t *)fp->state;
+            bam_stream_reader_t *reader = bam_stream_reader_open(fp, cfg);
+
+            if (reader) {
+                fp->state = NULL;
+                bam_deferred_threads_destroy(cfg);
+                fp->state = reader;
+                return reader;
+            }
+            if (!bam_batch_env_strict())
+                (void)bam_deferred_threads_enable_bgzf(fp, cfg);
+            fp->state = NULL;
+            bam_deferred_threads_destroy(cfg);
+            return NULL;
+        }
+        return NULL;
+    }
+
+    if (bam_batch_env_enabled()) {
+        bam_stream_reader_t *reader = bam_stream_reader_open(fp, NULL);
+
+        if (reader) {
+            fp->state = reader;
+            return reader;
+        }
+    }
+    return NULL;
+}
+
+static int bam_batch_validate_header(bam_stream_reader_t *reader, sam_hdr_t *h,
+                                     bam_stream_parse_job_t *job,
+                                     size_t *valid_len, int *valid_records)
+{
+    const uint8_t *data = job->data ? job->data : job->ref_data;
+    size_t off = 0;
+    int i;
+
+    *valid_len = job->len;
+    *valid_records = job->n_records;
+    if (!h)
+        return 0;
+
+    for (i = 0; i < job->n_records; i++) {
+        int32_t block_len;
+        int32_t tid, mtid;
+
+        if (job->len - off < 4 + 32)
+            return -4;
+        block_len = le_to_i32(data + off);
+        if (block_len < 32 || job->len - off < 4 + (size_t)block_len)
+            return -4;
+        tid = le_to_i32(data + off + 4);
+        mtid = le_to_i32(data + off + 24);
+        if (tid >= h->n_targets || tid < -1 ||
+            mtid >= h->n_targets || mtid < -1) {
+            if (i > 0) {
+                *valid_len = off;
+                *valid_records = i;
+                reader->pending_frame_error = -3;
+                return 0;
+            }
+            errno = ERANGE;
+            return -3;
+        }
+        off += 4 + (size_t)block_len;
+    }
+    return 0;
+}
+
+int sam_bam_read_batch(htsFile *fp, sam_hdr_t *h, bam_batch_t *batch)
+{
+    bam_stream_reader_t *reader;
+    bam_stream_parse_job_t *job = NULL;
+    size_t valid_len = 0;
+    int valid_records = 0;
+    int ret;
+
+    if (!batch)
+        return -2;
+    sam_bam_batch_destroy(batch);
+
+    if (!bam_batch_env_enabled())
+        return -2;
+    if (!fp || fp->format.format != bam || fp->is_write)
+        return -2;
+
+    reader = bam_batch_reader_get(fp);
+    if (!reader)
+        return -2;
+
+    if (reader->pending_frame_error) {
+        ret = reader->pending_frame_error;
+        reader->pending_frame_error = 0;
+        return ret;
+    }
+    if (reader->parse_input_error)
+        return reader->parse_input_error;
+    if (reader->parse_input_eof)
+        return -1;
+
+    ret = bam_stream_reader_build_parse_job(reader, &job);
+    if (ret <= 0)
+        return ret == 0 ? -1 : ret;
+
+    ret = bam_batch_validate_header(reader, h, job, &valid_len,
+                                    &valid_records);
+    if (ret < 0) {
+        bam_stream_parse_job_free(job);
+        return ret;
+    }
+
+    batch->data = job->data ? job->data : job->ref_data;
+    batch->len = valid_len;
+    batch->n_records = valid_records;
+    batch->impl = job;
+    return valid_records;
+}
+
 int sam_set_thread_pool(htsFile *fp, htsThreadPool *p) {
     if (fp->format.format == bam) {
         if (!fp->is_write &&
-            (bam_stream_env_enabled() || bam_ordered_env_enabled()))
+            (bam_batch_env_enabled() ||
+             bam_stream_env_enabled() || bam_ordered_env_enabled()))
             return bam_deferred_threads_set(fp, 0, p);
         if (fp->format.compression == bgzf)
             return bgzf_thread_pool(fp->fp.bgzf, p->pool, p->qsize);
@@ -4993,7 +5146,8 @@ int sam_set_threads(htsFile *fp, int nthreads) {
 
     if (fp->format.format == bam) {
         if (!fp->is_write &&
-            (bam_stream_env_enabled() || bam_ordered_env_enabled()))
+            (bam_batch_env_enabled() ||
+             bam_stream_env_enabled() || bam_ordered_env_enabled()))
             return bam_deferred_threads_set(fp, nthreads, NULL);
         if (fp->format.compression == bgzf)
             return bgzf_mt(fp->fp.bgzf, nthreads, 256);

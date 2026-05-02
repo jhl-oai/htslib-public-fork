@@ -39,6 +39,16 @@ int sam_set_thread_pool(htsFile *fp, htsThreadPool *p);
 int sam_set_threads(htsFile *fp, int nthreads);
 int sam_bam_raw_copy_blocks(htsFile *in, htsFile *out);
 
+typedef struct bam_batch_t {
+    const uint8_t *data;
+    size_t len;
+    int n_records;
+    void *impl;
+} bam_batch_t;
+
+int sam_bam_read_batch(htsFile *fp, sam_hdr_t *h, bam_batch_t *batch);
+void sam_bam_batch_destroy(bam_batch_t *batch);
+
 // Fastq state
 int fastq_state_set(samFile *fp, enum hts_fmt_option opt, ...);
 void fastq_state_destroy(samFile *fp);

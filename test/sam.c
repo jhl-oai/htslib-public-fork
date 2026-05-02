@@ -42,6 +42,7 @@ DEALINGS IN THE SOFTWARE.  */
 
 #include "../htslib/sam.h"
 #include "../htslib/bgzf.h"
+#include "../htslib/hts_endian.h"
 #include "../htslib/faidx.h"
 #include "../htslib/khash.h"
 #include "../htslib/hts_log.h"
@@ -2401,6 +2402,20 @@ static void stream_reader_env(int enable, int strict, const char *chunk)
     }
 }
 
+static void batch_reader_env(int enable, int strict)
+{
+    if (enable) {
+        setenv("HTS_BAM_BATCH_READER", "1", 1);
+        if (strict)
+            setenv("HTS_BAM_BATCH_READER_REQUIRE", "1", 1);
+        else
+            unsetenv("HTS_BAM_BATCH_READER_REQUIRE");
+    } else {
+        unsetenv("HTS_BAM_BATCH_READER");
+        unsetenv("HTS_BAM_BATCH_READER_REQUIRE");
+    }
+}
+
 static void read_bam_order_hash(const char *path, int use_ordered_reader,
                                 int hts_threads, int use_thread_pool,
                                 int strict_ordered_reader,
@@ -2500,6 +2515,70 @@ cleanup:
     if (p.pool)
         hts_tpool_destroy(p.pool);
     stream_reader_env(0, 0, NULL);
+}
+
+static void read_bam_batch_hash(const char *path, int hts_threads,
+                                int use_thread_pool, uint64_t *hash,
+                                int *count)
+{
+    const char *tmp = "test/test_bam_batch_reader.out.tmp.bam";
+    samFile *fp = NULL;
+    samFile *out = NULL;
+    sam_hdr_t *hdr = NULL;
+    htsThreadPool p = {NULL, 0};
+    bam_batch_t batch = {0};
+    int ret, batch_count = 0;
+
+    batch_reader_env(1, 1);
+    unlink(tmp);
+
+    *hash = 1469598103934665603ULL;
+    *count = 0;
+    fp = sam_open(path, "rb");
+    VERIFY(fp != NULL, "failed to open BAM");
+    if (hts_threads > 0) {
+        if (use_thread_pool) {
+            p.pool = hts_tpool_init(hts_threads);
+            p.qsize = hts_threads * 2;
+            VERIFY(p.pool != NULL, "failed to create BAM batch pool");
+            VERIFY(hts_set_thread_pool(fp, &p) == 0,
+                   "failed to set BAM batch thread pool");
+        } else {
+            VERIFY(hts_set_threads(fp, hts_threads) == 0,
+                   "failed to set BAM batch threads");
+        }
+    }
+    hdr = sam_hdr_read(fp);
+    VERIFY(hdr != NULL, "failed to read BAM header");
+    out = sam_open(tmp, "wb");
+    VERIFY(out != NULL, "failed to open temporary batch BAM");
+    VERIFY(sam_hdr_write(out, hdr) >= 0,
+           "failed to write temporary batch BAM header");
+
+    while ((ret = sam_bam_read_batch(fp, hdr, &batch)) >= 0) {
+        VERIFY(ret == batch.n_records, "BAM batch returned bad count");
+        VERIFY(bgzf_write(out->fp.bgzf, batch.data, batch.len) ==
+               (ssize_t)batch.len, "failed to write temporary batch records");
+        batch_count += batch.n_records;
+        sam_bam_batch_destroy(&batch);
+    }
+    VERIFY(ret == -1, "failed to read all BAM batches");
+    VERIFY(sam_close(out) == 0, "failed to close temporary batch BAM");
+    out = NULL;
+    read_bam_order_hash(tmp, 0, 0, 0, 0, NULL, hash, count);
+    VERIFY(batch_count == *count, "BAM batch count changed after rewrite");
+
+cleanup:
+    sam_bam_batch_destroy(&batch);
+    sam_hdr_destroy(hdr);
+    if (out)
+        sam_close(out);
+    if (fp)
+        sam_close(fp);
+    if (p.pool)
+        hts_tpool_destroy(p.pool);
+    unlink(tmp);
+    batch_reader_env(0, 0);
 }
 
 static void read_bam_stream_late_fallback_hash(const char *path,
@@ -3124,6 +3203,51 @@ cleanup:
     ordered_reader_env(0, 0, NULL);
 }
 
+static void test_bam_batch_reader(void)
+{
+    const char *split_body = "test/test_bam_batch_reader.split_body.tmp.bam";
+    uint64_t serial_hash = 0, batch_hash = 0;
+    int serial_count = 0, batch_count = 0;
+
+    unlink(split_body);
+
+    read_range_bam_order_hash(0, 0, 0, 0, NULL, &serial_hash,
+                              &serial_count);
+    read_bam_batch_hash("test/range.bam", 0, 0, &batch_hash, &batch_count);
+    VERIFY(batch_count == serial_count,
+           "BAM batch reader returned the wrong record count");
+    VERIFY(batch_hash == serial_hash,
+           "BAM batch reader changed record order or contents");
+
+    batch_hash = 0;
+    batch_count = 0;
+    read_bam_batch_hash("test/range.bam", 2, 0, &batch_hash, &batch_count);
+    VERIFY(batch_count == serial_count,
+           "-@ controlled BAM batch reader returned the wrong record count");
+    VERIFY(batch_hash == serial_hash,
+           "-@ controlled BAM batch reader changed record order or contents");
+
+    batch_hash = 0;
+    batch_count = 0;
+    read_bam_batch_hash("test/range.bam", 2, 1, &batch_hash, &batch_count);
+    VERIFY(batch_count == serial_count,
+           "thread-pool controlled BAM batch reader returned the wrong record count");
+    VERIFY(batch_hash == serial_hash,
+           "thread-pool controlled BAM batch reader changed record order or contents");
+
+    VERIFY(write_split_bam_record(split_body, 36) == 0,
+           "failed to create split-body BAM");
+    read_bam_order_hash(split_body, 0, 0, 0, 0, NULL,
+                        &serial_hash, &serial_count);
+    read_bam_batch_hash(split_body, 0, 0, &batch_hash, &batch_count);
+    VERIFY(batch_count == serial_count && batch_hash == serial_hash,
+           "BAM batch reader changed split body record");
+
+cleanup:
+    unlink(split_body);
+    batch_reader_env(0, 0);
+}
+
 static void test_bam_stream_reader(void)
 {
     const char *partial_len = "test/test_bam_stream_reader.partial_len.tmp.bam";
@@ -3316,6 +3440,7 @@ int main(int argc, char **argv)
     test_bam_set1_write_and_read_back();
     test_bam_raw_block_copy();
     test_bam_ordered_reader();
+    test_bam_batch_reader();
     test_bam_stream_reader();
     test_cigar_api();
 

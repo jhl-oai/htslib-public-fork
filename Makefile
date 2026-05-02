@@ -871,7 +871,7 @@ test/hfile.o: test/hfile.c config.h $(htslib_hfile_h) $(htslib_hts_defs_h) $(hts
 test/pileup.o: test/pileup.c config.h $(htslib_sam_h) $(htslib_kstring_h)
 test/pileup_mod.o: test/pileup_mod.c config.h $(htslib_sam_h)
 test/plugins-dlhts.o: test/plugins-dlhts.c config.h
-test/sam.o: test/sam.c config.h $(htslib_hts_defs_h) $(htslib_sam_h) $(htslib_faidx_h) $(htslib_khash_h) $(htslib_hts_log_h)
+test/sam.o: test/sam.c config.h $(htslib_hts_defs_h) $(htslib_sam_h) $(htslib_hts_endian_h) $(htslib_faidx_h) $(htslib_khash_h) $(htslib_hts_log_h) $(sam_internal_h)
 test/test_bgzf.o: test/test_bgzf.c config.h $(htslib_bgzf_h) $(htslib_hfile_h) $(htslib_hts_log_h) $(hfile_internal_h)
 test/test_expr.o: test/test_expr.c config.h $(htslib_hts_expr_h)
 test/test_kfunc.o: test/test_kfunc.c config.h $(htslib_kfunc_h)
@@ -884,7 +884,7 @@ test/test_realn.o: test/test_realn.c config.h $(htslib_hts_h) $(htslib_sam_h) $(
 test/test-regidx.o: test/test-regidx.c config.h $(htslib_kstring_h) $(htslib_regidx_h) $(htslib_hts_defs_h) $(textutils_internal_h)
 test/test_str2int.o: test/test_str2int.c config.h $(textutils_internal_h)
 test/test_time_funcs.o: test/test_time_funcs.c config.h $(hts_time_funcs_h)
-test/test_view.o: test/test_view.c config.h $(cram_h) $(htslib_sam_h) $(htslib_vcf_h) $(htslib_hts_log_h)
+test/test_view.o: test/test_view.c config.h $(cram_h) $(htslib_sam_h) $(htslib_vcf_h) $(htslib_hts_log_h) $(sam_internal_h)
 test/test_faidx.o: test/test_faidx.c config.h $(htslib_faidx_h)
 test/test_index.o: test/test_index.c config.h $(htslib_sam_h) $(htslib_vcf_h)
 test/test-vcf-api.o: test/test-vcf-api.c config.h $(htslib_hts_h) $(htslib_vcf_h) $(htslib_vcfutils_h) $(htslib_kbitset_h) $(htslib_kstring_h) $(htslib_kseq_h)
