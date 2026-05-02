@@ -172,6 +172,11 @@ Smoke benchmark notes on `HG00096.exome.chr20.bam` with `test_view -B`
 - The first raw-copy parse-batch implementation was slower and was pruned.
 - A descriptor/materialize experiment that avoided worker-side `bam1_t`
   allocation was also slower in smoke tests and was pruned.
+- A later local experiment added recycled `bam1_t::data` buffers, grouped
+  multiple BGZF-block segments into one parse job, and cached libdeflate
+  decompressors for the custom decode workers.  It preserved parity but still
+  lost to current BGZF `-@` on repeated corpus sweeps, so it was pruned rather
+  than committed as product code.
 - The remaining experimental parse path is correctness-useful but still not a
   product-level win because worker-side `bam1_t` allocation and queue overhead
   remain significant.
@@ -179,7 +184,10 @@ Smoke benchmark notes on `HG00096.exome.chr20.bam` with `test_view -B`
 Next likely useful parse design:
 
 - Replace per-record worker allocations with a batch arena or reusable
-  `bam1_t` pool.
+  `bam1_t` pool only if the design preserves normal `bam1_t` lifetime after
+  file close.  Reader-owned arenas are unsafe for the existing `sam_read1()`
+  contract unless records are copied before returning or arena ownership is
+  transferred to the caller.
 - Keep frame references into ordered decompressed block buffers plus a small
   carry buffer for split records.
 - Keep `HTS_BAM_STREAM_PARSE=1` as a correctness scaffold until it beats BGZF
