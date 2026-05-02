@@ -3080,6 +3080,48 @@ cleanup:
     return ret;
 }
 
+static int write_split_valid_then_invalid_tid_bam_record(const char *path,
+                                                         size_t split)
+{
+    BGZF *fp = NULL;
+    uint8_t buf[4], rec[37];
+    int ret = -1;
+
+    if (split == 0 || split >= sizeof(rec))
+        return -1;
+
+    fp = bgzf_open(path, "wb");
+    if (!fp)
+        return -1;
+
+    if (bgzf_write(fp, "BAM\1", 4) != 4)
+        goto cleanup;
+    memset(buf, 0, sizeof(buf));
+    if (bgzf_write(fp, buf, 4) != 4) // l_text
+        goto cleanup;
+    if (bgzf_write(fp, buf, 4) != 4) // n_ref
+        goto cleanup;
+
+    fill_minimal_unmapped_record(rec);
+    if (bgzf_write(fp, rec, split) != (ssize_t)split)
+        goto cleanup;
+    if (bgzf_flush(fp) < 0)
+        goto cleanup;
+    if (bgzf_write(fp, rec + split, sizeof(rec) - split) !=
+        (ssize_t)(sizeof(rec) - split))
+        goto cleanup;
+
+    test_put_le32(rec + 4, 0); // tid, invalid because n_ref is zero
+    if (bgzf_write(fp, rec, sizeof(rec)) != sizeof(rec))
+        goto cleanup;
+    ret = 0;
+
+cleanup:
+    if (bgzf_close(fp) != 0)
+        ret = -1;
+    return ret;
+}
+
 static int read_one_bam_batch_ret(const char *path, int hts_threads)
 {
     samFile *fp = NULL;
@@ -3131,8 +3173,13 @@ static void check_bam_batch_valid_then_invalid_tid(const char *path,
            "BAM batch reader did not return valid prefix before invalid TID");
     sam_bam_batch_destroy(&batch);
 
+    errno = 0;
     ret = sam_bam_read_batch(fp, hdr, &batch);
     VERIFY(ret == -3, "BAM batch reader did not report invalid TID after prefix");
+    VERIFY(errno == ERANGE, "BAM batch invalid TID did not set errno");
+
+    ret = sam_bam_read_batch(fp, hdr, &batch);
+    VERIFY(ret == -1, "BAM batch reader re-reported invalid TID after error");
 
 cleanup:
     sam_bam_batch_destroy(&batch);
@@ -3513,6 +3560,8 @@ static void test_bam_batch_reader(void)
     const char *invalid_tid = "test/test_bam_batch_reader.invalid_tid.tmp.bam";
     const char *valid_then_invalid_tid =
         "test/test_bam_batch_reader.valid_then_invalid_tid.tmp.bam";
+    const char *split_valid_then_invalid_tid =
+        "test/test_bam_batch_reader.split_valid_then_invalid_tid.tmp.bam";
     uint64_t serial_hash = 0, batch_hash = 0;
     int serial_count = 0, batch_count = 0;
 
@@ -3520,6 +3569,7 @@ static void test_bam_batch_reader(void)
     unlink(invalid_core);
     unlink(invalid_tid);
     unlink(valid_then_invalid_tid);
+    unlink(split_valid_then_invalid_tid);
 
     read_range_bam_order_hash(0, 0, 0, 0, NULL, &serial_hash,
                               &serial_count);
@@ -3575,11 +3625,18 @@ static void test_bam_batch_reader(void)
     check_bam_batch_valid_then_invalid_tid(valid_then_invalid_tid, 0);
     check_bam_batch_valid_then_invalid_tid(valid_then_invalid_tid, 2);
 
+    VERIFY(write_split_valid_then_invalid_tid_bam_record(
+               split_valid_then_invalid_tid, 36) == 0,
+           "failed to create split valid-prefix invalid-TID BAM");
+    check_bam_batch_valid_then_invalid_tid(split_valid_then_invalid_tid, 0);
+    check_bam_batch_valid_then_invalid_tid(split_valid_then_invalid_tid, 2);
+
 cleanup:
     unlink(split_body);
     unlink(invalid_core);
     unlink(invalid_tid);
     unlink(valid_then_invalid_tid);
+    unlink(split_valid_then_invalid_tid);
     batch_reader_env(0, 0);
 }
 

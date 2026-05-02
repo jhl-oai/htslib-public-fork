@@ -1389,7 +1389,11 @@ int bgzf_read_block_compressed(BGZF *fp, bgzf_block_data_t *block)
         return -1;
     }
 
-    memset(block, 0, sizeof(*block));
+    block->block_address = 0;
+    block->comp_len = 0;
+    block->uncomp_len = 0;
+    block->hit_eof = 0;
+    block->errcode = 0;
 
     int64_t block_address = bgzf_htell(fp);
     int ret;

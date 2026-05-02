@@ -4372,9 +4372,14 @@ static int bam_stream_reader_dispatch_block(bam_stream_reader_t *reader)
     if (reader->input_eof || reader->input_error)
         return reader->input_error ? -1 : 0;
 
-    job = calloc(1, sizeof(*job));
+    job = malloc(sizeof(*job));
     if (!job)
         return -1;
+    job->block.block_address = 0;
+    job->block.comp_len = 0;
+    job->block.uncomp_len = 0;
+    job->block.hit_eof = 0;
+    job->block.errcode = 0;
 
     if (bgzf_read_block_compressed(reader->bgzf, &job->block) < 0) {
         free(job);
@@ -4632,6 +4637,26 @@ static int bam_stream_reader_carry_append(bam_stream_reader_t *reader,
     return 0;
 }
 
+static int bam_stream_reader_carry_reserve_frame(bam_stream_reader_t *reader,
+                                                 const uint8_t *data,
+                                                 size_t pos, size_t end)
+{
+    int32_t block_len;
+    size_t frame_len;
+
+    if (end - pos < 4)
+        return 0;
+    block_len = le_to_i32(data + pos);
+    if (block_len < 32)
+        return 0;
+    frame_len = 4 + (size_t)block_len;
+    if (frame_len > BAM_STREAM_PARSE_BATCH_BYTES)
+        return 0;
+    if (frame_len <= end - pos)
+        return 0;
+    return bam_stream_reader_carry_reserve(reader, frame_len) < 0 ? -2 : 0;
+}
+
 static int bam_stream_reader_carry_error(bam_stream_reader_t *reader)
 {
     if (reader->carry_len == 0)
@@ -4782,6 +4807,119 @@ static int bam_batch_record_view_append(bam_batch_record_t **views,
     return 0;
 }
 
+static int bam_stream_parse_job_append_owned_frame(bam_stream_parse_job_t *job,
+                                                  const uint8_t *frame,
+                                                  size_t frame_len)
+{
+    if (bam_stream_parse_job_reserve(job, frame_len) < 0)
+        return -2;
+    memcpy(job->data + job->len, frame, frame_len);
+    job->len += frame_len;
+    job->n_records++;
+    return 0;
+}
+
+static int bam_stream_parse_job_build_views(bam_stream_parse_job_t *job,
+                                            sam_hdr_t *h)
+{
+    bam_batch_record_t *views = NULL;
+    size_t pos = 0;
+    int n_records = 0, m_views = 0;
+
+    while (pos + 4 <= job->len) {
+        int32_t block_len = le_to_i32(job->data + pos);
+        size_t frame_len;
+        int vret;
+
+        if (block_len < 32) {
+            free(views);
+            return -4;
+        }
+        frame_len = 4 + (size_t)block_len;
+        if (frame_len > job->len - pos ||
+            bam_validate1_body_core(block_len, job->data + pos + 4) < 0) {
+            free(views);
+            return -4;
+        }
+        vret = bam_batch_record_view_append(&views, &n_records, &m_views,
+                                            job->data + pos, frame_len, h);
+        if (vret < 0) {
+            free(views);
+            return vret == -3 ? -3 : -2;
+        }
+        pos += frame_len;
+    }
+
+    if (pos != job->len || n_records != job->n_records) {
+        free(views);
+        return -4;
+    }
+    job->views = views;
+    return 0;
+}
+
+static int bam_stream_reader_extend_owned_job_from_block(
+        bam_stream_reader_t *reader, bam_stream_parse_job_t *job,
+        int build_views, sam_hdr_t *h)
+{
+    BGZF *bgzf = reader->bgzf;
+    uint8_t *data = reader->block->uncomp_data;
+    size_t pos = reader->block_off;
+    size_t end = (size_t)reader->block->uncomp_len;
+
+    while (pos + 4 <= end &&
+           job->n_records < BAM_STREAM_PARSE_BATCH_RECORDS &&
+           job->len < BAM_STREAM_PARSE_BATCH_BYTES) {
+        int32_t block_len = le_to_i32(data + pos);
+        size_t frame_len;
+
+        if (block_len < 32) {
+            reader->pending_frame_error = -4;
+            break;
+        }
+        frame_len = 4 + (size_t)block_len;
+        if (job->len + frame_len > BAM_STREAM_PARSE_BATCH_BYTES)
+            break;
+        if (frame_len > end - pos)
+            break;
+        if (bam_validate1_body_core(block_len, data + pos + 4) < 0) {
+            reader->pending_frame_error = -4;
+            break;
+        }
+        if (build_views) {
+            bam_batch_record_t view;
+
+            bam_batch_record_view_set(&view, data + pos, frame_len);
+            if (!bam_batch_record_view_tid_valid(&view, h)) {
+                reader->pending_frame_error = -3;
+                errno = ERANGE;
+                break;
+            }
+        }
+        if (bam_stream_parse_job_append_owned_frame(job, data + pos,
+                                                   frame_len) < 0)
+            return -2;
+        pos += frame_len;
+    }
+
+    reader->block_off = pos;
+    bgzf->block_offset = (int)reader->block_off;
+
+    if (pos < end && !reader->pending_frame_error &&
+        job->n_records < BAM_STREAM_PARSE_BATCH_RECORDS &&
+        job->len < BAM_STREAM_PARSE_BATCH_BYTES) {
+        if (bam_stream_reader_carry_append(reader, data + pos, end - pos) < 0)
+            return -2;
+        reader->block_off = end;
+        bgzf->block_offset = (int)reader->block_off;
+        bam_stream_reader_release_block(reader);
+    } else if (pos == end || reader->pending_frame_error) {
+        bam_stream_reader_release_block(reader);
+    }
+
+    return 0;
+}
+
 static int bam_stream_reader_build_parse_job(bam_stream_reader_t *reader,
                                              bam_stream_parse_job_t **job_out,
                                              int build_views, sam_hdr_t *h)
@@ -4836,6 +4974,9 @@ static int bam_stream_reader_build_parse_job(bam_stream_reader_t *reader,
                 return -4;
             }
             frame_len = 4 + (size_t)block_len;
+            if (frame_len <= BAM_STREAM_PARSE_BATCH_BYTES &&
+                bam_stream_reader_carry_reserve(reader, frame_len) < 0)
+                return -2;
             need = frame_len - reader->carry_len;
             avail = end - reader->block_off;
             if (need > avail)
@@ -4862,18 +5003,22 @@ static int bam_stream_reader_build_parse_job(bam_stream_reader_t *reader,
             job->is_be = bgzf->is_be;
             reader->carry = NULL;
             reader->carry_len = reader->carry_cap = 0;
-            if (build_views) {
-                job->views = malloc(sizeof(*job->views));
-                if (!job->views) {
+            if (reader->block_off < end) {
+                int eret = bam_stream_reader_extend_owned_job_from_block(
+                        reader, job, build_views, h);
+                if (eret < 0) {
                     bam_stream_parse_job_free(job);
-                    return -2;
+                    return eret;
                 }
-                bam_batch_record_view_set(&job->views[0], job->data,
-                                          frame_len);
-                if (!bam_batch_record_view_tid_valid(&job->views[0], h)) {
+            }
+            if (build_views) {
+                int vret = bam_stream_parse_job_build_views(job, h);
+
+                if (vret < 0) {
                     bam_stream_parse_job_free(job);
-                    errno = ERANGE;
-                    return -3;
+                    if (vret == -3)
+                        errno = ERANGE;
+                    return vret;
                 }
             }
             *job_out = job;
@@ -4937,12 +5082,15 @@ static int bam_stream_reader_build_parse_job(bam_stream_reader_t *reader,
             job->is_be = bgzf->is_be;
             job->views = views;
             views = NULL;
-            job->owned_block_result = reader->block_result;
-            reader->block_result = NULL;
             reader->block_off = pos;
             bgzf->block_offset = (int)reader->block_off;
 
             if (pos < end && !reader->pending_frame_error) {
+                if (bam_stream_reader_carry_reserve_frame(reader, data, pos,
+                                                          end) < 0) {
+                    bam_stream_parse_job_free(job);
+                    return -2;
+                }
                 if (bam_stream_reader_carry_append(reader, data + pos,
                                                    end - pos) < 0) {
                     bam_stream_parse_job_free(job);
@@ -4952,12 +5100,17 @@ static int bam_stream_reader_build_parse_job(bam_stream_reader_t *reader,
                 bgzf->block_offset = (int)reader->block_off;
             }
 
+            job->owned_block_result = reader->block_result;
+            reader->block_result = NULL;
             reader->block = NULL;
             *job_out = job;
             return 1;
         }
 
         if (pos < end) {
+            if (bam_stream_reader_carry_reserve_frame(reader, data, pos,
+                                                      end) < 0)
+                return -2;
             if (bam_stream_reader_carry_append(reader, data + pos,
                                                end - pos) < 0)
                 return -2;
@@ -5055,6 +5208,8 @@ static int bam_stream_reader_next_parsed(bam_stream_reader_t *reader, bam1_t *b)
             if (reader->pending_frame_error) {
                 int ret = reader->pending_frame_error;
                 reader->pending_frame_error = 0;
+                if (ret == -3)
+                    errno = ERANGE;
                 return ret;
             }
             if (reader->parse_input_error)
@@ -5265,6 +5420,8 @@ int sam_bam_read_batch(htsFile *fp, sam_hdr_t *h, bam_batch_t *batch)
     if (reader->pending_frame_error) {
         ret = reader->pending_frame_error;
         reader->pending_frame_error = 0;
+        if (ret == -3)
+            errno = ERANGE;
         return ret;
     }
     if (reader->parse_input_error)

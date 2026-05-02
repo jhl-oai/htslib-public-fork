@@ -65,6 +65,13 @@ reader:
   explicit `htsThreadPool.qsize` is supplied.  This stays bounded while avoiding
   the shallow `2 * threads` queue depth that underfed larger read-throughput
   workloads.
+- The compressed-block helper initializes only scalar metadata before reading
+  each BGZF block instead of clearing the two 64 KiB block buffers.  The stream
+  reader also allocates decode jobs without zeroing those buffers.
+- Split-record batches pre-reserve bounded carry capacity once the BAM frame
+  length is known.  When a carried long record completes, the reader can append
+  following complete records from the same decoded block into the same owned
+  batch, reducing one-record batches on long-read BAMs without changing order.
 
 ## First Implementation Slice
 
@@ -130,18 +137,19 @@ Repeated median-of-five benchmark notes from the local BAM corpus:
 test_view -B, lower is better
 
 Input                         BGZF -@1  Batch -@1  BGZF -@4  Batch -@4  BGZF -@8  Batch -@8
-HG00096.exome.chr20.bam          0.60s      0.59s      0.25s      0.16s      0.24s      0.15s
+HG00096.exome.chr20.bam          0.62s      0.63s      0.27s      0.16s      0.27s      0.09s
 HG00096.lowcov.chr20_10-20Mb     0.16s      0.17s      0.07s      0.05s      0.07s      0.05s
 HG00096.highcov.chr20_10-11Mb    0.21s      0.21s      0.06s      0.06s      0.05s      0.04s
 HG002.ont_ul.chr20_10-10.2Mb     0.05s      0.05s      0.01s      0.02s      0.01s      0.01s
-HG002.ont_ul.chr20_10-15Mb       0.75s      0.73s      0.21s      0.20s      0.11s      0.13s
+HG002.ont_ul.chr20_10-15Mb       0.80s      0.80s      0.21s      0.20s      0.11s      0.10s
 ```
 
 The current slice is faster on the medium short-read workloads and neutral on
-the tiny highcov/ONT slices.  The larger exome slice reaches roughly 1.6x at
-`-@8`.  The larger 5 Mb ONT slice is neutral at `-@4` but slower than BGZF at
-`-@8`, which points to long-read/high-thread decompression scheduling rather
-than per-record materialization as the limiting regime.
+the tiny highcov/ONT slices.  The larger exome slice reaches roughly 1.7x at
+`-@4` and 3.0x at `-@8` in the batch-consuming benchmark path.  The larger
+5 Mb ONT slice is now neutral to slightly faster at `-@4/-@8`; the retained
+fixes were avoiding per-block buffer clearing and reducing split-record batch
+fragmentation.
 
 The previous transparent stream/parse prototype on `feature/bam-throughput-product`
 was benchmarked with the same `test_view -B` shape:
@@ -159,9 +167,9 @@ HG002.ont_ul.chr20_10-15Mb       0.78s       0.80s      0.21s       0.23s      0
 
 That comparison preserves the earlier conclusion: transparent `sam_read1()`
 parallel parsing does not compose cleanly with the existing one-record-at-a-time
-materialization contract.  The batch reader is still the better direction for
-tool-facing throughput work, but the larger ONT rows show that this prototype
-does not yet satisfy the strict `-@8` not-slower gate for long-read workloads.
+materialization contract.  The batch reader remains the better direction for
+tool-facing throughput work, and the later block/carry fixes remove the larger
+ONT `-@8` regression seen in the first batch-reader cut.
 
 ## Samtools Consumer Experiment
 
@@ -178,17 +186,17 @@ Median-of-five local timings from `/tmp/samtools_batch_view_bench.tsv`:
 samtools view -c, lower is better
 
 Input                         BGZF -@1  Batch -@1  BGZF -@4  Batch -@4  BGZF -@8  Batch -@8
-HG00096.exome.chr20.bam          0.60s      0.62s      0.27s      0.20s      0.28s      0.19s
+HG00096.exome.chr20.bam          0.60s      0.62s      0.28s      0.16s      0.28s      0.09s
 HG00096.lowcov.chr20_10-20Mb     0.17s      0.17s      0.07s      0.06s      0.08s      0.05s
 HG00096.highcov.chr20_10-11Mb    0.22s      0.22s      0.06s      0.06s      0.05s      0.04s
 HG002.ont_ul.chr20_10-10.2Mb     0.05s      0.05s      0.02s      0.02s      0.01s      0.02s
-HG002.ont_ul.chr20_10-15Mb       0.74s      0.75s      0.20s      0.20s      0.10s      0.16s
+HG002.ont_ul.chr20_10-15Mb       0.74s      0.75s      0.20s      0.20s      0.11s      0.10s
 ```
 
 The end-to-end count consumer is neutral at one thread, faster on the larger
-short-read slices with `-@`, and still dominated by timing noise on the tiny
-ONT slice.  The plain count path now validates long-CIGAR `CG` candidates and
-mapped raw-CIGAR query lengths to match the normal decode error contract.
+short-read slices with `-@`, and neutral on the larger ONT slice at `-@8`.
+The plain count path now validates long-CIGAR `CG` candidates and mapped
+raw-CIGAR query lengths to match the normal decode error contract.
 
 Median-of-five local timings for the raw-CIGAR `-m 75` count fast path from
 `/tmp/samtools_batch_minqlen_bench.tsv`:
@@ -197,20 +205,20 @@ Median-of-five local timings for the raw-CIGAR `-m 75` count fast path from
 samtools view -c -m 75, lower is better
 
 Input                         BGZF -@4  Batch -@4  BGZF -@8  Batch -@8
-HG00096.exome.chr20.bam          0.28s      0.20s      0.28s      0.19s
+HG00096.exome.chr20.bam          0.29s      0.19s      0.29s      0.15s
 HG00096.lowcov.chr20_10-20Mb     0.07s      0.06s      0.07s      0.05s
 HG00096.highcov.chr20_10-11Mb    0.06s      0.06s      0.05s      0.05s
 HG002.ont_ul.chr20_10-10.2Mb     0.02s      0.02s      0.01s      0.02s
-HG002.ont_ul.chr20_10-15Mb       0.21s      0.20s      0.11s      0.16s
+HG002.ont_ul.chr20_10-15Mb       0.21s      0.20s      0.10s      0.10s
 ```
 
 This extends the fast path beyond core-only predicates while keeping the same
-short-read benefit.  The ONT slice is too small for stable timing and remains a
-prototype-only datapoint.  `-B` remains excluded from this fast path because
-normal `samtools view` applies `bam_remove_B()` before query-length and flag
-filtering.  Long-CIGAR `CG` candidates are selectively materialized for
-correct query-length semantics and malformed-input parity; ordinary records
-validate raw CIGAR query length before filtering.
+short-read benefit.  The larger ONT slice no longer regresses at `-@8` in this
+consumer path.  `-B` remains excluded from this fast path because normal
+`samtools view` applies `bam_remove_B()` before query-length and flag filtering.
+Long-CIGAR `CG` candidates are selectively materialized for correct query-length
+semantics and malformed-input parity; ordinary records validate raw CIGAR query
+length before filtering.
 
 ## Benchmark Gate
 
@@ -219,6 +227,8 @@ and the previous stream/parse prototype on the local BAM corpus at `1/4/8`
 threads.  The batch path should not be slower than BGZF `-@` at `4/8` threads
 and should target at least 1.5x on medium/large read-throughput workloads.
 
-The current prototype does not meet that gate on the larger ONT slice at `-@8`.
-Keep it prototype-only unless a later iteration removes that long-read
-high-thread regression.
+The current benchmark path now meets the local not-slower gate on the larger
+ONT slice at `-@4/-@8` and exceeds the 1.5x target on the exome short-read
+slice.  It remains prototype-only because the only real samtools consumer is
+the narrow opt-in count experiment; broader command integration still needs
+separate design and validation.
