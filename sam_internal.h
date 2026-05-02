@@ -44,6 +44,8 @@ typedef struct bam_batch_record_t {
     size_t frame_len;
     const uint8_t *body;
     uint32_t raw_l_data;
+    // Core values are decoded from the raw BAM frame.  l_qname remains the
+    // on-wire length, so body + core.l_qname points at raw CIGAR data.
     bam1_core_t core;
 } bam_batch_record_t;
 

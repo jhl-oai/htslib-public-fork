@@ -83,14 +83,21 @@ reader:
 - Each batch includes lightweight `bam_batch_record_t` views with frame/body
   pointers, raw payload length, and decoded core fields.  This lets internal
   consumers inspect per-record metadata without allocating `bam1_t` objects.
+- Descriptor construction is fused into the frame scan for batch reads, so the
+  batch path no longer scans each raw frame once to count and again to build
+  record views.
+- Batch frame scanning validates BAM core layout before exposing record views,
+  and serial batches detach their backing data so live batches survive
+  `htsFile` close just like threaded block-backed batches.
 - `test/test_view.c` has a benchmark-only batch consumer for BAM input under
   `HTS_BAM_BATCH_READER=1` and `-B`; it walks record views without
   materializing every record as a `bam1_t`.
 - `test/sam.c` covers batch parity by rewriting returned raw frames into a
   temporary BAM and comparing ordinary `sam_read1()` hash/count results.  It
   covers serial batch reads, `hts_set_threads()`, borrowed
-  `HTS_OPT_THREAD_POOL`, split-record payload handling, and live batch data
-  surviving `htsFile` close until `sam_bam_batch_destroy()`.
+  `HTS_OPT_THREAD_POOL`, split-record payload handling, malformed core
+  rejection, and live serial/threaded batch data surviving `htsFile` close
+  until `sam_bam_batch_destroy()`.
 
 Verification so far:
 
@@ -108,18 +115,17 @@ Repeated median-of-five benchmark notes from `/tmp/bam_batch_bench.tsv`:
 test_view -B, lower is better
 
 Input                         BGZF -@4  Batch -@4  BGZF -@8  Batch -@8
-HG00096.exome.chr20.bam          0.28s      0.20s      0.28s      0.18s
-HG00096.lowcov.chr20_10-20Mb     0.08s      0.07s      0.08s      0.07s
-HG00096.highcov.chr20_10-11Mb    0.07s      0.08s      0.06s      0.06s
-HG002.ont_ul.chr20_10-10.2Mb     0.03s      0.03s      0.02s      0.03s
+HG00096.exome.chr20.bam          0.28s      0.19s      0.28s      0.16s
+HG00096.lowcov.chr20_10-20Mb     0.08s      0.06s      0.08s      0.06s
+HG00096.highcov.chr20_10-11Mb    0.07s      0.07s      0.06s      0.06s
+HG002.ont_ul.chr20_10-10.2Mb     0.03s      0.03s      0.02s      0.02s
 ```
 
-The first slice is directionally useful on medium short-read workloads, but it
-does not yet clear the product gate broadly.  The tiny ONT slice is too small
-to amortize batch setup and header validation, and highcov remains effectively
-neutral.  The next step is either a real tool-facing batch consumer or a richer
-record-view surface that lets tools do useful work without materializing every
-record.
+The current slice is faster on the medium short-read workloads and neutral on
+the tiny highcov/ONT slices.  It now clears the local "not slower than BGZF
+`-@`" benchmark sweep, but only the larger exome slice reaches roughly 1.5x.
+The next step is a real tool-facing batch consumer that can convert this
+internal record-view surface into end-to-end samtools speedups.
 
 ## Benchmark Gate
 

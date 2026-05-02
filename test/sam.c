@@ -2610,7 +2610,7 @@ static uint64_t batch_reader_bytes_hash(const bam_batch_t *batch)
     return h;
 }
 
-static void check_bam_batch_survives_close(const char *path)
+static void check_bam_batch_survives_close(const char *path, int hts_threads)
 {
     samFile *fp = NULL;
     sam_hdr_t *hdr = NULL;
@@ -2622,8 +2622,9 @@ static void check_bam_batch_survives_close(const char *path)
 
     fp = sam_open(path, "rb");
     VERIFY(fp != NULL, "failed to open BAM for batch lifetime test");
-    VERIFY(hts_set_threads(fp, 2) == 0,
-           "failed to set BAM batch lifetime threads");
+    if (hts_threads > 0)
+        VERIFY(hts_set_threads(fp, hts_threads) == 0,
+               "failed to set BAM batch lifetime threads");
     hdr = sam_hdr_read(fp);
     VERIFY(hdr != NULL, "failed to read BAM header");
 
@@ -2902,6 +2903,79 @@ static int write_split_bam_record(const char *path, size_t split)
 cleanup:
     if (bgzf_close(fp) != 0)
         ret = -1;
+    return ret;
+}
+
+static int write_invalid_core_bam_record(const char *path)
+{
+    BGZF *fp = NULL;
+    uint8_t buf[4], core[32];
+    int ret = -1;
+
+    fp = bgzf_open(path, "wb");
+    if (!fp)
+        return -1;
+
+    if (bgzf_write(fp, "BAM\1", 4) != 4)
+        goto cleanup;
+    memset(buf, 0, sizeof(buf));
+    if (bgzf_write(fp, buf, 4) != 4) // l_text
+        goto cleanup;
+    if (bgzf_write(fp, buf, 4) != 4) // n_ref
+        goto cleanup;
+
+    test_put_le32(buf, 33);
+    if (bgzf_write(fp, buf, 4) != 4)
+        goto cleanup;
+
+    memset(core, 0, sizeof(core));
+    test_put_le32(core, 0xffffffffu);      // tid
+    test_put_le32(core + 4, 0xffffffffu);  // pos
+    test_put_le32(core + 8, 2);            // l_qname too large for body
+    test_put_le32(core + 12, BAM_FUNMAP << 16);
+    test_put_le32(core + 16, 0);           // l_qseq
+    test_put_le32(core + 20, 0xffffffffu); // mtid
+    test_put_le32(core + 24, 0xffffffffu); // mpos
+    test_put_le32(core + 28, 0);           // isize
+
+    if (bgzf_write(fp, core, sizeof(core)) != sizeof(core))
+        goto cleanup;
+    buf[0] = '\0';
+    if (bgzf_write(fp, buf, 1) != 1)
+        goto cleanup;
+    ret = 0;
+
+cleanup:
+    if (bgzf_close(fp) != 0)
+        ret = -1;
+    return ret;
+}
+
+static int read_one_bam_batch_ret(const char *path, int hts_threads)
+{
+    samFile *fp = NULL;
+    sam_hdr_t *hdr = NULL;
+    bam_batch_t batch = {0};
+    int ret = -999;
+
+    batch_reader_env(1, 1);
+
+    fp = sam_open(path, "rb");
+    if (!fp)
+        goto cleanup;
+    if (hts_threads > 0 && hts_set_threads(fp, hts_threads) < 0)
+        goto cleanup;
+    hdr = sam_hdr_read(fp);
+    if (!hdr)
+        goto cleanup;
+    ret = sam_bam_read_batch(fp, hdr, &batch);
+
+cleanup:
+    sam_bam_batch_destroy(&batch);
+    sam_hdr_destroy(hdr);
+    if (fp)
+        sam_close(fp);
+    batch_reader_env(0, 0);
     return ret;
 }
 
@@ -3272,10 +3346,12 @@ cleanup:
 static void test_bam_batch_reader(void)
 {
     const char *split_body = "test/test_bam_batch_reader.split_body.tmp.bam";
+    const char *invalid_core = "test/test_bam_batch_reader.invalid_core.tmp.bam";
     uint64_t serial_hash = 0, batch_hash = 0;
     int serial_count = 0, batch_count = 0;
 
     unlink(split_body);
+    unlink(invalid_core);
 
     read_range_bam_order_hash(0, 0, 0, 0, NULL, &serial_hash,
                               &serial_count);
@@ -3309,10 +3385,19 @@ static void test_bam_batch_reader(void)
     VERIFY(batch_count == serial_count && batch_hash == serial_hash,
            "BAM batch reader changed split body record");
 
-    check_bam_batch_survives_close("test/range.bam");
+    check_bam_batch_survives_close("test/range.bam", 0);
+    check_bam_batch_survives_close("test/range.bam", 2);
+
+    VERIFY(write_invalid_core_bam_record(invalid_core) == 0,
+           "failed to create invalid-core BAM");
+    VERIFY(read_one_bam_batch_ret(invalid_core, 0) == -4,
+           "BAM batch reader accepted invalid core layout");
+    VERIFY(read_one_bam_batch_ret(invalid_core, 2) == -4,
+           "threaded BAM batch reader accepted invalid core layout");
 
 cleanup:
     unlink(split_body);
+    unlink(invalid_core);
     batch_reader_env(0, 0);
 }
 
