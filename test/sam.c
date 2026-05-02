@@ -41,6 +41,7 @@ DEALINGS IN THE SOFTWARE.  */
 #define HTS_DEPRECATED(message)
 
 #include "../htslib/sam.h"
+#include "../htslib/bgzf.h"
 #include "../htslib/faidx.h"
 #include "../htslib/khash.h"
 #include "../htslib/hts_log.h"
@@ -2381,6 +2382,25 @@ static void ordered_reader_env(int enable, int strict, const char *threads)
     }
 }
 
+static void stream_reader_env(int enable, int strict, const char *chunk)
+{
+    if (enable) {
+        setenv("HTS_BAM_STREAM_READER", "1", 1);
+        if (strict)
+            setenv("HTS_BAM_STREAM_READER_REQUIRE", "1", 1);
+        else
+            unsetenv("HTS_BAM_STREAM_READER_REQUIRE");
+        if (chunk)
+            setenv("HTS_BAM_STREAM_READER_CHUNK", chunk, 1);
+        else
+            unsetenv("HTS_BAM_STREAM_READER_CHUNK");
+    } else {
+        unsetenv("HTS_BAM_STREAM_READER");
+        unsetenv("HTS_BAM_STREAM_READER_REQUIRE");
+        unsetenv("HTS_BAM_STREAM_READER_CHUNK");
+    }
+}
+
 static void read_bam_order_hash(const char *path, int use_ordered_reader,
                                 int hts_threads, int use_thread_pool,
                                 int strict_ordered_reader,
@@ -2431,6 +2451,90 @@ cleanup:
     if (p.pool)
         hts_tpool_destroy(p.pool);
     ordered_reader_env(0, 0, NULL);
+}
+
+static void read_bam_stream_hash(const char *path, int hts_threads,
+                                 int use_thread_pool, const char *chunk,
+                                 uint64_t *hash, int *count)
+{
+    samFile *fp = NULL;
+    sam_hdr_t *hdr = NULL;
+    bam1_t *b = NULL;
+    htsThreadPool p = {NULL, 0};
+    int ret;
+
+    stream_reader_env(1, 1, chunk);
+
+    *hash = 1469598103934665603ULL;
+    *count = 0;
+    fp = sam_open(path, "rb");
+    VERIFY(fp != NULL, "failed to open BAM");
+    if (hts_threads > 0) {
+        if (use_thread_pool) {
+            p.pool = hts_tpool_init(hts_threads);
+            p.qsize = hts_threads * 2;
+            VERIFY(p.pool != NULL, "failed to create BAM reader thread pool");
+            VERIFY(hts_set_thread_pool(fp, &p) == 0,
+                   "failed to set BAM reader thread pool");
+        } else {
+            VERIFY(hts_set_threads(fp, hts_threads) == 0,
+                   "failed to set BAM reader threads");
+        }
+    }
+    hdr = sam_hdr_read(fp);
+    VERIFY(hdr != NULL, "failed to read BAM header");
+    b = bam_init1();
+    VERIFY(b != NULL, "failed to initialize BAM record");
+
+    while ((ret = sam_read1(fp, hdr, b)) >= 0) {
+        *hash = ordered_reader_record_hash(*hash, b);
+        (*count)++;
+    }
+    VERIFY(ret == -1, "failed to read all BAM records");
+
+cleanup:
+    bam_destroy1(b);
+    sam_hdr_destroy(hdr);
+    if (fp)
+        sam_close(fp);
+    if (p.pool)
+        hts_tpool_destroy(p.pool);
+    stream_reader_env(0, 0, NULL);
+}
+
+static void read_bam_stream_late_fallback_hash(const char *path,
+                                               uint64_t *hash, int *count)
+{
+    samFile *fp = NULL;
+    sam_hdr_t *hdr = NULL;
+    bam1_t *b = NULL;
+    int ret;
+
+    stream_reader_env(0, 0, NULL);
+
+    *hash = 1469598103934665603ULL;
+    *count = 0;
+    fp = sam_open(path, "rb");
+    VERIFY(fp != NULL, "failed to open BAM");
+    VERIFY(hts_set_threads(fp, 2) == 0, "failed to set BAM reader threads");
+    stream_reader_env(1, 0, "7");
+    hdr = sam_hdr_read(fp);
+    VERIFY(hdr != NULL, "failed to read BAM header");
+    b = bam_init1();
+    VERIFY(b != NULL, "failed to initialize BAM record");
+
+    while ((ret = sam_read1(fp, hdr, b)) >= 0) {
+        *hash = ordered_reader_record_hash(*hash, b);
+        (*count)++;
+    }
+    VERIFY(ret == -1, "failed to read all BAM records");
+
+cleanup:
+    bam_destroy1(b);
+    sam_hdr_destroy(hdr);
+    if (fp)
+        sam_close(fp);
+    stream_reader_env(0, 0, NULL);
 }
 
 static void read_range_bam_order_hash(int use_ordered_reader,
@@ -2538,6 +2642,237 @@ cleanup:
     if (in)
         fclose(in);
     return ret;
+}
+
+static void test_put_le32(uint8_t *buf, uint32_t val)
+{
+    buf[0] = val & 0xff;
+    buf[1] = (val >> 8) & 0xff;
+    buf[2] = (val >> 16) & 0xff;
+    buf[3] = (val >> 24) & 0xff;
+}
+
+static int write_partial_bam_record(const char *path, int mode)
+{
+    BGZF *fp = NULL;
+    uint8_t buf[4], core[32];
+    int ret = -1;
+
+    fp = bgzf_open(path, "wb");
+    if (!fp)
+        return -1;
+
+    if (bgzf_write(fp, "BAM\1", 4) != 4)
+        goto cleanup;
+    memset(buf, 0, sizeof(buf));
+    if (bgzf_write(fp, buf, 4) != 4) // l_text
+        goto cleanup;
+    if (bgzf_write(fp, buf, 4) != 4) // n_ref
+        goto cleanup;
+
+    test_put_le32(buf, 33);
+    if (mode == 0) {
+        if (bgzf_write(fp, buf, 2) != 2)
+            goto cleanup;
+        ret = 0;
+        goto cleanup;
+    }
+
+    if (bgzf_write(fp, buf, 4) != 4)
+        goto cleanup;
+
+    memset(core, 0, sizeof(core));
+    test_put_le32(core, 0xffffffffu);      // tid
+    test_put_le32(core + 4, 0xffffffffu);  // pos
+    test_put_le32(core + 8, 1);            // l_qname
+    test_put_le32(core + 12, BAM_FUNMAP << 16);
+    test_put_le32(core + 16, 0);           // l_qseq
+    test_put_le32(core + 20, 0xffffffffu); // mtid
+    test_put_le32(core + 24, 0xffffffffu); // mpos
+    test_put_le32(core + 28, 0);           // isize
+
+    if (mode == 1) {
+        if (bgzf_write(fp, core, 10) != 10)
+            goto cleanup;
+        ret = 0;
+        goto cleanup;
+    }
+
+    if (bgzf_write(fp, core, sizeof(core)) != sizeof(core))
+        goto cleanup;
+    ret = 0;
+
+cleanup:
+    if (bgzf_close(fp) != 0)
+        ret = -1;
+    return ret;
+}
+
+static void fill_minimal_unmapped_record(uint8_t *rec)
+{
+    memset(rec, 0, 37);
+    test_put_le32(rec, 33);
+    test_put_le32(rec + 4, 0xffffffffu);      // tid
+    test_put_le32(rec + 8, 0xffffffffu);      // pos
+    test_put_le32(rec + 12, 1);               // l_qname
+    test_put_le32(rec + 16, BAM_FUNMAP << 16);
+    test_put_le32(rec + 20, 0);               // l_qseq
+    test_put_le32(rec + 24, 0xffffffffu);     // mtid
+    test_put_le32(rec + 28, 0xffffffffu);     // mpos
+    test_put_le32(rec + 32, 0);               // isize
+    rec[36] = '\0';                           // qname
+}
+
+static int write_split_bam_record(const char *path, size_t split)
+{
+    BGZF *fp = NULL;
+    uint8_t buf[4], rec[37];
+    int ret = -1;
+
+    if (split == 0 || split >= sizeof(rec))
+        return -1;
+
+    fp = bgzf_open(path, "wb");
+    if (!fp)
+        return -1;
+
+    if (bgzf_write(fp, "BAM\1", 4) != 4)
+        goto cleanup;
+    memset(buf, 0, sizeof(buf));
+    if (bgzf_write(fp, buf, 4) != 4) // l_text
+        goto cleanup;
+    if (bgzf_write(fp, buf, 4) != 4) // n_ref
+        goto cleanup;
+
+    fill_minimal_unmapped_record(rec);
+    if (bgzf_write(fp, rec, split) != (ssize_t)split)
+        goto cleanup;
+    if (bgzf_flush(fp) < 0)
+        goto cleanup;
+    if (bgzf_write(fp, rec + split, sizeof(rec) - split) !=
+        (ssize_t)(sizeof(rec) - split))
+        goto cleanup;
+    ret = 0;
+
+cleanup:
+    if (bgzf_close(fp) != 0)
+        ret = -1;
+    return ret;
+}
+
+static int write_valid_then_partial_bam_record(const char *path, int mode)
+{
+    BGZF *fp = NULL;
+    uint8_t buf[4], rec[37], core[32];
+    int ret = -1;
+
+    fp = bgzf_open(path, "wb");
+    if (!fp)
+        return -1;
+
+    if (bgzf_write(fp, "BAM\1", 4) != 4)
+        goto cleanup;
+    memset(buf, 0, sizeof(buf));
+    if (bgzf_write(fp, buf, 4) != 4) // l_text
+        goto cleanup;
+    if (bgzf_write(fp, buf, 4) != 4) // n_ref
+        goto cleanup;
+
+    fill_minimal_unmapped_record(rec);
+    if (bgzf_write(fp, rec, sizeof(rec)) != sizeof(rec))
+        goto cleanup;
+
+    test_put_le32(buf, 33);
+    if (mode == 0) {
+        if (bgzf_write(fp, buf, 2) != 2)
+            goto cleanup;
+        ret = 0;
+        goto cleanup;
+    }
+    if (bgzf_write(fp, buf, 4) != 4)
+        goto cleanup;
+
+    memset(core, 0, sizeof(core));
+    test_put_le32(core, 0xffffffffu);
+    test_put_le32(core + 4, 0xffffffffu);
+    test_put_le32(core + 8, 1);
+    test_put_le32(core + 12, BAM_FUNMAP << 16);
+    test_put_le32(core + 20, 0xffffffffu);
+    test_put_le32(core + 24, 0xffffffffu);
+
+    if (mode == 1) {
+        if (bgzf_write(fp, core, 10) != 10)
+            goto cleanup;
+        ret = 0;
+        goto cleanup;
+    }
+    if (bgzf_write(fp, core, sizeof(core)) != sizeof(core))
+        goto cleanup;
+    ret = 0;
+
+cleanup:
+    if (bgzf_close(fp) != 0)
+        ret = -1;
+    return ret;
+}
+
+static int read_one_bam_ret(const char *path, int use_stream)
+{
+    samFile *fp = NULL;
+    sam_hdr_t *hdr = NULL;
+    bam1_t *b = NULL;
+    int ret = -999;
+
+    stream_reader_env(use_stream, 1, "7");
+    fp = sam_open(path, "rb");
+    if (!fp)
+        goto cleanup;
+    hdr = sam_hdr_read(fp);
+    if (!hdr)
+        goto cleanup;
+    b = bam_init1();
+    if (!b)
+        goto cleanup;
+
+    ret = sam_read1(fp, hdr, b);
+
+cleanup:
+    bam_destroy1(b);
+    sam_hdr_destroy(hdr);
+    if (fp)
+        sam_close(fp);
+    stream_reader_env(0, 0, NULL);
+    return ret;
+}
+
+static void read_two_bam_rets(const char *path, int use_stream,
+                              int *first_ret, int *second_ret)
+{
+    samFile *fp = NULL;
+    sam_hdr_t *hdr = NULL;
+    bam1_t *b = NULL;
+
+    *first_ret = *second_ret = -999;
+    stream_reader_env(use_stream, 1, "7");
+    fp = sam_open(path, "rb");
+    if (!fp)
+        goto cleanup;
+    hdr = sam_hdr_read(fp);
+    if (!hdr)
+        goto cleanup;
+    b = bam_init1();
+    if (!b)
+        goto cleanup;
+
+    *first_ret = sam_read1(fp, hdr, b);
+    *second_ret = sam_read1(fp, hdr, b);
+
+cleanup:
+    bam_destroy1(b);
+    sam_hdr_destroy(hdr);
+    if (fp)
+        sam_close(fp);
+    stream_reader_env(0, 0, NULL);
 }
 
 static int copy_file_without_eof(const char *src, const char *dst)
@@ -2789,6 +3124,157 @@ cleanup:
     ordered_reader_env(0, 0, NULL);
 }
 
+static void test_bam_stream_reader(void)
+{
+    const char *partial_len = "test/test_bam_stream_reader.partial_len.tmp.bam";
+    const char *partial_core = "test/test_bam_stream_reader.partial_core.tmp.bam";
+    const char *partial_body = "test/test_bam_stream_reader.partial_body.tmp.bam";
+    const char *split_len = "test/test_bam_stream_reader.split_len.tmp.bam";
+    const char *split_core = "test/test_bam_stream_reader.split_core.tmp.bam";
+    const char *split_body = "test/test_bam_stream_reader.split_body.tmp.bam";
+    const char *valid_partial_len =
+        "test/test_bam_stream_reader.valid_partial_len.tmp.bam";
+    const char *valid_partial_core =
+        "test/test_bam_stream_reader.valid_partial_core.tmp.bam";
+    const char *valid_partial_body =
+        "test/test_bam_stream_reader.valid_partial_body.tmp.bam";
+    uint64_t serial_hash = 0, stream_hash = 0;
+    int serial_count = 0, stream_count = 0;
+    int ordinary_ret, stream_ret, ordinary_first, stream_first;
+
+    unlink(partial_len);
+    unlink(partial_core);
+    unlink(partial_body);
+    unlink(split_len);
+    unlink(split_core);
+    unlink(split_body);
+    unlink(valid_partial_len);
+    unlink(valid_partial_core);
+    unlink(valid_partial_body);
+
+    read_range_bam_order_hash(0, 0, 0, 0, NULL, &serial_hash, &serial_count);
+    read_bam_stream_hash("test/range.bam", 0, 0, "7",
+                         &stream_hash, &stream_count);
+    VERIFY(stream_count == serial_count,
+           "BAM stream reader returned the wrong record count");
+    VERIFY(stream_hash == serial_hash,
+           "BAM stream reader changed record order or contents");
+
+    stream_hash = 0;
+    stream_count = 0;
+    read_bam_stream_hash("test/range.bam", 2, 0, "7",
+                         &stream_hash, &stream_count);
+    VERIFY(stream_count == serial_count,
+           "thread-budgeted BAM stream reader returned the wrong record count");
+    VERIFY(stream_hash == serial_hash,
+           "thread-budgeted BAM stream reader changed record order or contents");
+
+    stream_hash = 0;
+    stream_count = 0;
+    read_bam_stream_hash("test/range.bam", 2, 1, "7",
+                         &stream_hash, &stream_count);
+    VERIFY(stream_count == serial_count,
+           "thread-pool BAM stream reader returned the wrong record count");
+    VERIFY(stream_hash == serial_hash,
+           "thread-pool BAM stream reader changed record order or contents");
+
+    stream_hash = 0;
+    stream_count = 0;
+    read_bam_stream_late_fallback_hash("test/range.bam",
+                                       &stream_hash, &stream_count);
+    VERIFY(stream_count == serial_count,
+           "non-strict BAM stream fallback returned the wrong record count");
+    VERIFY(stream_hash == serial_hash,
+           "non-strict BAM stream fallback changed record order or contents");
+
+    VERIFY(write_partial_bam_record(partial_len, 0) == 0,
+           "failed to write partial block_len BAM");
+    ordinary_ret = read_one_bam_ret(partial_len, 0);
+    stream_ret = read_one_bam_ret(partial_len, 1);
+    VERIFY(ordinary_ret == -2 && stream_ret == ordinary_ret,
+           "BAM stream reader changed partial block_len error behavior");
+
+    VERIFY(write_partial_bam_record(partial_core, 1) == 0,
+           "failed to write partial core BAM");
+    ordinary_ret = read_one_bam_ret(partial_core, 0);
+    stream_ret = read_one_bam_ret(partial_core, 1);
+    VERIFY(ordinary_ret == -3 && stream_ret == ordinary_ret,
+           "BAM stream reader changed partial core error behavior");
+
+    VERIFY(write_partial_bam_record(partial_body, 2) == 0,
+           "failed to write partial body BAM");
+    ordinary_ret = read_one_bam_ret(partial_body, 0);
+    stream_ret = read_one_bam_ret(partial_body, 1);
+    VERIFY(ordinary_ret == -4 && stream_ret == ordinary_ret,
+           "BAM stream reader changed partial body error behavior");
+
+    VERIFY(write_valid_then_partial_bam_record(valid_partial_len, 0) == 0,
+           "failed to write valid-plus-partial block_len BAM");
+    read_two_bam_rets(valid_partial_len, 0, &ordinary_first, &ordinary_ret);
+    read_two_bam_rets(valid_partial_len, 1, &stream_first, &stream_ret);
+    VERIFY(ordinary_first >= 0 && stream_first == ordinary_first &&
+           ordinary_ret == -2 && stream_ret == ordinary_ret,
+           "BAM stream reader changed terminal partial block_len behavior");
+
+    VERIFY(write_valid_then_partial_bam_record(valid_partial_core, 1) == 0,
+           "failed to write valid-plus-partial core BAM");
+    read_two_bam_rets(valid_partial_core, 0, &ordinary_first, &ordinary_ret);
+    read_two_bam_rets(valid_partial_core, 1, &stream_first, &stream_ret);
+    VERIFY(ordinary_first >= 0 && stream_first == ordinary_first &&
+           ordinary_ret == -3 && stream_ret == ordinary_ret,
+           "BAM stream reader changed terminal partial core behavior");
+
+    VERIFY(write_valid_then_partial_bam_record(valid_partial_body, 2) == 0,
+           "failed to write valid-plus-partial body BAM");
+    read_two_bam_rets(valid_partial_body, 0, &ordinary_first, &ordinary_ret);
+    read_two_bam_rets(valid_partial_body, 1, &stream_first, &stream_ret);
+    VERIFY(ordinary_first >= 0 && stream_first == ordinary_first &&
+           ordinary_ret == -4 && stream_ret == ordinary_ret,
+           "BAM stream reader changed terminal partial body behavior");
+
+    VERIFY(write_split_bam_record(split_len, 2) == 0,
+           "failed to write split block_len BAM");
+    serial_hash = stream_hash = 0;
+    serial_count = stream_count = 0;
+    read_bam_order_hash(split_len, 0, 0, 0, 0, NULL,
+                        &serial_hash, &serial_count);
+    read_bam_stream_hash(split_len, 0, 0, "7", &stream_hash, &stream_count);
+    VERIFY(stream_count == serial_count && stream_hash == serial_hash,
+           "BAM stream reader changed split block_len record");
+
+    VERIFY(write_split_bam_record(split_core, 20) == 0,
+           "failed to write split core BAM");
+    serial_hash = stream_hash = 0;
+    serial_count = stream_count = 0;
+    read_bam_order_hash(split_core, 0, 0, 0, 0, NULL,
+                        &serial_hash, &serial_count);
+    read_bam_stream_hash(split_core, 0, 0, "7", &stream_hash, &stream_count);
+    VERIFY(stream_count == serial_count && stream_hash == serial_hash,
+           "BAM stream reader changed split core record");
+
+    VERIFY(write_split_bam_record(split_body, 36) == 0,
+           "failed to write split body BAM");
+    serial_hash = stream_hash = 0;
+    serial_count = stream_count = 0;
+    read_bam_order_hash(split_body, 0, 0, 0, 0, NULL,
+                        &serial_hash, &serial_count);
+    read_bam_stream_hash(split_body, 0, 0, "7", &stream_hash, &stream_count);
+    VERIFY(stream_count == serial_count && stream_hash == serial_hash,
+           "BAM stream reader changed split body record");
+
+cleanup:
+    unlink(partial_len);
+    unlink(partial_core);
+    unlink(partial_body);
+    unlink(split_len);
+    unlink(split_core);
+    unlink(split_body);
+    unlink(valid_partial_len);
+    unlink(valid_partial_core);
+    unlink(valid_partial_body);
+    stream_reader_env(0, 0, NULL);
+}
+
 int main(int argc, char **argv)
 {
     int i;
@@ -2830,6 +3316,7 @@ int main(int argc, char **argv)
     test_bam_set1_write_and_read_back();
     test_bam_raw_block_copy();
     test_bam_ordered_reader();
+    test_bam_stream_reader();
     test_cigar_api();
 
     return status;

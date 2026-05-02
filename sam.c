@@ -779,6 +779,110 @@ static int fixup_missing_qname_nul(bam1_t *b) {
     return 0;
 }
 
+static int bam_decode1_body(BGZF *fp, bam1_t *b, int32_t block_len,
+                            const uint8_t *body)
+{
+    bam1_core_t *c = &b->core;
+    const uint8_t *x = body;
+    int raw_l_qname, rest_len, i;
+    uint32_t new_l_data;
+
+    b->l_data = 0;
+
+    if (block_len < 32)
+        return -4;
+
+    c->tid        = le_to_u32(x);
+    c->pos        = le_to_i32(x+4);
+    uint32_t x2   = le_to_u32(x+8);
+    c->bin        = x2>>16;
+    c->qual       = x2>>8&0xff;
+    c->l_qname    = x2&0xff;
+    c->l_extranul = (c->l_qname%4 != 0)? (4 - c->l_qname%4) : 0;
+    uint32_t x3   = le_to_u32(x+12);
+    c->flag       = x3>>16;
+    c->n_cigar    = x3&0xffff;
+    c->l_qseq     = le_to_u32(x+16);
+    c->mtid       = le_to_u32(x+20);
+    c->mpos       = le_to_i32(x+24);
+    c->isize      = le_to_i32(x+28);
+
+    raw_l_qname = c->l_qname;
+    new_l_data = block_len - 32 + c->l_extranul;
+    if (new_l_data > INT_MAX || c->l_qseq < 0 || c->l_qname < 1)
+        return -4;
+    if (((uint64_t) c->n_cigar << 2) + c->l_qname + c->l_extranul
+        + (((uint64_t) c->l_qseq + 1) >> 1) + c->l_qseq > (uint64_t) new_l_data)
+        return -4;
+    if (realloc_bam_data(b, new_l_data) < 0)
+        return -4;
+    b->l_data = new_l_data;
+
+    memcpy(b->data, body + 32, raw_l_qname);
+    if (b->data[raw_l_qname - 1] != '\0') {
+        if (fixup_missing_qname_nul(b) < 0)
+            return -4;
+    }
+    for (i = 0; i < c->l_extranul; ++i)
+        b->data[c->l_qname+i] = '\0';
+    c->l_qname += c->l_extranul;
+
+    rest_len = block_len - 32 - raw_l_qname;
+    if (rest_len < 0 || b->l_data < c->l_qname ||
+        b->l_data - c->l_qname != rest_len)
+        return -4;
+    memcpy(b->data + c->l_qname, body + 32 + raw_l_qname,
+           (size_t)rest_len);
+
+    if (fp && fp->is_be)
+        swap_data(c, b->l_data, b->data, 0);
+    if (bam_tag2cigar(b, 0, 0) < 0)
+        return -4;
+
+    if (c->n_cigar > 0) {
+        hts_pos_t rlen, qlen;
+        bam_cigar2rqlens(c->n_cigar, bam_get_cigar(b), &rlen, &qlen);
+        if ((b->core.flag & BAM_FUNMAP) || rlen == 0)
+            rlen = 1;
+        b->core.bin = hts_reg2bin(b->core.pos, b->core.pos + rlen, 14, 5);
+        if (c->l_qseq > 0 && !(c->flag & BAM_FUNMAP) &&
+            qlen != c->l_qseq) {
+            hts_log_error("CIGAR and query sequence lengths differ for %s",
+                          bam_get_qname(b));
+            return -4;
+        }
+    }
+
+    return 4 + block_len;
+}
+
+static int bam_validate1_body_core(int32_t block_len, const uint8_t *body)
+{
+    const uint8_t *x = body;
+    int l_qname, l_extranul, n_cigar;
+    int32_t l_qseq;
+    uint32_t new_l_data;
+    uint32_t x2, x3;
+
+    if (block_len < 32)
+        return -4;
+
+    x2 = le_to_u32(x+8);
+    l_qname = x2 & 0xff;
+    l_extranul = (l_qname % 4 != 0) ? (4 - l_qname % 4) : 0;
+    x3 = le_to_u32(x+12);
+    n_cigar = x3 & 0xffff;
+    l_qseq = le_to_u32(x+16);
+
+    new_l_data = block_len - 32 + l_extranul;
+    if (new_l_data > INT_MAX || l_qseq < 0 || l_qname < 1)
+        return -4;
+    if (((uint64_t)n_cigar << 2) + l_qname + l_extranul
+        + (((uint64_t)l_qseq + 1) >> 1) + l_qseq > (uint64_t)new_l_data)
+        return -4;
+    return 0;
+}
+
 /*
  * Note a second interface that returns a bam pointer instead would avoid bam_copy1
  * in multi-threaded handling.  This may be worth considering for htslib2.
@@ -3863,6 +3967,8 @@ static void *sam_format_worker(void *arg) {
 }
 
 #define BAM_DEFERRED_THREADS_MAGIC 0x62746872u
+#define BAM_STREAM_READER_MAGIC 0x62737472u
+#define BAM_STREAM_READER_DEFAULT_CHUNK 32768
 
 typedef struct bam_deferred_threads_t {
     uint32_t magic;
@@ -3872,7 +3978,48 @@ typedef struct bam_deferred_threads_t {
     int use_pool;
 } bam_deferred_threads_t;
 
+typedef struct bam_stream_reader_t {
+    uint32_t magic;
+    BGZF *bgzf;
+    uint8_t *buf;
+    size_t off;
+    size_t len;
+    size_t cap;
+    size_t chunk_size;
+    int eof;
+} bam_stream_reader_t;
+
 static int bam_ordered_env_enabled(void);
+static int bam_stream_env_enabled(void);
+
+static int bam_stream_env_strict(void)
+{
+    const char *env = getenv("HTS_BAM_STREAM_READER_REQUIRE");
+    return env && *env && strcmp(env, "0") != 0;
+}
+
+static int bam_stream_env_enabled(void)
+{
+    const char *env = getenv("HTS_BAM_STREAM_READER");
+    return env && *env && strcmp(env, "0") != 0;
+}
+
+static size_t bam_stream_env_chunk_size(void)
+{
+    const char *env = getenv("HTS_BAM_STREAM_READER_CHUNK");
+    char *end = NULL;
+    long n;
+
+    if (!env || !*env)
+        return BAM_STREAM_READER_DEFAULT_CHUNK;
+
+    errno = 0;
+    n = strtol(env, &end, 10);
+    if (errno || end == env || *end || n < 1 ||
+        n > BGZF_MAX_BLOCK_SIZE)
+        return BAM_STREAM_READER_DEFAULT_CHUNK;
+    return (size_t)n;
+}
 
 static int bam_deferred_threads_set(htsFile *fp, int n_threads,
                                     htsThreadPool *p)
@@ -3923,9 +4070,147 @@ static int bam_deferred_threads_enable_bgzf(htsFile *fp,
     return bgzf_mt(fp->fp.bgzf, cfg->n_threads, 256);
 }
 
+static bam_stream_reader_t *bam_stream_reader_open(htsFile *fp)
+{
+    bam_stream_reader_t *reader;
+
+    if (!fp || !fp->is_bgzf || !fp->fp.bgzf || fp->fp.bgzf->is_gzip ||
+        fp->fp.bgzf->mt)
+        return NULL;
+
+    reader = calloc(1, sizeof(*reader));
+    if (!reader)
+        return NULL;
+
+    reader->magic = BAM_STREAM_READER_MAGIC;
+    reader->bgzf = fp->fp.bgzf;
+    reader->chunk_size = bam_stream_env_chunk_size();
+    return reader;
+}
+
+static void bam_stream_reader_destroy(bam_stream_reader_t *reader)
+{
+    if (!reader)
+        return;
+    free(reader->buf);
+    free(reader);
+}
+
+static int bam_stream_reader_reserve(bam_stream_reader_t *reader,
+                                     size_t extra)
+{
+    uint8_t *new_buf;
+    size_t avail = reader->len - reader->off;
+    size_t need = avail + extra;
+    size_t new_cap;
+
+    if (need <= reader->cap - reader->off)
+        return 0;
+
+    if (reader->off > 0 && avail > 0)
+        memmove(reader->buf, reader->buf + reader->off, avail);
+    reader->off = 0;
+    reader->len = avail;
+    if (need <= reader->cap)
+        return 0;
+
+    new_cap = reader->cap ? reader->cap : reader->chunk_size;
+    while (new_cap < need) {
+        if (new_cap > SIZE_MAX / 2) {
+            errno = ENOMEM;
+            return -1;
+        }
+        new_cap *= 2;
+    }
+
+    new_buf = realloc(reader->buf, new_cap);
+    if (!new_buf) {
+        errno = ENOMEM;
+        return -1;
+    }
+    reader->buf = new_buf;
+    reader->cap = new_cap;
+    return 0;
+}
+
+static int bam_stream_reader_need(bam_stream_reader_t *reader, size_t need)
+{
+    while (reader->len - reader->off < need && !reader->eof) {
+        size_t want = need - (reader->len - reader->off);
+        ssize_t n;
+
+        if (want > reader->chunk_size)
+            want = reader->chunk_size;
+        if (want > SIZE_MAX - reader->len) {
+            errno = ENOMEM;
+            return -2;
+        }
+        if (bam_stream_reader_reserve(reader, want) < 0)
+            return -2;
+
+        n = bgzf_read(reader->bgzf, reader->buf + reader->len, want);
+        if (n < 0)
+            return -2;
+        if (n == 0) {
+            reader->eof = 1;
+            break;
+        }
+        reader->len += (size_t)n;
+    }
+
+    if (reader->len - reader->off >= need)
+        return 0;
+    return reader->len == reader->off ? -1 : -2;
+}
+
+static int bam_stream_reader_next(bam_stream_reader_t *reader, bam1_t *b)
+{
+    int32_t block_len;
+    size_t frame_len, avail;
+    int ret;
+
+    ret = bam_stream_reader_need(reader, 4);
+    if (ret < 0) {
+        if (ret == -2)
+            reader->off = reader->len;
+        return ret;
+    }
+
+    block_len = le_to_i32(reader->buf + reader->off);
+    if (block_len < 32) {
+        reader->off += 4;
+        return -4;
+    }
+    frame_len = 4 + (size_t)block_len;
+
+    ret = bam_stream_reader_need(reader, 4 + 32);
+    if (ret < 0) {
+        reader->off = reader->len;
+        return -3;
+    }
+
+    if (bam_validate1_body_core(block_len, reader->buf + reader->off + 4) < 0) {
+        reader->off += 4 + 32;
+        return -4;
+    }
+
+    ret = bam_stream_reader_need(reader, frame_len);
+    if (ret < 0) {
+        avail = reader->len - reader->off;
+        reader->off = reader->len;
+        return avail < 4 + 32 ? -3 : -4;
+    }
+
+    ret = bam_decode1_body(reader->bgzf, b, block_len,
+                           reader->buf + reader->off + 4);
+    reader->off += frame_len;
+    return ret;
+}
+
 int sam_set_thread_pool(htsFile *fp, htsThreadPool *p) {
     if (fp->format.format == bam) {
-        if (!fp->is_write && bam_ordered_env_enabled())
+        if (!fp->is_write &&
+            (bam_stream_env_enabled() || bam_ordered_env_enabled()))
             return bam_deferred_threads_set(fp, 0, p);
         if (fp->format.compression == bgzf)
             return bgzf_thread_pool(fp->fp.bgzf, p->pool, p->qsize);
@@ -3963,7 +4248,8 @@ int sam_set_threads(htsFile *fp, int nthreads) {
         return 0;
 
     if (fp->format.format == bam) {
-        if (!fp->is_write && bam_ordered_env_enabled())
+        if (!fp->is_write &&
+            (bam_stream_env_enabled() || bam_ordered_env_enabled()))
             return bam_deferred_threads_set(fp, nthreads, NULL);
         if (fp->format.compression == bgzf)
             return bgzf_mt(fp->fp.bgzf, nthreads, 256);
@@ -4536,6 +4822,13 @@ int sam_bam_state_destroy(htsFile *fp)
         bam_ordered_reader_destroy(reader);
         return 0;
     }
+    if (magic == BAM_STREAM_READER_MAGIC) {
+        bam_stream_reader_t *reader = (bam_stream_reader_t *)fp->state;
+
+        fp->state = NULL;
+        bam_stream_reader_destroy(reader);
+        return 0;
+    }
     if (magic == BAM_DEFERRED_THREADS_MAGIC) {
         bam_deferred_threads_t *cfg = (bam_deferred_threads_t *)fp->state;
 
@@ -5081,17 +5374,48 @@ static int fastq_parse1(htsFile *fp, bam1_t *b) {
     return ret;
 }
 
+static inline int sam_read1_bam_check_header(sam_hdr_t *h, bam1_t *b, int ret)
+{
+    if (h && ret >= 0) {
+        if (b->core.tid  >= h->n_targets || b->core.tid  < -1 ||
+            b->core.mtid >= h->n_targets || b->core.mtid < -1) {
+            errno = ERANGE;
+            return -3;
+        }
+    }
+    return ret;
+}
+
 // Internal component of sam_read1 below
 static inline int sam_read1_bam(htsFile *fp, sam_hdr_t *h, bam1_t *b) {
     if (fp->state) {
         uint32_t magic = *(uint32_t *)fp->state;
         if (magic == BAM_ORDERED_READER_MAGIC) {
             bam_ordered_reader_t *reader = (bam_ordered_reader_t *)fp->state;
-            return bam_ordered_reader_next(reader, b);
+            return sam_read1_bam_check_header(h, b,
+                                              bam_ordered_reader_next(reader, b));
+        }
+        if (magic == BAM_STREAM_READER_MAGIC) {
+            bam_stream_reader_t *reader = (bam_stream_reader_t *)fp->state;
+            return sam_read1_bam_check_header(h, b,
+                                              bam_stream_reader_next(reader, b));
         }
         if (magic == BAM_DEFERRED_THREADS_MAGIC) {
             bam_deferred_threads_t *cfg =
                 (bam_deferred_threads_t *)fp->state;
+
+            if (bam_stream_env_enabled()) {
+                bam_stream_reader_t *reader = bam_stream_reader_open(fp);
+                if (reader) {
+                    fp->state = NULL;
+                    bam_deferred_threads_destroy(cfg);
+                    fp->state = reader;
+                    return sam_read1_bam_check_header(h, b,
+                                                      bam_stream_reader_next(reader, b));
+                }
+                if (bam_stream_env_strict())
+                    return -2;
+            }
 
             if (bam_ordered_env_enabled()) {
                 bam_ordered_reader_t *reader =
@@ -5100,7 +5424,8 @@ static inline int sam_read1_bam(htsFile *fp, sam_hdr_t *h, bam1_t *b) {
                     fp->state = NULL;
                     bam_deferred_threads_destroy(cfg);
                     fp->state = reader;
-                    return bam_ordered_reader_next(reader, b);
+                    return sam_read1_bam_check_header(h, b,
+                                                      bam_ordered_reader_next(reader, b));
                 }
                 if (bam_ordered_env_strict())
                     return -2;
@@ -5112,25 +5437,27 @@ static inline int sam_read1_bam(htsFile *fp, sam_hdr_t *h, bam1_t *b) {
             if (ret < 0)
                 return -2;
         }
+    } else if (bam_stream_env_enabled()) {
+        bam_stream_reader_t *reader = bam_stream_reader_open(fp);
+        if (reader) {
+            fp->state = reader;
+            return sam_read1_bam_check_header(h, b,
+                                              bam_stream_reader_next(reader, b));
+        }
+        if (bam_stream_env_strict())
+            return -2;
     } else if (bam_ordered_env_enabled()) {
         bam_ordered_reader_t *reader = bam_ordered_reader_open(fp, h, 0);
         if (reader) {
             fp->state = reader;
-            return bam_ordered_reader_next(reader, b);
+            return sam_read1_bam_check_header(h, b,
+                                              bam_ordered_reader_next(reader, b));
         }
         if (bam_ordered_env_strict())
             return -2;
     }
 
-    int ret = bam_read1(fp->fp.bgzf, b);
-    if (h && ret >= 0) {
-        if (b->core.tid  >= h->n_targets || b->core.tid  < -1 ||
-            b->core.mtid >= h->n_targets || b->core.mtid < -1) {
-            errno = ERANGE;
-            return -3;
-        }
-    }
-    return ret;
+    return sam_read1_bam_check_header(h, b, bam_read1(fp->fp.bgzf, b));
 }
 
 // Internal component of sam_read1 below
