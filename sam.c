@@ -53,6 +53,7 @@ DEALINGS IN THE SOFTWARE.  */
 #include "htslib/bgzf.h"
 #include "cram/cram.h"
 #include "hts_internal.h"
+#include "bgzf_internal.h"
 #include "sam_internal.h"
 #include "htslib/hfile.h"
 #include "htslib/hts_endian.h"
@@ -3981,6 +3982,8 @@ typedef struct bam_deferred_threads_t {
 typedef struct bam_stream_reader_t {
     uint32_t magic;
     BGZF *bgzf;
+    bgzf_block_data_t *block;
+    size_t block_off;
     uint8_t *buf;
     size_t off;
     size_t len;
@@ -4085,6 +4088,19 @@ static bam_stream_reader_t *bam_stream_reader_open(htsFile *fp)
     reader->magic = BAM_STREAM_READER_MAGIC;
     reader->bgzf = fp->fp.bgzf;
     reader->chunk_size = bam_stream_env_chunk_size();
+    reader->block = calloc(1, sizeof(*reader->block));
+    if (!reader->block) {
+        free(reader);
+        return NULL;
+    }
+    if (fp->fp.bgzf->block_length > fp->fp.bgzf->block_offset) {
+        reader->block->block_address = fp->fp.bgzf->block_address;
+        reader->block->comp_len = fp->fp.bgzf->block_clength;
+        reader->block->uncomp_len = fp->fp.bgzf->block_length;
+        reader->block_off = (size_t)fp->fp.bgzf->block_offset;
+        memcpy(reader->block->uncomp_data, fp->fp.bgzf->uncompressed_block,
+               (size_t)fp->fp.bgzf->block_length);
+    }
     return reader;
 }
 
@@ -4092,6 +4108,7 @@ static void bam_stream_reader_destroy(bam_stream_reader_t *reader)
 {
     if (!reader)
         return;
+    free(reader->block);
     free(reader->buf);
     free(reader);
 }
@@ -4140,26 +4157,32 @@ static ssize_t bam_stream_reader_read_block_bytes(bam_stream_reader_t *reader,
     size_t copied = 0;
 
     while (copied < len) {
-        int avail, n;
+        int n;
+        size_t avail;
 
-        if (bgzf->block_offset >= bgzf->block_length) {
-            if (bgzf_read_block(bgzf) < 0)
+        if (reader->block_off >= (size_t)reader->block->uncomp_len) {
+            if (bgzf_read_block_data(bgzf, reader->block) < 0)
                 return copied ? (ssize_t)copied : -1;
-            if (bgzf->block_length == 0)
+            reader->block_off = 0;
+            if (reader->block->hit_eof)
                 break;
+            bgzf->block_address = reader->block->block_address;
+            bgzf->block_clength = reader->block->comp_len;
+            bgzf->block_length = reader->block->uncomp_len;
+            bgzf->block_offset = 0;
         }
 
-        avail = bgzf->block_length - bgzf->block_offset;
-        if (avail <= 0)
+        avail = (size_t)reader->block->uncomp_len - reader->block_off;
+        if (avail == 0)
             continue;
-        n = avail;
+        n = (int)avail;
         if ((size_t)n > len - copied)
             n = (int)(len - copied);
 
-        memcpy(dst + copied,
-               (uint8_t *)bgzf->uncompressed_block + bgzf->block_offset,
+        memcpy(dst + copied, reader->block->uncomp_data + reader->block_off,
                (size_t)n);
-        bgzf->block_offset += n;
+        reader->block_off += (size_t)n;
+        bgzf->block_offset = (int)reader->block_off;
         copied += (size_t)n;
     }
 

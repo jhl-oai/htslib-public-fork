@@ -1376,6 +1376,102 @@ ssize_t bgzf_raw_read(BGZF *fp, void *data, size_t length)
     return ret;
 }
 
+int bgzf_read_block_data(BGZF *fp, bgzf_block_data_t *block)
+{
+    uint8_t header[BLOCK_HEADER_LENGTH];
+    int count, block_length;
+
+    if (!fp || !block || fp->errcode)
+        return -1;
+    if (!fp->is_compressed || fp->is_gzip) {
+        if (block)
+            block->errcode = BGZF_ERR_HEADER;
+        return -1;
+    }
+
+    memset(block, 0, sizeof(*block));
+
+    for (;;) {
+        int64_t block_address = bgzf_htell(fp);
+        int ret;
+        uint32_t crc;
+        size_t dlen = BGZF_MAX_BLOCK_SIZE;
+
+        count = hread(fp->fp, header, sizeof(header));
+        if (count == 0) {
+            if (!fp->last_block_eof && !fp->no_eof_block) {
+                fp->no_eof_block = 1;
+                hts_log_warning("EOF marker is absent. The input may be truncated");
+            }
+            fp->block_length = 0;
+            block->hit_eof = 1;
+            return 0;
+        }
+        ret = 0;
+        if (count != sizeof(header) || (ret = check_header(header)) == -2) {
+            fp->errcode |= BGZF_ERR_HEADER;
+            block->errcode = BGZF_ERR_HEADER;
+            hts_log_error("%s BGZF header at offset %"PRId64,
+                          ret ? "Invalid" : "Failed to read",
+                          block_address);
+            return -1;
+        }
+        if (ret == -1) {
+            fp->errcode |= BGZF_ERR_HEADER;
+            block->errcode = BGZF_ERR_HEADER;
+            return -1;
+        }
+
+        block_length = unpackInt16((uint8_t *)&header[16]) + 1;
+        if (block_length < BLOCK_HEADER_LENGTH) {
+            fp->errcode |= BGZF_ERR_HEADER;
+            block->errcode = BGZF_ERR_HEADER;
+            hts_log_error("Invalid BGZF block length at offset %"PRId64,
+                          block_address);
+            return -1;
+        }
+
+        memcpy(block->comp_data, header, BLOCK_HEADER_LENGTH);
+        count = hread(fp->fp, block->comp_data + BLOCK_HEADER_LENGTH,
+                      block_length - BLOCK_HEADER_LENGTH);
+        if (count != block_length - BLOCK_HEADER_LENGTH) {
+            fp->errcode |= BGZF_ERR_IO;
+            block->errcode = BGZF_ERR_IO;
+            hts_log_error("Failed to read BGZF block data at offset %"PRId64
+                          " expected %d bytes; hread returned %d",
+                          block_address, block_length - BLOCK_HEADER_LENGTH,
+                          count);
+            return -1;
+        }
+
+        block->block_address = block_address;
+        block->comp_len = block_length;
+        crc = le_to_u32(block->comp_data + block_length - 8);
+        ret = bgzf_uncompress(block->uncomp_data, &dlen,
+                              block->comp_data + 18, block_length - 18,
+                              crc);
+        if (ret != 0) {
+            fp->errcode |= BGZF_ERR_ZLIB;
+            block->errcode = BGZF_ERR_ZLIB;
+            hts_log_debug("Inflate block operation failed for "
+                          "block at offset %"PRId64": %s",
+                          block_address, bgzf_zerr(ret, NULL));
+            return -1;
+        }
+
+        block->uncomp_len = (int)dlen;
+        fp->last_block_eof = (block->uncomp_len == 0);
+        if (block->uncomp_len == 0)
+            continue;
+
+        if (fp->idx_build_otf) {
+            bgzf_index_add_block(fp);
+            fp->idx->ublock_addr += block->uncomp_len;
+        }
+        return 0;
+    }
+}
+
 #ifdef BGZF_MT
 
 /* Function to clean up when jobs are discarded (e.g. during seek)
