@@ -47,7 +47,8 @@ one complete assembled frame.
 - Split records are copied into a batch-owned carry buffer.
 - `sam_bam_batch_record_to_bam1()` materializes one descriptor into a normal
   `bam1_t`, so future consumers can batch-scan all records and copy only the
-  records they need to emit.
+  records they need to emit.  The test suite compares every core field plus
+  `l_data` and `data[]` bytes against ordinary `sam_read1()` materialization.
 - `sam_read1()` remains the compatibility path and materializes normal
   independent `bam1_t` records.
 
@@ -116,10 +117,11 @@ reader:
   materializing every record as a `bam1_t`.
 - `test/sam.c` covers batch parity by rewriting returned raw frames into a
   temporary BAM and comparing ordinary `sam_read1()` hash/count results.  It
-  covers serial batch reads, `hts_set_threads()`, borrowed
-  `HTS_OPT_THREAD_POOL`, split-record payload handling, malformed core
-  rejection, and live serial/threaded batch data surviving `htsFile` close
-  until `sam_bam_batch_destroy()`.
+  also compares materialized batch records byte-for-byte against ordinary
+  `sam_read1()` `bam1_t` records.  It covers serial batch reads,
+  `hts_set_threads()`, borrowed `HTS_OPT_THREAD_POOL`, split-record payload
+  handling, malformed core rejection, and live serial/threaded batch data
+  surviving `htsFile` close until `sam_bam_batch_destroy()`.
 
 Verification so far:
 

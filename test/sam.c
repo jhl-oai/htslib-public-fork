@@ -2663,6 +2663,101 @@ cleanup:
     batch_reader_env(0, 0);
 }
 
+static int bam1_exact_match(const bam1_t *expected, const bam1_t *actual)
+{
+    return actual->core.tid == expected->core.tid &&
+           actual->core.pos == expected->core.pos &&
+           actual->core.bin == expected->core.bin &&
+           actual->core.qual == expected->core.qual &&
+           actual->core.l_extranul == expected->core.l_extranul &&
+           actual->core.flag == expected->core.flag &&
+           actual->core.l_qname == expected->core.l_qname &&
+           actual->core.n_cigar == expected->core.n_cigar &&
+           actual->core.l_qseq == expected->core.l_qseq &&
+           actual->core.mtid == expected->core.mtid &&
+           actual->core.mpos == expected->core.mpos &&
+           actual->core.isize == expected->core.isize &&
+           actual->l_data == expected->l_data &&
+           (actual->l_data == 0 ||
+            memcmp(actual->data, expected->data,
+                   (size_t)actual->l_data) == 0);
+}
+
+static void check_bam_batch_materialized_exact(const char *path,
+                                               int hts_threads,
+                                               int use_thread_pool)
+{
+    samFile *serial_fp = NULL;
+    samFile *batch_fp = NULL;
+    sam_hdr_t *serial_hdr = NULL;
+    sam_hdr_t *batch_hdr = NULL;
+    bam1_t *expected = NULL, *actual = NULL;
+    htsThreadPool p = {NULL, 0};
+    bam_batch_t batch = {0};
+    int ret, serial_ret, n = 0;
+
+    serial_fp = sam_open(path, "rb");
+    VERIFY(serial_fp != NULL, "failed to open serial BAM for exact compare");
+    serial_hdr = sam_hdr_read(serial_fp);
+    VERIFY(serial_hdr != NULL, "failed to read serial BAM header");
+
+    batch_reader_env(1, 1);
+    batch_fp = sam_open(path, "rb");
+    VERIFY(batch_fp != NULL, "failed to open batch BAM for exact compare");
+    if (hts_threads > 0) {
+        if (use_thread_pool) {
+            p.pool = hts_tpool_init(hts_threads);
+            p.qsize = hts_threads * 2;
+            VERIFY(p.pool != NULL, "failed to create exact-compare thread pool");
+            VERIFY(hts_set_thread_pool(batch_fp, &p) == 0,
+                   "failed to set exact-compare thread pool");
+        } else {
+            VERIFY(hts_set_threads(batch_fp, hts_threads) == 0,
+                   "failed to set exact-compare threads");
+        }
+    }
+    batch_hdr = sam_hdr_read(batch_fp);
+    VERIFY(batch_hdr != NULL, "failed to read batch BAM header");
+    expected = bam_init1();
+    actual = bam_init1();
+    VERIFY(expected != NULL && actual != NULL,
+           "failed to allocate exact-compare BAM records");
+
+    while ((ret = sam_bam_read_batch(batch_fp, batch_hdr, &batch)) >= 0) {
+        int i;
+
+        for (i = 0; i < batch.n_records; i++) {
+            serial_ret = sam_read1(serial_fp, serial_hdr, expected);
+            VERIFY(serial_ret >= 0,
+                   "serial BAM ended before materialized batch records");
+            VERIFY(sam_bam_batch_record_to_bam1(&batch.records[i], actual) >= 0,
+                   "failed to materialize exact-compare BAM record");
+            VERIFY(bam1_exact_match(expected, actual),
+                   "materialized BAM record differs byte-for-byte from sam_read1");
+            n++;
+        }
+        sam_bam_batch_destroy(&batch);
+    }
+    VERIFY(ret == -1, "batch exact compare did not end at EOF");
+    VERIFY(sam_read1(serial_fp, serial_hdr, expected) == -1,
+           "materialized batch ended before serial BAM");
+    VERIFY(n > 0, "exact materialized batch compare read no records");
+
+cleanup:
+    sam_bam_batch_destroy(&batch);
+    bam_destroy1(actual);
+    bam_destroy1(expected);
+    sam_hdr_destroy(batch_hdr);
+    sam_hdr_destroy(serial_hdr);
+    if (batch_fp)
+        sam_close(batch_fp);
+    if (serial_fp)
+        sam_close(serial_fp);
+    if (p.pool)
+        hts_tpool_destroy(p.pool);
+    batch_reader_env(0, 0);
+}
+
 static uint64_t batch_reader_bytes_hash(const bam_batch_t *batch)
 {
     uint64_t h = 1469598103934665603ULL;
@@ -3594,6 +3689,9 @@ static void test_bam_batch_reader(void)
            "thread-pool controlled BAM batch reader returned the wrong record count");
     VERIFY(batch_hash == serial_hash,
            "thread-pool controlled BAM batch reader changed record order or contents");
+    check_bam_batch_materialized_exact("test/range.bam", 0, 0);
+    check_bam_batch_materialized_exact("test/range.bam", 2, 0);
+    check_bam_batch_materialized_exact("test/range.bam", 2, 1);
 
     VERIFY(write_split_bam_record(split_body, 36) == 0,
            "failed to create split-body BAM");
@@ -3602,6 +3700,8 @@ static void test_bam_batch_reader(void)
     read_bam_batch_hash(split_body, 0, 0, &batch_hash, &batch_count);
     VERIFY(batch_count == serial_count && batch_hash == serial_hash,
            "BAM batch reader changed split body record");
+    check_bam_batch_materialized_exact(split_body, 0, 0);
+    check_bam_batch_materialized_exact(split_body, 2, 0);
 
     check_bam_batch_survives_close("test/range.bam", 0);
     check_bam_batch_survives_close("test/range.bam", 2);
