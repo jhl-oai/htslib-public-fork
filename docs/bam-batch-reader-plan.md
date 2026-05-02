@@ -61,6 +61,10 @@ reader:
 - The batch reader does not enable BGZF `fp->mt`.
 - Compressed block reads stay on the caller thread; BGZF inflate workers fill
   ordered decoded block results.
+- Deferred BAM stream paths use a default queue depth of 64 jobs when no
+  explicit `htsThreadPool.qsize` is supplied.  This stays bounded while avoiding
+  the shallow `2 * threads` queue depth that underfed larger read-throughput
+  workloads.
 
 ## First Implementation Slice
 
@@ -126,16 +130,18 @@ Repeated median-of-five benchmark notes from the local BAM corpus:
 test_view -B, lower is better
 
 Input                         BGZF -@1  Batch -@1  BGZF -@4  Batch -@4  BGZF -@8  Batch -@8
-HG00096.exome.chr20.bam          0.60s      0.59s      0.25s      0.18s      0.25s      0.16s
+HG00096.exome.chr20.bam          0.60s      0.59s      0.25s      0.16s      0.24s      0.15s
 HG00096.lowcov.chr20_10-20Mb     0.16s      0.17s      0.07s      0.05s      0.07s      0.05s
 HG00096.highcov.chr20_10-11Mb    0.21s      0.21s      0.06s      0.06s      0.05s      0.04s
 HG002.ont_ul.chr20_10-10.2Mb     0.05s      0.05s      0.01s      0.02s      0.01s      0.01s
+HG002.ont_ul.chr20_10-15Mb       0.75s      0.73s      0.21s      0.20s      0.11s      0.13s
 ```
 
 The current slice is faster on the medium short-read workloads and neutral on
-the tiny highcov/ONT slices.  The larger exome slice reaches roughly 1.5x at
-`-@8`, while the tiny ONT slice remains timing-noise dominated and can miss a
-strict "not slower" gate at `-@4`.
+the tiny highcov/ONT slices.  The larger exome slice reaches roughly 1.6x at
+`-@8`.  The larger 5 Mb ONT slice is neutral at `-@4` but slower than BGZF at
+`-@8`, which points to long-read/high-thread decompression scheduling rather
+than per-record materialization as the limiting regime.
 
 The previous transparent stream/parse prototype on `feature/bam-throughput-product`
 was benchmarked with the same `test_view -B` shape:
@@ -148,12 +154,14 @@ HG00096.exome.chr20.bam          0.63s       0.68s      0.25s       0.23s      0
 HG00096.lowcov.chr20_10-20Mb     0.17s       0.19s      0.07s       0.07s      0.07s       0.07s
 HG00096.highcov.chr20_10-11Mb    0.23s       0.25s      0.07s       0.09s      0.05s       0.08s
 HG002.ont_ul.chr20_10-10.2Mb     0.05s       0.05s      0.01s       0.02s      0.01s       0.02s
+HG002.ont_ul.chr20_10-15Mb       0.78s       0.80s      0.21s       0.23s      0.11s       0.18s
 ```
 
 That comparison preserves the earlier conclusion: transparent `sam_read1()`
 parallel parsing does not compose cleanly with the existing one-record-at-a-time
-materialization contract, so the batch reader is the better direction for
-tool-facing throughput work.
+materialization contract.  The batch reader is still the better direction for
+tool-facing throughput work, but the larger ONT rows show that this prototype
+does not yet satisfy the strict `-@8` not-slower gate for long-read workloads.
 
 ## Samtools Consumer Experiment
 
@@ -174,6 +182,7 @@ HG00096.exome.chr20.bam          0.60s      0.62s      0.27s      0.20s      0.2
 HG00096.lowcov.chr20_10-20Mb     0.17s      0.17s      0.07s      0.06s      0.08s      0.05s
 HG00096.highcov.chr20_10-11Mb    0.22s      0.22s      0.06s      0.06s      0.05s      0.04s
 HG002.ont_ul.chr20_10-10.2Mb     0.05s      0.05s      0.02s      0.02s      0.01s      0.02s
+HG002.ont_ul.chr20_10-15Mb       0.74s      0.75s      0.20s      0.20s      0.10s      0.16s
 ```
 
 The end-to-end count consumer is neutral at one thread, faster on the larger
@@ -192,6 +201,7 @@ HG00096.exome.chr20.bam          0.28s      0.20s      0.28s      0.19s
 HG00096.lowcov.chr20_10-20Mb     0.07s      0.06s      0.07s      0.05s
 HG00096.highcov.chr20_10-11Mb    0.06s      0.06s      0.05s      0.05s
 HG002.ont_ul.chr20_10-10.2Mb     0.02s      0.02s      0.01s      0.02s
+HG002.ont_ul.chr20_10-15Mb       0.21s      0.20s      0.11s      0.16s
 ```
 
 This extends the fast path beyond core-only predicates while keeping the same
@@ -209,4 +219,6 @@ and the previous stream/parse prototype on the local BAM corpus at `1/4/8`
 threads.  The batch path should not be slower than BGZF `-@` at `4/8` threads
 and should target at least 1.5x on medium/large read-throughput workloads.
 
-If it cannot meet that gate, keep it prototype-only and document why.
+The current prototype does not meet that gate on the larger ONT slice at `-@8`.
+Keep it prototype-only unless a later iteration removes that long-read
+high-thread regression.

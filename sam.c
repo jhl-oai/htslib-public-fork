@@ -3972,6 +3972,7 @@ static void *sam_format_worker(void *arg) {
 #define BAM_STREAM_READER_DEFAULT_CHUNK 32768
 #define BAM_STREAM_PARSE_BATCH_RECORDS 4096
 #define BAM_STREAM_PARSE_BATCH_BYTES (4u << 20)
+#define BAM_STREAM_DEFAULT_QSIZE 64
 
 typedef struct bam_deferred_threads_t {
     uint32_t magic;
@@ -4229,7 +4230,7 @@ static int bam_stream_reader_init_threads(bam_stream_reader_t *reader,
 
     qsize = cfg->qsize;
     if (qsize <= 0)
-        qsize = cfg->n_threads * 2;
+        qsize = BAM_STREAM_DEFAULT_QSIZE;
     if (qsize <= 0)
         qsize = 2;
     reader->qsize = qsize;
