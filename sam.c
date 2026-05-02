@@ -4004,6 +4004,9 @@ typedef struct bam_stream_reader_t {
     int pending_frame_error;
     size_t block_off;
     size_t parse_i;
+    uint8_t *carry;
+    size_t carry_len;
+    size_t carry_cap;
     uint8_t *buf;
     size_t off;
     size_t len;
@@ -4018,6 +4021,7 @@ typedef struct bam_stream_decode_job_t {
 
 typedef struct bam_stream_parse_job_t {
     uint8_t *data;
+    const uint8_t *ref_data;
     size_t len;
     size_t cap;
     int n_records;
@@ -4025,6 +4029,7 @@ typedef struct bam_stream_parse_job_t {
     int ret;
     int is_be;
     bam1_t *records;
+    hts_tpool_result *owned_block_result;
 } bam_stream_parse_job_t;
 
 static int bam_ordered_env_enabled(void);
@@ -4132,6 +4137,8 @@ static void bam_stream_parse_job_free(void *arg)
             free(job->records[i].data);
         free(job->records);
     }
+    if (job->owned_block_result)
+        hts_tpool_delete_result(job->owned_block_result, 1);
     free(job->data);
     free(job);
 }
@@ -4149,6 +4156,7 @@ static void *bam_stream_parse_worker(void *arg)
 {
     bam_stream_parse_job_t *job = (bam_stream_parse_job_t *)arg;
     BGZF fake_bgzf = {0};
+    const uint8_t *data = job->data ? job->data : job->ref_data;
     size_t off = 0;
 
     fake_bgzf.is_be = job->is_be;
@@ -4166,14 +4174,14 @@ static void *bam_stream_parse_worker(void *arg)
             job->ret = -2;
             return job;
         }
-        block_len = le_to_i32(job->data + off);
+        block_len = le_to_i32(data + off);
         if (block_len < 32 || job->len - off < 4 + (size_t)block_len) {
             job->ret = -4;
             return job;
         }
         ret = bam_decode1_body(job->is_be ? &fake_bgzf : NULL,
                                &job->records[job->n_parsed], block_len,
-                               job->data + off + 4);
+                               data + off + 4);
         if (ret < 0) {
             job->ret = ret;
             return job;
@@ -4289,6 +4297,7 @@ static void bam_stream_reader_destroy(bam_stream_reader_t *reader)
     if (reader->own_pool && reader->pool)
         hts_tpool_destroy(reader->pool);
     free(reader->serial_block);
+    free(reader->carry);
     free(reader->buf);
     free(reader);
 }
@@ -4568,6 +4577,55 @@ static int bam_stream_parse_job_reserve(bam_stream_parse_job_t *job,
     return 0;
 }
 
+static int bam_stream_reader_carry_reserve(bam_stream_reader_t *reader,
+                                           size_t need)
+{
+    uint8_t *new_carry;
+    size_t new_cap;
+
+    if (need <= reader->carry_cap)
+        return 0;
+
+    new_cap = reader->carry_cap ? reader->carry_cap : 256;
+    while (new_cap < need) {
+        if (new_cap > SIZE_MAX / 2) {
+            errno = ENOMEM;
+            return -1;
+        }
+        new_cap *= 2;
+    }
+
+    new_carry = realloc(reader->carry, new_cap);
+    if (!new_carry) {
+        errno = ENOMEM;
+        return -1;
+    }
+    reader->carry = new_carry;
+    reader->carry_cap = new_cap;
+    return 0;
+}
+
+static int bam_stream_reader_carry_append(bam_stream_reader_t *reader,
+                                          const uint8_t *src, size_t len)
+{
+    if (bam_stream_reader_carry_reserve(reader, reader->carry_len + len) < 0)
+        return -2;
+    memcpy(reader->carry + reader->carry_len, src, len);
+    reader->carry_len += len;
+    return 0;
+}
+
+static int bam_stream_reader_carry_error(bam_stream_reader_t *reader)
+{
+    if (reader->carry_len == 0)
+        return -1;
+    if (reader->carry_len < 4)
+        return -2;
+    if (reader->carry_len < 4 + 32)
+        return -3;
+    return -4;
+}
+
 static int bam_stream_reader_next_frame(bam_stream_reader_t *reader,
                                         bam_stream_parse_job_t *job)
 {
@@ -4640,37 +4698,142 @@ static int bam_stream_reader_next_serial(bam_stream_reader_t *reader, bam1_t *b)
 static int bam_stream_reader_build_parse_job(bam_stream_reader_t *reader,
                                              bam_stream_parse_job_t **job_out)
 {
-    bam_stream_parse_job_t *job = calloc(1, sizeof(*job));
-    int ret = 0;
+    BGZF *bgzf = reader->bgzf;
+    bam_stream_parse_job_t *job;
+    uint8_t *data;
+    size_t start, pos, end;
+    int n_records = 0;
 
-    if (!job)
-        return -2;
-    job->is_be = reader->bgzf->is_be;
+    for (;;) {
+        if (!reader->block ||
+            reader->block_off >= (size_t)reader->block->uncomp_len) {
+            int ret = bam_stream_reader_next_block(reader);
+            if (ret < 0)
+                return -2;
+            if (ret == 0) {
+                int err;
+                reader->parse_input_eof = 1;
+                err = bam_stream_reader_carry_error(reader);
+                return err == -1 ? 0 : err;
+            }
+        }
 
-    while (job->n_records < BAM_STREAM_PARSE_BATCH_RECORDS &&
-           job->len < BAM_STREAM_PARSE_BATCH_BYTES) {
-        ret = bam_stream_reader_next_frame(reader, job);
-        if (ret == 1)
+        data = reader->block->uncomp_data;
+        end = (size_t)reader->block->uncomp_len;
+
+        if (reader->carry_len) {
+            int32_t block_len;
+            size_t frame_len, need, avail;
+
+            if (reader->carry_len < 4) {
+                need = 4 - reader->carry_len;
+                avail = end - reader->block_off;
+                if (need > avail)
+                    need = avail;
+                if (bam_stream_reader_carry_append(reader,
+                                                   data + reader->block_off,
+                                                   need) < 0)
+                    return -2;
+                reader->block_off += need;
+                bgzf->block_offset = (int)reader->block_off;
+                if (reader->carry_len < 4)
+                    continue;
+            }
+
+            block_len = le_to_i32(reader->carry);
+            if (block_len < 32) {
+                reader->carry_len = 0;
+                return -4;
+            }
+            frame_len = 4 + (size_t)block_len;
+            need = frame_len - reader->carry_len;
+            avail = end - reader->block_off;
+            if (need > avail)
+                need = avail;
+            if (bam_stream_reader_carry_append(reader, data + reader->block_off,
+                                               need) < 0)
+                return -2;
+            reader->block_off += need;
+            bgzf->block_offset = (int)reader->block_off;
+            if (reader->carry_len < frame_len)
+                continue;
+
+            job = calloc(1, sizeof(*job));
+            if (!job)
+                return -2;
+            job->data = reader->carry;
+            job->len = frame_len;
+            job->cap = reader->carry_cap;
+            job->n_records = 1;
+            job->is_be = bgzf->is_be;
+            reader->carry = NULL;
+            reader->carry_len = reader->carry_cap = 0;
+            *job_out = job;
+            return 1;
+        }
+
+        start = reader->block_off;
+        pos = start;
+        while (pos + 4 <= end) {
+            int32_t block_len = le_to_i32(data + pos);
+            size_t frame_len;
+
+            if (block_len < 32) {
+                if (pos == start) {
+                    reader->block_off += 4;
+                    bgzf->block_offset = (int)reader->block_off;
+                    return -4;
+                }
+                reader->pending_frame_error = -4;
+                break;
+            }
+            frame_len = 4 + (size_t)block_len;
+            if (pos + frame_len > end)
+                break;
+            pos += frame_len;
+            n_records++;
+        }
+
+        if (n_records > 0) {
+            job = calloc(1, sizeof(*job));
+            if (!job)
+                return -2;
+            job->ref_data = data + start;
+            job->len = pos - start;
+            job->n_records = n_records;
+            job->is_be = bgzf->is_be;
+            job->owned_block_result = reader->block_result;
+            reader->block_result = NULL;
+            reader->block_off = pos;
+            bgzf->block_offset = (int)reader->block_off;
+
+            if (pos < end && !reader->pending_frame_error) {
+                if (bam_stream_reader_carry_append(reader, data + pos,
+                                                   end - pos) < 0) {
+                    bam_stream_parse_job_free(job);
+                    return -2;
+                }
+                reader->block_off = end;
+                bgzf->block_offset = (int)reader->block_off;
+            }
+
+            reader->block = NULL;
+            *job_out = job;
+            return 1;
+        }
+
+        if (pos < end) {
+            if (bam_stream_reader_carry_append(reader, data + pos,
+                                               end - pos) < 0)
+                return -2;
+            reader->block_off = end;
+            bgzf->block_offset = (int)reader->block_off;
+            bam_stream_reader_release_block(reader);
             continue;
-        if (ret == -1) {
-            reader->parse_input_eof = 1;
-            break;
         }
-        if (job->n_records > 0) {
-            reader->pending_frame_error = ret;
-            break;
-        }
-        bam_stream_parse_job_free(job);
-        return ret;
-    }
 
-    if (job->n_records == 0) {
-        bam_stream_parse_job_free(job);
-        return 0;
+        bam_stream_reader_release_block(reader);
     }
-
-    *job_out = job;
-    return 1;
 }
 
 static int bam_stream_reader_dispatch_parse(bam_stream_reader_t *reader,
@@ -4729,10 +4892,15 @@ static int bam_stream_reader_next_parsed(bam_stream_reader_t *reader, bam1_t *b)
 
             if (reader->parse_i < (size_t)job->n_parsed) {
                 bam1_t *src = &job->records[reader->parse_i++];
-                free(b->data);
-                *b = *src;
-                src->data = NULL;
-                src->l_data = src->m_data = 0;
+                if ((bam_get_mempolicy(b) & BAM_USER_OWNS_DATA) != 0) {
+                    if (bam_copy1(b, src) < 0)
+                        return -4;
+                } else {
+                    free(b->data);
+                    *b = *src;
+                    src->data = NULL;
+                    src->l_data = src->m_data = 0;
+                }
                 return 36 + b->l_data - b->core.l_extranul;
             }
 
