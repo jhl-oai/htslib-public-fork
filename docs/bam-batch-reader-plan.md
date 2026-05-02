@@ -86,13 +86,16 @@ reader:
 - `test/sam.c` covers batch parity by rewriting returned raw frames into a
   temporary BAM and comparing ordinary `sam_read1()` hash/count results.  It
   covers serial batch reads, `hts_set_threads()`, borrowed
-  `HTS_OPT_THREAD_POOL`, and split-record payload handling.
+  `HTS_OPT_THREAD_POOL`, split-record payload handling, and live batch data
+  surviving `htsFile` close until `sam_bam_batch_destroy()`.
 
 Verification so far:
 
 ```sh
-make -j4 libhts.a test/test_view test/sam
+make -j4 libhts.a test/test_view test/test_bgzf test/sam
 ./test/sam
+./test/test_bgzf test/bgziptest.txt
+make test
 git diff --check
 ```
 

@@ -2581,6 +2581,57 @@ cleanup:
     batch_reader_env(0, 0);
 }
 
+static uint64_t batch_reader_bytes_hash(const bam_batch_t *batch)
+{
+    uint64_t h = 1469598103934665603ULL;
+    size_t i;
+
+    for (i = 0; i < batch->len; i++) {
+        h ^= batch->data[i];
+        h *= 1099511628211ULL;
+    }
+    h ^= (uint64_t)batch->n_records;
+    h *= 1099511628211ULL;
+    return h;
+}
+
+static void check_bam_batch_survives_close(const char *path)
+{
+    samFile *fp = NULL;
+    sam_hdr_t *hdr = NULL;
+    bam_batch_t batch = {0};
+    uint64_t before, after;
+    int ret;
+
+    batch_reader_env(1, 1);
+
+    fp = sam_open(path, "rb");
+    VERIFY(fp != NULL, "failed to open BAM for batch lifetime test");
+    VERIFY(hts_set_threads(fp, 2) == 0,
+           "failed to set BAM batch lifetime threads");
+    hdr = sam_hdr_read(fp);
+    VERIFY(hdr != NULL, "failed to read BAM header");
+
+    ret = sam_bam_read_batch(fp, hdr, &batch);
+    VERIFY(ret > 0, "failed to read first BAM batch");
+    before = batch_reader_bytes_hash(&batch);
+
+    sam_hdr_destroy(hdr);
+    hdr = NULL;
+    VERIFY(sam_close(fp) == 0, "failed to close BAM with live batch");
+    fp = NULL;
+
+    after = batch_reader_bytes_hash(&batch);
+    VERIFY(after == before, "BAM batch data changed after file close");
+
+cleanup:
+    sam_bam_batch_destroy(&batch);
+    sam_hdr_destroy(hdr);
+    if (fp)
+        sam_close(fp);
+    batch_reader_env(0, 0);
+}
+
 static void read_bam_stream_late_fallback_hash(const char *path,
                                                uint64_t *hash, int *count)
 {
@@ -3242,6 +3293,8 @@ static void test_bam_batch_reader(void)
     read_bam_batch_hash(split_body, 0, 0, &batch_hash, &batch_count);
     VERIFY(batch_count == serial_count && batch_hash == serial_hash,
            "BAM batch reader changed split body record");
+
+    check_bam_batch_survives_close("test/range.bam");
 
 cleanup:
     unlink(split_body);
