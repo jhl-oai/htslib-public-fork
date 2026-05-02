@@ -114,9 +114,9 @@ an experiment rather than a product feature.
 
 - Added `HTS_BAM_STREAM_READER=1` as a separate opt-in from the indexed ordered
   reader.
-- Added a serial stream framer that reads arbitrary decompressed byte chunks,
-  assembles complete BAM records, decodes them into the caller's `bam1_t`, and
-  emits through `sam_read1_bam()`.
+- Added a serial stream framer that consumes explicit decompressed BGZF block
+  bytes, assembles complete BAM records, decodes them into the caller's
+  `bam1_t`, and emits through `sam_read1_bam()`.
 - Added `HTS_BAM_STREAM_READER_CHUNK` as an internal stress knob; tests use a
   7-byte chunk to force split `block_len`, core, and payload handling.
 - Thread settings are deferred when stream-reader mode is enabled, so this path

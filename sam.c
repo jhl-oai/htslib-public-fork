@@ -4133,6 +4133,39 @@ static int bam_stream_reader_reserve(bam_stream_reader_t *reader,
     return 0;
 }
 
+static ssize_t bam_stream_reader_read_block_bytes(bam_stream_reader_t *reader,
+                                                  uint8_t *dst, size_t len)
+{
+    BGZF *bgzf = reader->bgzf;
+    size_t copied = 0;
+
+    while (copied < len) {
+        int avail, n;
+
+        if (bgzf->block_offset >= bgzf->block_length) {
+            if (bgzf_read_block(bgzf) < 0)
+                return copied ? (ssize_t)copied : -1;
+            if (bgzf->block_length == 0)
+                break;
+        }
+
+        avail = bgzf->block_length - bgzf->block_offset;
+        if (avail <= 0)
+            continue;
+        n = avail;
+        if ((size_t)n > len - copied)
+            n = (int)(len - copied);
+
+        memcpy(dst + copied,
+               (uint8_t *)bgzf->uncompressed_block + bgzf->block_offset,
+               (size_t)n);
+        bgzf->block_offset += n;
+        copied += (size_t)n;
+    }
+
+    return (ssize_t)copied;
+}
+
 static int bam_stream_reader_need(bam_stream_reader_t *reader, size_t need)
 {
     while (reader->len - reader->off < need && !reader->eof) {
@@ -4148,7 +4181,8 @@ static int bam_stream_reader_need(bam_stream_reader_t *reader, size_t need)
         if (bam_stream_reader_reserve(reader, want) < 0)
             return -2;
 
-        n = bgzf_read(reader->bgzf, reader->buf + reader->len, want);
+        n = bam_stream_reader_read_block_bytes(reader, reader->buf + reader->len,
+                                               want);
         if (n < 0)
             return -2;
         if (n == 0) {
