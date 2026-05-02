@@ -39,6 +39,14 @@ cost, but they would change lifetime semantics unless data is copied before
 returning or ownership is transferred to the caller.  The attempted low-risk
 variants did not beat current BGZF `-@` broadly.
 
+A follow-up implementation review did not find another low-friction change
+inside the existing `sam_read1(fp, hdr, b)` contract.  The current parse path
+already avoids raw-frame copies for records wholly contained in one BGZF block,
+copies only split-record carry data, and transfers worker-owned `bam1_t::data`
+buffers into the caller when the caller does not use `BAM_USER_OWNS_DATA`.
+That leaves independent per-record `bam1_t` materialization as the remaining
+cost center.
+
 ## Pruned Experiments
 
 - Raw-copy parse batches: correct but slower due frame copies and per-record
