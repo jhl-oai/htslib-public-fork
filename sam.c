@@ -5094,6 +5094,21 @@ void sam_bam_batch_destroy(bam_batch_t *batch)
     memset(batch, 0, sizeof(*batch));
 }
 
+int sam_bam_batch_record_to_bam1(const bam_batch_record_t *record, bam1_t *bam)
+{
+    BGZF fake_bgzf = {0};
+    int32_t block_len;
+
+    if (!record || !bam || !record->frame || record->frame_len < 36 ||
+        record->frame_len - 4 > INT32_MAX)
+        return -2;
+
+    block_len = (int32_t)(record->frame_len - 4);
+    fake_bgzf.is_be = ed_is_big();
+    return bam_decode1_body(fake_bgzf.is_be ? &fake_bgzf : NULL, bam,
+                            block_len, record->frame + 4);
+}
+
 static bam_stream_reader_t *bam_batch_reader_get(htsFile *fp)
 {
     if (!fp || !fp->is_bgzf || !fp->fp.bgzf)

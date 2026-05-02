@@ -59,6 +59,7 @@ typedef struct bam_batch_t {
 
 int sam_bam_read_batch(htsFile *fp, sam_hdr_t *h, bam_batch_t *batch);
 void sam_bam_batch_destroy(bam_batch_t *batch);
+int sam_bam_batch_record_to_bam1(const bam_batch_record_t *record, bam1_t *bam);
 
 // Fastq state
 int fastq_state_set(samFile *fp, enum hts_fmt_option opt, ...);

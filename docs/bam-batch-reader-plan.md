@@ -43,6 +43,9 @@ one complete assembled frame.
 - The batch reader owns decoded BGZF block results while a batch references
   them.
 - Split records are copied into a batch-owned carry buffer.
+- `sam_bam_batch_record_to_bam1()` materializes one descriptor into a normal
+  `bam1_t`, so future consumers can batch-scan all records and copy only the
+  records they need to emit.
 - `sam_read1()` remains the compatibility path and materializes normal
   independent `bam1_t` records.
 

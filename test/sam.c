@@ -2527,6 +2527,9 @@ static void read_bam_batch_hash(const char *path, int hts_threads,
     sam_hdr_t *hdr = NULL;
     htsThreadPool p = {NULL, 0};
     bam_batch_t batch = {0};
+    bam1_t *materialized = NULL;
+    uint64_t materialized_hash = 1469598103934665603ULL;
+    int materialized_count = 0;
     int ret, batch_count = 0;
 
     batch_reader_env(1, 1);
@@ -2550,6 +2553,8 @@ static void read_bam_batch_hash(const char *path, int hts_threads,
     }
     hdr = sam_hdr_read(fp);
     VERIFY(hdr != NULL, "failed to read BAM header");
+    materialized = bam_init1();
+    VERIFY(materialized != NULL, "failed to initialize materialized BAM record");
     out = sam_open(tmp, "wb");
     VERIFY(out != NULL, "failed to open temporary batch BAM");
     VERIFY(sam_hdr_write(out, hdr) >= 0,
@@ -2569,6 +2574,11 @@ static void read_bam_batch_hash(const char *path, int hts_threads,
                    "BAM batch record view points outside batch");
             VERIFY(rec->body == rec->frame + 4 + 32,
                    "BAM batch record view body pointer is wrong");
+            VERIFY(sam_bam_batch_record_to_bam1(rec, materialized) >= 0,
+                   "failed to materialize BAM batch record");
+            materialized_hash =
+                ordered_reader_record_hash(materialized_hash, materialized);
+            materialized_count++;
             view_len += rec->frame_len;
         }
         VERIFY(view_len == batch.len, "BAM batch record views length mismatch");
@@ -2582,8 +2592,13 @@ static void read_bam_batch_hash(const char *path, int hts_threads,
     out = NULL;
     read_bam_order_hash(tmp, 0, 0, 0, 0, NULL, hash, count);
     VERIFY(batch_count == *count, "BAM batch count changed after rewrite");
+    VERIFY(materialized_count == *count,
+           "BAM batch materialized count changed");
+    VERIFY(materialized_hash == *hash,
+           "BAM batch materialized records differ from rewritten records");
 
 cleanup:
+    bam_destroy1(materialized);
     sam_bam_batch_destroy(&batch);
     sam_hdr_destroy(hdr);
     if (out)
