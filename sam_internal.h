@@ -39,10 +39,19 @@ int sam_set_thread_pool(htsFile *fp, htsThreadPool *p);
 int sam_set_threads(htsFile *fp, int nthreads);
 int sam_bam_raw_copy_blocks(htsFile *in, htsFile *out);
 
+typedef struct bam_batch_record_t {
+    const uint8_t *frame;
+    size_t frame_len;
+    const uint8_t *body;
+    uint32_t raw_l_data;
+    bam1_core_t core;
+} bam_batch_record_t;
+
 typedef struct bam_batch_t {
     const uint8_t *data;
     size_t len;
     int n_records;
+    const bam_batch_record_t *records;
     void *impl;
 } bam_batch_t;
 

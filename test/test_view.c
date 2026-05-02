@@ -137,8 +137,16 @@ int sam_loop(int argc, char **argv, int optind, struct opts *opts, htsFile *in, 
         int attempted = 0;
 
         while ((r = sam_bam_read_batch(in, h, &batch)) >= 0) {
+            int i;
+
             attempted = 1;
-            batch_sink += (uint64_t)batch.n_records + (uint64_t)batch.len;
+            for (i = 0; i < batch.n_records; i++) {
+                const bam_batch_record_t *rec = &batch.records[i];
+
+                batch_sink += (uint64_t)rec->core.flag +
+                              (uint64_t)rec->core.l_qseq +
+                              (uint64_t)rec->raw_l_data;
+            }
             sam_bam_batch_destroy(&batch);
         }
         sam_bam_batch_destroy(&batch);

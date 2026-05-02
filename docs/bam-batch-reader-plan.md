@@ -80,9 +80,12 @@ reader:
 - `sam_bam_read_batch()` returns one complete ordered raw-frame batch at a
   time.  Batch data is backed either by an owned decoded BGZF block result or
   by an owned carry buffer for split records.
+- Each batch includes lightweight `bam_batch_record_t` views with frame/body
+  pointers, raw payload length, and decoded core fields.  This lets internal
+  consumers inspect per-record metadata without allocating `bam1_t` objects.
 - `test/test_view.c` has a benchmark-only batch consumer for BAM input under
-  `HTS_BAM_BATCH_READER=1` and `-B`; it counts batches without materializing
-  every record as a `bam1_t`.
+  `HTS_BAM_BATCH_READER=1` and `-B`; it walks record views without
+  materializing every record as a `bam1_t`.
 - `test/sam.c` covers batch parity by rewriting returned raw frames into a
   temporary BAM and comparing ordinary `sam_read1()` hash/count results.  It
   covers serial batch reads, `hts_set_threads()`, borrowed
@@ -105,10 +108,10 @@ Repeated median-of-five benchmark notes from `/tmp/bam_batch_bench.tsv`:
 test_view -B, lower is better
 
 Input                         BGZF -@4  Batch -@4  BGZF -@8  Batch -@8
-HG00096.exome.chr20.bam          0.28s      0.20s      0.28s      0.17s
-HG00096.lowcov.chr20_10-20Mb     0.09s      0.07s      0.08s      0.06s
-HG00096.highcov.chr20_10-11Mb    0.07s      0.08s      0.07s      0.06s
-HG002.ont_ul.chr20_10-10.2Mb     0.02s      0.03s      0.02s      0.03s
+HG00096.exome.chr20.bam          0.28s      0.20s      0.28s      0.18s
+HG00096.lowcov.chr20_10-20Mb     0.08s      0.07s      0.08s      0.07s
+HG00096.highcov.chr20_10-11Mb    0.07s      0.08s      0.06s      0.06s
+HG002.ont_ul.chr20_10-10.2Mb     0.03s      0.03s      0.02s      0.03s
 ```
 
 The first slice is directionally useful on medium short-read workloads, but it

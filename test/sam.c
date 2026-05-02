@@ -2556,7 +2556,22 @@ static void read_bam_batch_hash(const char *path, int hts_threads,
            "failed to write temporary batch BAM header");
 
     while ((ret = sam_bam_read_batch(fp, hdr, &batch)) >= 0) {
+        size_t view_len = 0;
+        int i;
+
         VERIFY(ret == batch.n_records, "BAM batch returned bad count");
+        VERIFY(batch.records != NULL, "BAM batch did not return record views");
+        for (i = 0; i < batch.n_records; i++) {
+            const bam_batch_record_t *rec = &batch.records[i];
+
+            VERIFY(rec->frame >= batch.data &&
+                   rec->frame + rec->frame_len <= batch.data + batch.len,
+                   "BAM batch record view points outside batch");
+            VERIFY(rec->body == rec->frame + 4 + 32,
+                   "BAM batch record view body pointer is wrong");
+            view_len += rec->frame_len;
+        }
+        VERIFY(view_len == batch.len, "BAM batch record views length mismatch");
         VERIFY(bgzf_write(out->fp.bgzf, batch.data, batch.len) ==
                (ssize_t)batch.len, "failed to write temporary batch records");
         batch_count += batch.n_records;

@@ -4029,6 +4029,7 @@ typedef struct bam_stream_parse_job_t {
     int ret;
     int is_be;
     bam1_t *records;
+    bam_batch_record_t *views;
     hts_tpool_result *owned_block_result;
 } bam_stream_parse_job_t;
 
@@ -4150,6 +4151,7 @@ static void bam_stream_parse_job_free(void *arg)
             free(job->records[i].data);
         free(job->records);
     }
+    free(job->views);
     if (job->owned_block_result)
         hts_tpool_delete_result(job->owned_block_result, 1);
     free(job->data);
@@ -5014,9 +5016,9 @@ static bam_stream_reader_t *bam_batch_reader_get(htsFile *fp)
     return NULL;
 }
 
-static int bam_batch_validate_header(bam_stream_reader_t *reader, sam_hdr_t *h,
-                                     bam_stream_parse_job_t *job,
-                                     size_t *valid_len, int *valid_records)
+static int bam_batch_build_views(bam_stream_reader_t *reader, sam_hdr_t *h,
+                                 bam_stream_parse_job_t *job,
+                                 size_t *valid_len, int *valid_records)
 {
     const uint8_t *data = job->data ? job->data : job->ref_data;
     size_t off = 0;
@@ -5024,22 +5026,48 @@ static int bam_batch_validate_header(bam_stream_reader_t *reader, sam_hdr_t *h,
 
     *valid_len = job->len;
     *valid_records = job->n_records;
-    if (!h)
-        return 0;
+
+    job->views = calloc((size_t)job->n_records, sizeof(*job->views));
+    if (!job->views)
+        return -2;
 
     for (i = 0; i < job->n_records; i++) {
         int32_t block_len;
-        int32_t tid, mtid;
+        const uint8_t *body;
+        bam_batch_record_t *view = &job->views[i];
+        uint32_t x2, x3;
 
         if (job->len - off < 4 + 32)
             return -4;
         block_len = le_to_i32(data + off);
         if (block_len < 32 || job->len - off < 4 + (size_t)block_len)
             return -4;
-        tid = le_to_i32(data + off + 4);
-        mtid = le_to_i32(data + off + 24);
-        if (tid >= h->n_targets || tid < -1 ||
-            mtid >= h->n_targets || mtid < -1) {
+
+        body = data + off + 4;
+        x2 = le_to_u32(body + 8);
+        x3 = le_to_u32(body + 12);
+        view->frame = data + off;
+        view->frame_len = 4 + (size_t)block_len;
+        view->body = body + 32;
+        view->raw_l_data = (uint32_t)block_len - 32;
+        view->core.tid = le_to_i32(body);
+        view->core.pos = le_to_i32(body + 4);
+        view->core.bin = x2 >> 16;
+        view->core.qual = (x2 >> 8) & 0xff;
+        view->core.l_qname = x2 & 0xff;
+        view->core.l_extranul = (view->core.l_qname % 4 != 0)
+            ? (4 - view->core.l_qname % 4) : 0;
+        view->core.flag = x3 >> 16;
+        view->core.n_cigar = x3 & 0xffff;
+        view->core.l_qseq = le_to_i32(body + 16);
+        view->core.mtid = le_to_i32(body + 20);
+        view->core.mpos = le_to_i32(body + 24);
+        view->core.isize = le_to_i32(body + 28);
+
+        if (h && (view->core.tid >= h->n_targets ||
+                  view->core.tid < -1 ||
+                  view->core.mtid >= h->n_targets ||
+                  view->core.mtid < -1)) {
             if (i > 0) {
                 *valid_len = off;
                 *valid_records = i;
@@ -5089,8 +5117,7 @@ int sam_bam_read_batch(htsFile *fp, sam_hdr_t *h, bam_batch_t *batch)
     if (ret <= 0)
         return ret == 0 ? -1 : ret;
 
-    ret = bam_batch_validate_header(reader, h, job, &valid_len,
-                                    &valid_records);
+    ret = bam_batch_build_views(reader, h, job, &valid_len, &valid_records);
     if (ret < 0) {
         bam_stream_parse_job_free(job);
         return ret;
@@ -5099,6 +5126,7 @@ int sam_bam_read_batch(htsFile *fp, sam_hdr_t *h, bam_batch_t *batch)
     batch->data = job->data ? job->data : job->ref_data;
     batch->len = valid_len;
     batch->n_records = valid_records;
+    batch->records = job->views;
     batch->impl = job;
     return valid_records;
 }
