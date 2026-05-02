@@ -96,26 +96,24 @@ make -j4 libhts.a test/test_view test/sam
 git diff --check
 ```
 
-Smoke benchmark notes, single run and noisy:
+Repeated median-of-five benchmark notes from `/tmp/bam_batch_bench.tsv`:
 
 ```text
-HG00096.exome.chr20.bam, test_view -B
-  BGZF -@4: 0.25s after warmup
-  batch -@4: 0.19s
-  BGZF -@8: 0.25s
-  batch -@8: 0.17s
+test_view -B, lower is better
 
-HG00096.highcov.chr20_10-11Mb.bam, test_view -B
-  BGZF -@4: 0.06s
-  batch -@4: 0.06s
-  BGZF -@8: 0.05s
-  batch -@8: 0.04s
+Input                         BGZF -@4  Batch -@4  BGZF -@8  Batch -@8
+HG00096.exome.chr20.bam          0.28s      0.20s      0.28s      0.17s
+HG00096.lowcov.chr20_10-20Mb     0.09s      0.07s      0.08s      0.06s
+HG00096.highcov.chr20_10-11Mb    0.07s      0.08s      0.07s      0.06s
+HG002.ont_ul.chr20_10-10.2Mb     0.02s      0.03s      0.02s      0.03s
 ```
 
-These are only first-pass smoke results.  The next step is repeated
-median-of-five corpus benchmarking and then either a true batch consumer in a
-samtools command or a richer internal record-view surface that lets tools do
-useful work without materializing every record.
+The first slice is directionally useful on medium short-read workloads, but it
+does not yet clear the product gate broadly.  The tiny ONT slice is too small
+to amortize batch setup and header validation, and highcov remains effectively
+neutral.  The next step is either a real tool-facing batch consumer or a richer
+record-view surface that lets tools do useful work without materializing every
+record.
 
 ## Benchmark Gate
 
