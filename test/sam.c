@@ -2568,14 +2568,54 @@ static void read_bam_batch_hash(const char *path, int hts_threads,
         VERIFY(batch.records != NULL, "BAM batch did not return record views");
         for (i = 0; i < batch.n_records; i++) {
             const bam_batch_record_t *rec = &batch.records[i];
+            const uint8_t *qname = sam_bam_batch_record_qname(rec);
+            const uint8_t *cigar = sam_bam_batch_record_cigar(rec);
+            const uint8_t *seq = sam_bam_batch_record_seq(rec);
+            const uint8_t *qual = sam_bam_batch_record_qual(rec);
+            const uint8_t *aux = sam_bam_batch_record_aux(rec);
+            size_t aux_len = sam_bam_batch_record_aux_len(rec);
+            int k;
 
             VERIFY(rec->frame >= batch.data &&
                    rec->frame + rec->frame_len <= batch.data + batch.len,
                    "BAM batch record view points outside batch");
             VERIFY(rec->body == rec->frame + 4 + 32,
                    "BAM batch record view body pointer is wrong");
+            VERIFY(qname == rec->body, "BAM batch qname accessor is wrong");
+            VERIFY(cigar == rec->body + rec->core.l_qname,
+                   "BAM batch CIGAR accessor is wrong");
+            VERIFY(seq == cigar + ((size_t)rec->core.n_cigar << 2),
+                   "BAM batch seq accessor is wrong");
+            VERIFY(qual == seq + (((size_t)rec->core.l_qseq + 1) >> 1),
+                   "BAM batch qual accessor is wrong");
+            VERIFY(aux == qual + rec->core.l_qseq,
+                   "BAM batch aux accessor is wrong");
+            VERIFY(aux + aux_len == rec->body + rec->raw_l_data,
+                   "BAM batch aux length is wrong");
             VERIFY(sam_bam_batch_record_to_bam1(rec, materialized) >= 0,
                    "failed to materialize BAM batch record");
+            VERIFY(strcmp((const char *)qname, bam_get_qname(materialized)) == 0,
+                   "BAM batch qname differs after materialization");
+            if ((size_t)materialized->l_data == rec->raw_l_data &&
+                materialized->core.l_qname == rec->core.l_qname &&
+                materialized->core.n_cigar == rec->core.n_cigar) {
+                VERIFY(aux_len == (size_t)bam_get_l_aux(materialized),
+                       "BAM batch aux length differs after materialization");
+                for (k = 0; k < rec->core.n_cigar; k++) {
+                    VERIFY(le_to_u32(cigar + ((size_t)k << 2)) ==
+                           bam_get_cigar(materialized)[k],
+                           "BAM batch CIGAR differs after materialization");
+                }
+                VERIFY(memcmp(seq, bam_get_seq(materialized),
+                              ((size_t)rec->core.l_qseq + 1) >> 1) == 0,
+                       "BAM batch seq differs after materialization");
+                VERIFY(memcmp(qual, bam_get_qual(materialized),
+                              rec->core.l_qseq) == 0,
+                       "BAM batch qual differs after materialization");
+                VERIFY(aux_len == 0 ||
+                       memcmp(aux, bam_get_aux(materialized), aux_len) == 0,
+                       "BAM batch aux differs after materialization");
+            }
             materialized_hash =
                 ordered_reader_record_hash(materialized_hash, materialized);
             materialized_count++;

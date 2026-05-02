@@ -40,6 +40,8 @@ one complete assembled frame.
   by the caller.
 - Record frame pointers are views; consumers must not retain them after batch
   release.
+- Record accessors derive raw qname, CIGAR, sequence, quality, and aux offsets
+  from the descriptor without constructing a `bam1_t`.
 - The batch reader owns decoded BGZF block results while a batch references
   them.
 - Split records are copied into a batch-owned carry buffer.
@@ -86,6 +88,9 @@ reader:
 - Each batch includes lightweight `bam_batch_record_t` views with frame/body
   pointers, raw payload length, and decoded core fields.  This lets internal
   consumers inspect per-record metadata without allocating `bam1_t` objects.
+- `sam_internal.h` also provides record-view accessors for qname, CIGAR, seq,
+  qual, and aux offsets, allowing simple consumers to evaluate filters beyond
+  core flag/MAPQ fields while still avoiding full materialization.
 - Descriptor construction is fused into the frame scan for batch reads, so the
   batch path no longer scans each raw frame once to count and again to build
   record views.
@@ -135,8 +140,9 @@ validation pass over views, but did not materially move this local benchmark.
 A sibling `samtools` branch, `feature/bam-batch-reader-consumer`, adds an
 opt-in `samtools view -c` batch consumer compiled with
 `HTS_BAM_BATCH_READER_CONSUMER` and run under `HTS_BAM_BATCH_READER=1`.
-It only handles streaming BAM count mode with simple flag/MAPQ filters; complex
-filters and output modes fall back to the existing `sam_read1()` path.
+It only handles streaming BAM count mode with simple flag/MAPQ filters and
+minimum query-length filtering from raw CIGAR views; complex filters and output
+modes fall back to the existing `sam_read1()` path.
 
 Median-of-five local timings from `/tmp/samtools_batch_view_bench.tsv`:
 
@@ -144,15 +150,37 @@ Median-of-five local timings from `/tmp/samtools_batch_view_bench.tsv`:
 samtools view -c, lower is better
 
 Input                         BGZF -@1  Batch -@1  BGZF -@4  Batch -@4  BGZF -@8  Batch -@8
-HG00096.exome.chr20.bam          0.59s      0.57s      0.28s      0.18s      0.28s      0.15s
-HG00096.lowcov.chr20_10-20Mb     0.16s      0.16s      0.07s      0.06s      0.07s      0.05s
-HG00096.highcov.chr20_10-11Mb    0.22s      0.21s      0.06s      0.06s      0.05s      0.04s
-HG002.ont_ul.chr20_10-10.2Mb     0.04s      0.05s      0.02s      0.02s      0.01s      0.02s
+HG00096.exome.chr20.bam          0.60s      0.62s      0.28s      0.21s      0.28s      0.18s
+HG00096.lowcov.chr20_10-20Mb     0.16s      0.17s      0.07s      0.06s      0.08s      0.05s
+HG00096.highcov.chr20_10-11Mb    0.22s      0.22s      0.06s      0.06s      0.05s      0.05s
+HG002.ont_ul.chr20_10-10.2Mb     0.05s      0.05s      0.02s      0.02s      0.01s      0.02s
 ```
 
 The end-to-end count consumer is neutral at one thread, faster on the larger
 short-read slices with `-@`, and still dominated by timing noise on the tiny
-ONT slice.
+ONT slice.  The plain count path now validates long-CIGAR `CG` candidates and
+mapped raw-CIGAR query lengths to match the normal decode error contract.
+
+Median-of-five local timings for the raw-CIGAR `-m 75` count fast path from
+`/tmp/samtools_batch_minqlen_bench.tsv`:
+
+```text
+samtools view -c -m 75, lower is better
+
+Input                         BGZF -@4  Batch -@4  BGZF -@8  Batch -@8
+HG00096.exome.chr20.bam          0.28s      0.20s      0.28s      0.19s
+HG00096.lowcov.chr20_10-20Mb     0.07s      0.05s      0.07s      0.06s
+HG00096.highcov.chr20_10-11Mb    0.06s      0.06s      0.05s      0.05s
+HG002.ont_ul.chr20_10-10.2Mb     0.01s      0.02s      0.01s      0.02s
+```
+
+This extends the fast path beyond core-only predicates while keeping the same
+short-read benefit.  The ONT slice is too small for stable timing and remains a
+prototype-only datapoint.  `-B` remains excluded from this fast path because
+normal `samtools view` applies `bam_remove_B()` before query-length and flag
+filtering.  Long-CIGAR `CG` candidates are selectively materialized for
+correct query-length semantics and malformed-input parity; ordinary records
+validate raw CIGAR query length before filtering.
 
 ## Benchmark Gate
 

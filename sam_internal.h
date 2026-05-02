@@ -57,6 +57,44 @@ typedef struct bam_batch_t {
     void *impl;
 } bam_batch_t;
 
+static inline const uint8_t *sam_bam_batch_record_qname(
+        const bam_batch_record_t *record)
+{
+    return record->body;
+}
+
+static inline const uint8_t *sam_bam_batch_record_cigar(
+        const bam_batch_record_t *record)
+{
+    return record->body + record->core.l_qname;
+}
+
+static inline const uint8_t *sam_bam_batch_record_seq(
+        const bam_batch_record_t *record)
+{
+    return sam_bam_batch_record_cigar(record) + ((size_t)record->core.n_cigar << 2);
+}
+
+static inline const uint8_t *sam_bam_batch_record_qual(
+        const bam_batch_record_t *record)
+{
+    return sam_bam_batch_record_seq(record) + (((size_t)record->core.l_qseq + 1) >> 1);
+}
+
+static inline const uint8_t *sam_bam_batch_record_aux(
+        const bam_batch_record_t *record)
+{
+    return sam_bam_batch_record_qual(record) + record->core.l_qseq;
+}
+
+static inline size_t sam_bam_batch_record_aux_len(
+        const bam_batch_record_t *record)
+{
+    const uint8_t *aux = sam_bam_batch_record_aux(record);
+    return record->body + record->raw_l_data >= aux
+           ? (size_t)(record->body + record->raw_l_data - aux) : 0;
+}
+
 int sam_bam_read_batch(htsFile *fp, sam_hdr_t *h, bam_batch_t *batch);
 void sam_bam_batch_destroy(bam_batch_t *batch);
 int sam_bam_batch_record_to_bam1(const bam_batch_record_t *record, bam1_t *bam);
