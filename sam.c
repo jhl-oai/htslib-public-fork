@@ -4736,13 +4736,29 @@ static void bam_batch_record_view_set(bam_batch_record_t *view,
     view->core.isize = le_to_i32(body + 28);
 }
 
+static int bam_batch_record_view_tid_valid(const bam_batch_record_t *view,
+                                           sam_hdr_t *h)
+{
+    if (!h)
+        return 1;
+    return view->core.tid >= -1 && view->core.tid < h->n_targets &&
+           view->core.mtid >= -1 && view->core.mtid < h->n_targets;
+}
+
 static int bam_batch_record_view_append(bam_batch_record_t **views,
                                         int *n_views, int *m_views,
                                         const uint8_t *frame,
-                                        size_t frame_len)
+                                        size_t frame_len, sam_hdr_t *h)
 {
     bam_batch_record_t *new_views;
+    bam_batch_record_t view;
     int new_m;
+
+    bam_batch_record_view_set(&view, frame, frame_len);
+    if (!bam_batch_record_view_tid_valid(&view, h)) {
+        errno = ERANGE;
+        return -3;
+    }
 
     if (*n_views == *m_views) {
         new_m = *m_views ? (*m_views > INT_MAX / 2
@@ -4761,13 +4777,13 @@ static int bam_batch_record_view_append(bam_batch_record_t **views,
         *m_views = new_m;
     }
 
-    bam_batch_record_view_set(&(*views)[(*n_views)++], frame, frame_len);
+    (*views)[(*n_views)++] = view;
     return 0;
 }
 
 static int bam_stream_reader_build_parse_job(bam_stream_reader_t *reader,
                                              bam_stream_parse_job_t **job_out,
-                                             int build_views)
+                                             int build_views, sam_hdr_t *h)
 {
     BGZF *bgzf = reader->bgzf;
     bam_stream_parse_job_t *job;
@@ -4853,6 +4869,11 @@ static int bam_stream_reader_build_parse_job(bam_stream_reader_t *reader,
                 }
                 bam_batch_record_view_set(&job->views[0], job->data,
                                           frame_len);
+                if (!bam_batch_record_view_tid_valid(&job->views[0], h)) {
+                    bam_stream_parse_job_free(job);
+                    errno = ERANGE;
+                    return -3;
+                }
             }
             *job_out = job;
             return 1;
@@ -4885,11 +4906,18 @@ static int bam_stream_reader_build_parse_job(bam_stream_reader_t *reader,
                 reader->pending_frame_error = -4;
                 break;
             }
-            if (build_views &&
-                bam_batch_record_view_append(&views, &n_records, &m_views,
-                                             data + pos, frame_len) < 0) {
-                free(views);
-                return -2;
+            if (build_views) {
+                int vret = bam_batch_record_view_append(&views, &n_records,
+                                                        &m_views, data + pos,
+                                                        frame_len, h);
+                if (vret < 0) {
+                    if (vret == -3 && n_records > 0) {
+                        reader->pending_frame_error = -3;
+                        break;
+                    }
+                    free(views);
+                    return vret == -3 ? -3 : -2;
+                }
             }
             pos += frame_len;
             if (!build_views)
@@ -4962,7 +4990,7 @@ static int bam_stream_reader_fill_parse(bam_stream_reader_t *reader)
            !reader->pending_frame_error &&
            reader->parse_in_flight < reader->qsize) {
         bam_stream_parse_job_t *job = NULL;
-        int ret = bam_stream_reader_build_parse_job(reader, &job, 0);
+        int ret = bam_stream_reader_build_parse_job(reader, &job, 0, NULL);
 
         if (ret > 0) {
             if (bam_stream_reader_dispatch_parse(reader, job) < 0) {
@@ -5107,42 +5135,6 @@ static bam_stream_reader_t *bam_batch_reader_get(htsFile *fp)
     return NULL;
 }
 
-static int bam_batch_validate_views(bam_stream_reader_t *reader, sam_hdr_t *h,
-                                    bam_stream_parse_job_t *job,
-                                    size_t *valid_len, int *valid_records)
-{
-    size_t off = 0;
-    int i;
-
-    *valid_len = job->len;
-    *valid_records = job->n_records;
-
-    if (!job->views)
-        return -2;
-    if (!h)
-        return 0;
-
-    for (i = 0; i < job->n_records; i++) {
-        bam_batch_record_t *view = &job->views[i];
-
-        if (view->core.tid >= h->n_targets ||
-            view->core.tid < -1 ||
-            view->core.mtid >= h->n_targets ||
-            view->core.mtid < -1) {
-            if (i > 0) {
-                *valid_len = off;
-                *valid_records = i;
-                reader->pending_frame_error = -3;
-                return 0;
-            }
-            errno = ERANGE;
-            return -3;
-        }
-        off += view->frame_len;
-    }
-    return 0;
-}
-
 static int bam_batch_detach_ref_data(bam_stream_parse_job_t *job)
 {
     const uint8_t *old_data = job->ref_data;
@@ -5179,8 +5171,6 @@ int sam_bam_read_batch(htsFile *fp, sam_hdr_t *h, bam_batch_t *batch)
 {
     bam_stream_reader_t *reader;
     bam_stream_parse_job_t *job = NULL;
-    size_t valid_len = 0;
-    int valid_records = 0;
     int ret;
 
     if (!batch)
@@ -5206,14 +5196,13 @@ int sam_bam_read_batch(htsFile *fp, sam_hdr_t *h, bam_batch_t *batch)
     if (reader->parse_input_eof)
         return -1;
 
-    ret = bam_stream_reader_build_parse_job(reader, &job, 1);
+    ret = bam_stream_reader_build_parse_job(reader, &job, 1, h);
     if (ret <= 0)
         return ret == 0 ? -1 : ret;
 
-    ret = bam_batch_validate_views(reader, h, job, &valid_len, &valid_records);
-    if (ret < 0) {
+    if (!job->views) {
         bam_stream_parse_job_free(job);
-        return ret;
+        return -2;
     }
     if (bam_batch_detach_ref_data(job) < 0) {
         bam_stream_parse_job_free(job);
@@ -5221,11 +5210,11 @@ int sam_bam_read_batch(htsFile *fp, sam_hdr_t *h, bam_batch_t *batch)
     }
 
     batch->data = job->data ? job->data : job->ref_data;
-    batch->len = valid_len;
-    batch->n_records = valid_records;
+    batch->len = job->len;
+    batch->n_records = job->n_records;
     batch->records = job->views;
     batch->impl = job;
-    return valid_records;
+    return job->n_records;
 }
 
 int sam_set_thread_pool(htsFile *fp, htsThreadPool *p) {

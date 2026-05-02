@@ -115,17 +115,17 @@ Repeated median-of-five benchmark notes from `/tmp/bam_batch_bench.tsv`:
 test_view -B, lower is better
 
 Input                         BGZF -@4  Batch -@4  BGZF -@8  Batch -@8
-HG00096.exome.chr20.bam          0.28s      0.19s      0.28s      0.16s
-HG00096.lowcov.chr20_10-20Mb     0.08s      0.06s      0.08s      0.06s
+HG00096.exome.chr20.bam          0.28s      0.20s      0.28s      0.16s
+HG00096.lowcov.chr20_10-20Mb     0.09s      0.06s      0.08s      0.06s
 HG00096.highcov.chr20_10-11Mb    0.07s      0.07s      0.06s      0.06s
 HG002.ont_ul.chr20_10-10.2Mb     0.03s      0.03s      0.02s      0.02s
 ```
 
 The current slice is faster on the medium short-read workloads and neutral on
-the tiny highcov/ONT slices.  It now clears the local "not slower than BGZF
-`-@`" benchmark sweep, but only the larger exome slice reaches roughly 1.5x.
-The next step is a real tool-facing batch consumer that can convert this
-internal record-view surface into end-to-end samtools speedups.
+the tiny highcov/ONT slices.  It clears the local "not slower than BGZF `-@`"
+benchmark sweep, but only the larger exome slice reaches roughly 1.5x.  Fusing
+header TID validation into descriptor construction removes the remaining
+validation pass over views, but did not materially move this local benchmark.
 
 ## Samtools Consumer Experiment
 
