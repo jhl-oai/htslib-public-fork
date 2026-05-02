@@ -81,6 +81,15 @@ void hts_idx_amend_last(hts_idx_t *idx, uint64_t offset);
 
 int hts_idx_fmt(hts_idx_t *idx);
 
+// Return 1 if tid has binning-index data, 0 otherwise.
+int hts_idx_ref_has_data(const hts_idx_t *idx, int tid);
+
+// Return sorted unique virtual-offset boundaries spanning a reference.
+// The returned array is allocated with malloc() and must be freed by the
+// caller.  Returns 0 with *offsets == NULL if no usable range is available.
+int hts_idx_get_ref_file_offsets(const hts_idx_t *idx, int tid,
+                                 uint64_t **offsets, int *n_offsets);
+
 // Internal interface to save on-the-fly indexes.  The index file handle
 // is kept open so hts_close() can close if after writing out the EOF
 // block for its own file.

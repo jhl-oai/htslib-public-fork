@@ -508,6 +508,57 @@ static int test_write_read(Files *f, const char *mode, Open_method method,
     return -1;
 }
 
+static int test_cache_before_mt(Files *f) {
+    BGZF* bgz = NULL;
+    ssize_t bg_put, bg_got;
+    size_t pos = 0;
+    unsigned char bg_buf[BUFSZ];
+
+    bgz = try_bgzf_open(f->tmp_bgzf, "w", __func__);
+    if (!bgz) goto fail;
+    bg_put = try_bgzf_write(bgz, f->text, f->ltext, f->tmp_bgzf, __func__);
+    if (bg_put < 0) goto fail;
+    if (try_bgzf_close(&bgz, f->tmp_bgzf, __func__, 0) != 0) goto fail;
+
+    bgz = try_bgzf_open(f->tmp_bgzf, "r", __func__);
+    if (!bgz) goto fail;
+    bgzf_set_cache_size(bgz, 1000000);
+
+    bg_got = try_bgzf_read(bgz, bg_buf, 64, f->tmp_bgzf, __func__);
+    if (bg_got != 64 || memcmp(f->text, bg_buf, 64) != 0) goto fail;
+
+    if (try_bgzf_seek(bgz, 0, SEEK_SET, f->tmp_bgzf, __func__) != 0) {
+        goto fail;
+    }
+    if (try_bgzf_mt(bgz, 2, __func__) != 0) goto fail;
+
+    do {
+        bg_got = try_bgzf_read(bgz, bg_buf, BUFSZ, f->tmp_bgzf, __func__);
+        if (bg_got < 0) goto fail;
+        if (pos < f->ltext &&
+            memcmp(f->text + pos, bg_buf,
+                   pos + bg_got < f->ltext ? bg_got : f->ltext - pos) != 0) {
+            fprintf(stderr, "%s : Got wrong data from %s, pos %zu\n",
+                    __func__, f->tmp_bgzf, pos);
+            goto fail;
+        }
+        pos += bg_got;
+    } while (bg_got > 0);
+
+    if (pos != f->ltext) {
+        fprintf(stderr, "%s : bgzf_read got %zd bytes; expected %zd\n",
+                __func__, pos, f->ltext);
+        goto fail;
+    }
+
+    if (try_bgzf_close(&bgz, f->tmp_bgzf, __func__, 0) != 0) goto fail;
+    return 0;
+
+ fail:
+    if (bgz) bgzf_close(bgz);
+    return -1;
+}
+
 static int test_embed_eof(Files *f, const char *mode, int nthreads) {
     BGZF* bgz = NULL;
     ssize_t bg_put, bg_got;
@@ -1104,6 +1155,9 @@ int main(int argc, char **argv) {
     if (test_check_EOF(f.tmp_bgzf, 1) != 0) goto out;
     if (test_write_read(&f, "w", USE_BGZF_OPEN, 2, 2) != 0) goto out;
     if (test_check_EOF(f.tmp_bgzf, 1) != 0) goto out;
+    if (test_write_read(&f, "wg", USE_BGZF_OPEN, 2, 1) != 0) goto out;
+    if (test_check_EOF(f.tmp_bgzf, 0) != 0) goto out;
+    if (test_cache_before_mt(&f) != 0) goto out;
 
     // Embedded EOF block
     if (test_embed_eof(&f, "w", 0) != 0) goto out;

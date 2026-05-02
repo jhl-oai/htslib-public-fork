@@ -41,9 +41,12 @@ DEALINGS IN THE SOFTWARE.  */
 #define HTS_DEPRECATED(message)
 
 #include "../htslib/sam.h"
+#include "../htslib/bgzf.h"
 #include "../htslib/faidx.h"
 #include "../htslib/khash.h"
 #include "../htslib/hts_log.h"
+#include "../htslib/thread_pool.h"
+#include "../sam_internal.h"
 
 KHASH_SET_INIT_STR(keep)
 typedef khash_t(keep) *keephash_t;
@@ -2325,6 +2328,953 @@ cleanup:
     free(buf);
 }
 
+static uint64_t ordered_reader_record_hash(uint64_t h, const bam1_t *b)
+{
+    size_t i;
+
+    h ^= (uint64_t)b->core.tid + 0x9e3779b97f4a7c15ULL;
+    h *= 1099511628211ULL;
+    h ^= (uint64_t)b->core.pos;
+    h *= 1099511628211ULL;
+    h ^= (uint64_t)b->core.bin;
+    h *= 1099511628211ULL;
+    h ^= (uint64_t)b->core.qual;
+    h *= 1099511628211ULL;
+    h ^= (uint64_t)b->core.l_qname;
+    h *= 1099511628211ULL;
+    h ^= (uint64_t)b->core.flag;
+    h *= 1099511628211ULL;
+    h ^= (uint64_t)b->core.n_cigar;
+    h *= 1099511628211ULL;
+    h ^= (uint64_t)b->core.l_qseq;
+    h *= 1099511628211ULL;
+    h ^= (uint64_t)b->core.mtid;
+    h *= 1099511628211ULL;
+    h ^= (uint64_t)b->core.mpos;
+    h *= 1099511628211ULL;
+    h ^= (uint64_t)b->core.isize;
+    h *= 1099511628211ULL;
+    h ^= (uint64_t)b->l_data;
+    h *= 1099511628211ULL;
+    for (i = 0; i < (size_t)b->l_data; i++) {
+        h ^= b->data[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static void ordered_reader_env(int enable, int strict, const char *threads)
+{
+    if (enable) {
+        setenv("HTS_BAM_ORDERED_READER", "1", 1);
+        if (strict)
+            setenv("HTS_BAM_ORDERED_READER_REQUIRE", "1", 1);
+        else
+            unsetenv("HTS_BAM_ORDERED_READER_REQUIRE");
+        if (threads)
+            setenv("HTS_BAM_ORDERED_READER_THREADS", threads, 1);
+        else
+            unsetenv("HTS_BAM_ORDERED_READER_THREADS");
+    } else {
+        unsetenv("HTS_BAM_ORDERED_READER");
+        unsetenv("HTS_BAM_ORDERED_READER_REQUIRE");
+        unsetenv("HTS_BAM_ORDERED_READER_THREADS");
+    }
+}
+
+static void stream_reader_env(int enable, int strict, const char *chunk)
+{
+    if (enable) {
+        setenv("HTS_BAM_STREAM_READER", "1", 1);
+        if (strict)
+            setenv("HTS_BAM_STREAM_READER_REQUIRE", "1", 1);
+        else
+            unsetenv("HTS_BAM_STREAM_READER_REQUIRE");
+        if (chunk)
+            setenv("HTS_BAM_STREAM_READER_CHUNK", chunk, 1);
+        else
+            unsetenv("HTS_BAM_STREAM_READER_CHUNK");
+    } else {
+        unsetenv("HTS_BAM_STREAM_READER");
+        unsetenv("HTS_BAM_STREAM_READER_REQUIRE");
+        unsetenv("HTS_BAM_STREAM_READER_CHUNK");
+    }
+}
+
+static void read_bam_order_hash(const char *path, int use_ordered_reader,
+                                int hts_threads, int use_thread_pool,
+                                int strict_ordered_reader,
+                                const char *env_threads,
+                                uint64_t *hash, int *count)
+{
+    samFile *fp = NULL;
+    sam_hdr_t *hdr = NULL;
+    bam1_t *b = NULL;
+    htsThreadPool p = {NULL, 0};
+    int ret;
+
+    ordered_reader_env(use_ordered_reader, strict_ordered_reader,
+                       env_threads);
+
+    *hash = 1469598103934665603ULL;
+    *count = 0;
+    fp = sam_open(path, "rb");
+    VERIFY(fp != NULL, "failed to open BAM");
+    if (hts_threads > 0) {
+        if (use_thread_pool) {
+            p.pool = hts_tpool_init(hts_threads);
+            p.qsize = hts_threads * 2;
+            VERIFY(p.pool != NULL, "failed to create BAM reader thread pool");
+            VERIFY(hts_set_thread_pool(fp, &p) == 0,
+                   "failed to set BAM reader thread pool");
+        } else {
+            VERIFY(hts_set_threads(fp, hts_threads) == 0,
+                   "failed to set BAM reader threads");
+        }
+    }
+    hdr = sam_hdr_read(fp);
+    VERIFY(hdr != NULL, "failed to read BAM header");
+    b = bam_init1();
+    VERIFY(b != NULL, "failed to initialize BAM record");
+
+    while ((ret = sam_read1(fp, hdr, b)) >= 0) {
+        *hash = ordered_reader_record_hash(*hash, b);
+        (*count)++;
+    }
+    VERIFY(ret == -1, "failed to read all test/range.bam records");
+
+cleanup:
+    bam_destroy1(b);
+    sam_hdr_destroy(hdr);
+    if (fp)
+        sam_close(fp);
+    if (p.pool)
+        hts_tpool_destroy(p.pool);
+    ordered_reader_env(0, 0, NULL);
+}
+
+static void read_bam_stream_hash(const char *path, int hts_threads,
+                                 int use_thread_pool, const char *chunk,
+                                 uint64_t *hash, int *count)
+{
+    samFile *fp = NULL;
+    sam_hdr_t *hdr = NULL;
+    bam1_t *b = NULL;
+    htsThreadPool p = {NULL, 0};
+    int ret;
+
+    stream_reader_env(1, 1, chunk);
+
+    *hash = 1469598103934665603ULL;
+    *count = 0;
+    fp = sam_open(path, "rb");
+    VERIFY(fp != NULL, "failed to open BAM");
+    if (hts_threads > 0) {
+        if (use_thread_pool) {
+            p.pool = hts_tpool_init(hts_threads);
+            p.qsize = hts_threads * 2;
+            VERIFY(p.pool != NULL, "failed to create BAM reader thread pool");
+            VERIFY(hts_set_thread_pool(fp, &p) == 0,
+                   "failed to set BAM reader thread pool");
+        } else {
+            VERIFY(hts_set_threads(fp, hts_threads) == 0,
+                   "failed to set BAM reader threads");
+        }
+    }
+    hdr = sam_hdr_read(fp);
+    VERIFY(hdr != NULL, "failed to read BAM header");
+    b = bam_init1();
+    VERIFY(b != NULL, "failed to initialize BAM record");
+
+    while ((ret = sam_read1(fp, hdr, b)) >= 0) {
+        *hash = ordered_reader_record_hash(*hash, b);
+        (*count)++;
+    }
+    VERIFY(ret == -1, "failed to read all BAM records");
+
+cleanup:
+    bam_destroy1(b);
+    sam_hdr_destroy(hdr);
+    if (fp)
+        sam_close(fp);
+    if (p.pool)
+        hts_tpool_destroy(p.pool);
+    stream_reader_env(0, 0, NULL);
+}
+
+static void read_bam_stream_late_fallback_hash(const char *path,
+                                               uint64_t *hash, int *count)
+{
+    samFile *fp = NULL;
+    sam_hdr_t *hdr = NULL;
+    bam1_t *b = NULL;
+    int ret;
+
+    stream_reader_env(0, 0, NULL);
+
+    *hash = 1469598103934665603ULL;
+    *count = 0;
+    fp = sam_open(path, "rb");
+    VERIFY(fp != NULL, "failed to open BAM");
+    VERIFY(hts_set_threads(fp, 2) == 0, "failed to set BAM reader threads");
+    stream_reader_env(1, 0, "7");
+    hdr = sam_hdr_read(fp);
+    VERIFY(hdr != NULL, "failed to read BAM header");
+    b = bam_init1();
+    VERIFY(b != NULL, "failed to initialize BAM record");
+
+    while ((ret = sam_read1(fp, hdr, b)) >= 0) {
+        *hash = ordered_reader_record_hash(*hash, b);
+        (*count)++;
+    }
+    VERIFY(ret == -1, "failed to read all BAM records");
+
+cleanup:
+    bam_destroy1(b);
+    sam_hdr_destroy(hdr);
+    if (fp)
+        sam_close(fp);
+    stream_reader_env(0, 0, NULL);
+}
+
+static void read_range_bam_order_hash(int use_ordered_reader,
+                                      int hts_threads,
+                                      int use_thread_pool,
+                                      int strict_ordered_reader,
+                                      const char *env_threads,
+                                      uint64_t *hash, int *count)
+{
+    read_bam_order_hash("test/range.bam", use_ordered_reader,
+                        hts_threads, use_thread_pool, strict_ordered_reader,
+                        env_threads, hash, count);
+}
+
+static int copy_file_plain(const char *src, const char *dst)
+{
+    FILE *in = NULL, *out = NULL;
+    unsigned char buf[8192];
+    size_t n;
+    int ret = -1;
+
+    in = fopen(src, "rb");
+    if (!in)
+        goto cleanup;
+    out = fopen(dst, "wb");
+    if (!out)
+        goto cleanup;
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n)
+            goto cleanup;
+    }
+    if (ferror(in))
+        goto cleanup;
+    ret = 0;
+
+cleanup:
+    if (out && fclose(out) != 0)
+        ret = -1;
+    if (in)
+        fclose(in);
+    return ret;
+}
+
+static int copy_file_with_trailing_junk(const char *src, const char *dst)
+{
+    int ret = copy_file_plain(src, dst);
+    FILE *out;
+
+    if (ret < 0)
+        return ret;
+
+    out = fopen(dst, "ab");
+    if (!out)
+        return -1;
+    if (fwrite("junk", 1, 4, out) != 4)
+        ret = -1;
+    if (fclose(out) != 0)
+        ret = -1;
+    return ret;
+}
+
+static int copy_file_with_malformed_eof(const char *src, const char *dst)
+{
+    static const unsigned char bad_eof[28] = {
+        0x1f, 0x8b, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0xff, 0x06, 0x00, 0x42, 0x43, 0x02, 0x00,
+        0x1b, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00
+    };
+    FILE *in = NULL, *out = NULL;
+    unsigned char buf[8192];
+    long remaining;
+    int ret = -1;
+
+    in = fopen(src, "rb");
+    if (!in)
+        goto cleanup;
+    if (fseek(in, 0, SEEK_END) != 0)
+        goto cleanup;
+    remaining = ftell(in);
+    if (remaining < (long)sizeof(bad_eof))
+        goto cleanup;
+    remaining -= (long)sizeof(bad_eof);
+    if (fseek(in, 0, SEEK_SET) != 0)
+        goto cleanup;
+
+    out = fopen(dst, "wb");
+    if (!out)
+        goto cleanup;
+    while (remaining > 0) {
+        size_t want = remaining < (long)sizeof(buf)
+            ? (size_t)remaining : sizeof(buf);
+        size_t n = fread(buf, 1, want, in);
+        if (n != want || fwrite(buf, 1, n, out) != n)
+            goto cleanup;
+        remaining -= (long)n;
+    }
+    if (fwrite(bad_eof, 1, sizeof(bad_eof), out) != sizeof(bad_eof))
+        goto cleanup;
+    ret = 0;
+
+cleanup:
+    if (out && fclose(out) != 0)
+        ret = -1;
+    if (in)
+        fclose(in);
+    return ret;
+}
+
+static void test_put_le32(uint8_t *buf, uint32_t val)
+{
+    buf[0] = val & 0xff;
+    buf[1] = (val >> 8) & 0xff;
+    buf[2] = (val >> 16) & 0xff;
+    buf[3] = (val >> 24) & 0xff;
+}
+
+static int write_partial_bam_record(const char *path, int mode)
+{
+    BGZF *fp = NULL;
+    uint8_t buf[4], core[32];
+    int ret = -1;
+
+    fp = bgzf_open(path, "wb");
+    if (!fp)
+        return -1;
+
+    if (bgzf_write(fp, "BAM\1", 4) != 4)
+        goto cleanup;
+    memset(buf, 0, sizeof(buf));
+    if (bgzf_write(fp, buf, 4) != 4) // l_text
+        goto cleanup;
+    if (bgzf_write(fp, buf, 4) != 4) // n_ref
+        goto cleanup;
+
+    test_put_le32(buf, 33);
+    if (mode == 0) {
+        if (bgzf_write(fp, buf, 2) != 2)
+            goto cleanup;
+        ret = 0;
+        goto cleanup;
+    }
+
+    if (bgzf_write(fp, buf, 4) != 4)
+        goto cleanup;
+
+    memset(core, 0, sizeof(core));
+    test_put_le32(core, 0xffffffffu);      // tid
+    test_put_le32(core + 4, 0xffffffffu);  // pos
+    test_put_le32(core + 8, 1);            // l_qname
+    test_put_le32(core + 12, BAM_FUNMAP << 16);
+    test_put_le32(core + 16, 0);           // l_qseq
+    test_put_le32(core + 20, 0xffffffffu); // mtid
+    test_put_le32(core + 24, 0xffffffffu); // mpos
+    test_put_le32(core + 28, 0);           // isize
+
+    if (mode == 1) {
+        if (bgzf_write(fp, core, 10) != 10)
+            goto cleanup;
+        ret = 0;
+        goto cleanup;
+    }
+
+    if (bgzf_write(fp, core, sizeof(core)) != sizeof(core))
+        goto cleanup;
+    ret = 0;
+
+cleanup:
+    if (bgzf_close(fp) != 0)
+        ret = -1;
+    return ret;
+}
+
+static void fill_minimal_unmapped_record(uint8_t *rec)
+{
+    memset(rec, 0, 37);
+    test_put_le32(rec, 33);
+    test_put_le32(rec + 4, 0xffffffffu);      // tid
+    test_put_le32(rec + 8, 0xffffffffu);      // pos
+    test_put_le32(rec + 12, 1);               // l_qname
+    test_put_le32(rec + 16, BAM_FUNMAP << 16);
+    test_put_le32(rec + 20, 0);               // l_qseq
+    test_put_le32(rec + 24, 0xffffffffu);     // mtid
+    test_put_le32(rec + 28, 0xffffffffu);     // mpos
+    test_put_le32(rec + 32, 0);               // isize
+    rec[36] = '\0';                           // qname
+}
+
+static int write_split_bam_record(const char *path, size_t split)
+{
+    BGZF *fp = NULL;
+    uint8_t buf[4], rec[37];
+    int ret = -1;
+
+    if (split == 0 || split >= sizeof(rec))
+        return -1;
+
+    fp = bgzf_open(path, "wb");
+    if (!fp)
+        return -1;
+
+    if (bgzf_write(fp, "BAM\1", 4) != 4)
+        goto cleanup;
+    memset(buf, 0, sizeof(buf));
+    if (bgzf_write(fp, buf, 4) != 4) // l_text
+        goto cleanup;
+    if (bgzf_write(fp, buf, 4) != 4) // n_ref
+        goto cleanup;
+
+    fill_minimal_unmapped_record(rec);
+    if (bgzf_write(fp, rec, split) != (ssize_t)split)
+        goto cleanup;
+    if (bgzf_flush(fp) < 0)
+        goto cleanup;
+    if (bgzf_write(fp, rec + split, sizeof(rec) - split) !=
+        (ssize_t)(sizeof(rec) - split))
+        goto cleanup;
+    ret = 0;
+
+cleanup:
+    if (bgzf_close(fp) != 0)
+        ret = -1;
+    return ret;
+}
+
+static int write_valid_then_partial_bam_record(const char *path, int mode)
+{
+    BGZF *fp = NULL;
+    uint8_t buf[4], rec[37], core[32];
+    int ret = -1;
+
+    fp = bgzf_open(path, "wb");
+    if (!fp)
+        return -1;
+
+    if (bgzf_write(fp, "BAM\1", 4) != 4)
+        goto cleanup;
+    memset(buf, 0, sizeof(buf));
+    if (bgzf_write(fp, buf, 4) != 4) // l_text
+        goto cleanup;
+    if (bgzf_write(fp, buf, 4) != 4) // n_ref
+        goto cleanup;
+
+    fill_minimal_unmapped_record(rec);
+    if (bgzf_write(fp, rec, sizeof(rec)) != sizeof(rec))
+        goto cleanup;
+
+    test_put_le32(buf, 33);
+    if (mode == 0) {
+        if (bgzf_write(fp, buf, 2) != 2)
+            goto cleanup;
+        ret = 0;
+        goto cleanup;
+    }
+    if (bgzf_write(fp, buf, 4) != 4)
+        goto cleanup;
+
+    memset(core, 0, sizeof(core));
+    test_put_le32(core, 0xffffffffu);
+    test_put_le32(core + 4, 0xffffffffu);
+    test_put_le32(core + 8, 1);
+    test_put_le32(core + 12, BAM_FUNMAP << 16);
+    test_put_le32(core + 20, 0xffffffffu);
+    test_put_le32(core + 24, 0xffffffffu);
+
+    if (mode == 1) {
+        if (bgzf_write(fp, core, 10) != 10)
+            goto cleanup;
+        ret = 0;
+        goto cleanup;
+    }
+    if (bgzf_write(fp, core, sizeof(core)) != sizeof(core))
+        goto cleanup;
+    ret = 0;
+
+cleanup:
+    if (bgzf_close(fp) != 0)
+        ret = -1;
+    return ret;
+}
+
+static int read_one_bam_ret(const char *path, int use_stream)
+{
+    samFile *fp = NULL;
+    sam_hdr_t *hdr = NULL;
+    bam1_t *b = NULL;
+    int ret = -999;
+
+    stream_reader_env(use_stream, 1, "7");
+    fp = sam_open(path, "rb");
+    if (!fp)
+        goto cleanup;
+    hdr = sam_hdr_read(fp);
+    if (!hdr)
+        goto cleanup;
+    b = bam_init1();
+    if (!b)
+        goto cleanup;
+
+    ret = sam_read1(fp, hdr, b);
+
+cleanup:
+    bam_destroy1(b);
+    sam_hdr_destroy(hdr);
+    if (fp)
+        sam_close(fp);
+    stream_reader_env(0, 0, NULL);
+    return ret;
+}
+
+static void read_two_bam_rets(const char *path, int use_stream,
+                              int *first_ret, int *second_ret)
+{
+    samFile *fp = NULL;
+    sam_hdr_t *hdr = NULL;
+    bam1_t *b = NULL;
+
+    *first_ret = *second_ret = -999;
+    stream_reader_env(use_stream, 1, "7");
+    fp = sam_open(path, "rb");
+    if (!fp)
+        goto cleanup;
+    hdr = sam_hdr_read(fp);
+    if (!hdr)
+        goto cleanup;
+    b = bam_init1();
+    if (!b)
+        goto cleanup;
+
+    *first_ret = sam_read1(fp, hdr, b);
+    *second_ret = sam_read1(fp, hdr, b);
+
+cleanup:
+    bam_destroy1(b);
+    sam_hdr_destroy(hdr);
+    if (fp)
+        sam_close(fp);
+    stream_reader_env(0, 0, NULL);
+}
+
+static int copy_file_without_eof(const char *src, const char *dst)
+{
+    FILE *in = NULL, *out = NULL;
+    unsigned char buf[8192];
+    long remaining;
+    int ret = -1;
+
+    in = fopen(src, "rb");
+    if (!in)
+        goto cleanup;
+    if (fseek(in, 0, SEEK_END) != 0)
+        goto cleanup;
+    remaining = ftell(in);
+    if (remaining < 28)
+        goto cleanup;
+    remaining -= 28;
+    if (fseek(in, 0, SEEK_SET) != 0)
+        goto cleanup;
+
+    out = fopen(dst, "wb");
+    if (!out)
+        goto cleanup;
+    while (remaining > 0) {
+        size_t want = remaining < (long)sizeof(buf)
+            ? (size_t)remaining : sizeof(buf);
+        size_t n = fread(buf, 1, want, in);
+        if (n != want || fwrite(buf, 1, n, out) != n)
+            goto cleanup;
+        remaining -= (long)n;
+    }
+    ret = 0;
+
+cleanup:
+    if (out && fclose(out) != 0)
+        ret = -1;
+    if (in)
+        fclose(in);
+    return ret;
+}
+
+static void test_bam_raw_block_copy(void)
+{
+    const char *src = "test/range.bam";
+    const char *dst = "test/test_bam_raw_block_copy.tmp.bam";
+    const char *dst_uncomp = "test/test_bam_raw_block_copy.tmp.uncomp.bam";
+    const char *dst_level = "test/test_bam_raw_block_copy.tmp.level.bam";
+    const char *dst_indexed = "test/test_bam_raw_block_copy.tmp.indexed.bam";
+    const char *dst_index = "test/test_bam_raw_block_copy.tmp.indexed.bam.bai";
+    const char *junk_src = "test/test_bam_raw_block_copy.tmp.junk.bam";
+    const char *junk_dst = "test/test_bam_raw_block_copy.tmp.junk_out.bam";
+    const char *bad_eof_src = "test/test_bam_raw_block_copy.tmp.bad_eof.bam";
+    const char *bad_eof_dst = "test/test_bam_raw_block_copy.tmp.bad_eof_out.bam";
+    const char *no_eof_src = "test/test_bam_raw_block_copy.tmp.no_eof.bam";
+    const char *no_eof_dst = "test/test_bam_raw_block_copy.tmp.no_eof_out.bam";
+    samFile *in = NULL, *out = NULL;
+    sam_hdr_t *hdr = NULL;
+    uint64_t src_hash = 0, dst_hash = 0;
+    int src_count = 0, dst_count = 0;
+
+    in = sam_open(src, "rb");
+    VERIFY(in != NULL, "failed to open raw block copy input");
+    out = sam_open(dst, "wb");
+    VERIFY(out != NULL, "failed to open raw block copy output");
+    hdr = sam_hdr_read(in);
+    VERIFY(hdr != NULL, "failed to read raw block copy header");
+    VERIFY(sam_hdr_write(out, hdr) == 0, "failed to write raw block copy header");
+    VERIFY(sam_bam_raw_copy_blocks(in, out) == 0, "failed to raw-copy BAM BGZF blocks");
+
+    sam_hdr_destroy(hdr);
+    hdr = NULL;
+    VERIFY(sam_close(out) == 0, "failed to close raw block copy output");
+    out = NULL;
+    VERIFY(sam_close(in) == 0, "failed to close raw block copy input");
+    in = NULL;
+
+    read_bam_order_hash(src, 0, 0, 0, 0, NULL, &src_hash, &src_count);
+    read_bam_order_hash(dst, 0, 0, 0, 0, NULL, &dst_hash, &dst_count);
+    VERIFY(dst_count == src_count, "raw block copy changed record count");
+    VERIFY(dst_hash == src_hash, "raw block copy changed record contents or order");
+
+    in = sam_open(src, "rb");
+    VERIFY(in != NULL, "failed to open raw block copy input for reject test");
+    out = sam_open(dst_uncomp, "wbu");
+    VERIFY(out != NULL, "failed to open uncompressed raw block copy output");
+    hdr = sam_hdr_read(in);
+    VERIFY(hdr != NULL, "failed to read raw block copy reject-test header");
+    VERIFY(sam_hdr_write(out, hdr) == 0, "failed to write raw block copy reject-test header");
+    VERIFY(sam_bam_raw_copy_blocks(in, out) < 0,
+           "raw block copy accepted uncompressed BAM output");
+    sam_hdr_destroy(hdr);
+    hdr = NULL;
+    sam_close(out);
+    out = NULL;
+    sam_close(in);
+    in = NULL;
+
+    in = sam_open(src, "rb");
+    VERIFY(in != NULL, "failed to open raw block copy input for level reject test");
+    out = sam_open(dst_level, "wb0");
+    VERIFY(out != NULL, "failed to open non-default raw block copy output");
+    hdr = sam_hdr_read(in);
+    VERIFY(hdr != NULL, "failed to read raw block copy level reject-test header");
+    VERIFY(sam_hdr_write(out, hdr) == 0, "failed to write raw block copy level reject-test header");
+    VERIFY(sam_bam_raw_copy_blocks(in, out) < 0,
+           "raw block copy accepted non-default compression output");
+    sam_hdr_destroy(hdr);
+    hdr = NULL;
+    sam_close(out);
+    out = NULL;
+    sam_close(in);
+    in = NULL;
+
+    in = sam_open(src, "rb");
+    VERIFY(in != NULL, "failed to open raw block copy input for index reject test");
+    out = sam_open(dst_indexed, "wb");
+    VERIFY(out != NULL, "failed to open indexed raw block copy output");
+    hdr = sam_hdr_read(in);
+    VERIFY(hdr != NULL, "failed to read raw block copy index reject-test header");
+    VERIFY(sam_hdr_write(out, hdr) == 0, "failed to write raw block copy index reject-test header");
+    VERIFY(sam_idx_init(out, hdr, 0, dst_index) == 0,
+           "failed to initialize raw block copy reject-test index");
+    VERIFY(sam_bam_raw_copy_blocks(in, out) < 0,
+           "raw block copy accepted active output indexing");
+    sam_hdr_destroy(hdr);
+    hdr = NULL;
+    sam_close(out);
+    out = NULL;
+    sam_close(in);
+    in = NULL;
+
+    VERIFY(copy_file_with_trailing_junk(src, junk_src) == 0,
+           "failed to create BAM with trailing junk");
+    in = sam_open(junk_src, "rb");
+    VERIFY(in != NULL, "failed to open raw block copy trailing-junk input");
+    out = sam_open(junk_dst, "wb");
+    VERIFY(out != NULL, "failed to open raw block copy trailing-junk output");
+    hdr = sam_hdr_read(in);
+    VERIFY(hdr != NULL, "failed to read raw block copy trailing-junk header");
+    VERIFY(sam_hdr_write(out, hdr) == 0, "failed to write raw block copy trailing-junk header");
+    VERIFY(sam_bam_raw_copy_blocks(in, out) < 0,
+           "raw block copy accepted trailing data after BGZF EOF");
+
+    sam_hdr_destroy(hdr);
+    hdr = NULL;
+    sam_close(out);
+    out = NULL;
+    sam_close(in);
+    in = NULL;
+
+    VERIFY(copy_file_without_eof(src, no_eof_src) == 0,
+           "failed to create BAM without BGZF EOF marker");
+    in = sam_open(no_eof_src, "rb");
+    VERIFY(in != NULL, "failed to open raw block copy missing-EOF input");
+    out = sam_open(no_eof_dst, "wb");
+    VERIFY(out != NULL, "failed to open raw block copy missing-EOF output");
+    hdr = sam_hdr_read(in);
+    VERIFY(hdr != NULL, "failed to read raw block copy missing-EOF header");
+    VERIFY(sam_hdr_write(out, hdr) == 0, "failed to write raw block copy missing-EOF header");
+    VERIFY(sam_bam_raw_copy_blocks(in, out) < 0,
+           "raw block copy accepted missing BGZF EOF marker");
+
+    sam_hdr_destroy(hdr);
+    hdr = NULL;
+    sam_close(out);
+    out = NULL;
+    sam_close(in);
+    in = NULL;
+
+    VERIFY(copy_file_with_malformed_eof(src, bad_eof_src) == 0,
+           "failed to create BAM with malformed BGZF EOF marker");
+    in = sam_open(bad_eof_src, "rb");
+    VERIFY(in != NULL, "failed to open raw block copy bad-EOF input");
+    out = sam_open(bad_eof_dst, "wb");
+    VERIFY(out != NULL, "failed to open raw block copy bad-EOF output");
+    hdr = sam_hdr_read(in);
+    VERIFY(hdr != NULL, "failed to read raw block copy bad-EOF header");
+    VERIFY(sam_hdr_write(out, hdr) == 0, "failed to write raw block copy bad-EOF header");
+    VERIFY(sam_bam_raw_copy_blocks(in, out) < 0,
+           "raw block copy accepted malformed BGZF EOF marker");
+
+cleanup:
+    sam_hdr_destroy(hdr);
+    if (out)
+        sam_close(out);
+    if (in)
+        sam_close(in);
+    unlink(dst);
+    unlink(dst_uncomp);
+    unlink(dst_level);
+    unlink(dst_indexed);
+    unlink(dst_index);
+    unlink(junk_src);
+    unlink(junk_dst);
+    unlink(bad_eof_src);
+    unlink(bad_eof_dst);
+    unlink(no_eof_src);
+    unlink(no_eof_dst);
+}
+
+static void test_bam_ordered_reader(void)
+{
+    const char *no_index_bam = "test/test_bam_ordered_reader.no_index.tmp.bam";
+    uint64_t serial_hash = 0, ordered_hash = 0;
+    int serial_count = 0, ordered_count = 0;
+
+    unlink(no_index_bam);
+
+    read_range_bam_order_hash(0, 0, 0, 0, NULL, &serial_hash, &serial_count);
+    read_range_bam_order_hash(1, 0, 0, 1, "2",
+                              &ordered_hash, &ordered_count);
+    VERIFY(ordered_count == serial_count,
+           "ordered BAM reader returned the wrong record count");
+    VERIFY(ordered_hash == serial_hash,
+           "ordered BAM reader changed record order or contents");
+
+    ordered_hash = 0;
+    ordered_count = 0;
+    read_range_bam_order_hash(1, 2, 0, 1, "256",
+                              &ordered_hash, &ordered_count);
+    VERIFY(ordered_count == serial_count,
+           "-@ controlled ordered BAM reader returned the wrong record count");
+    VERIFY(ordered_hash == serial_hash,
+           "-@ controlled ordered BAM reader changed record order or contents");
+
+    ordered_hash = 0;
+    ordered_count = 0;
+    read_range_bam_order_hash(1, 2, 1, 1, "256",
+                              &ordered_hash, &ordered_count);
+    VERIFY(ordered_count == serial_count,
+           "thread-pool controlled ordered BAM reader returned the wrong record count");
+    VERIFY(ordered_hash == serial_hash,
+           "thread-pool controlled ordered BAM reader changed record order or contents");
+
+    VERIFY(copy_file_plain("test/range.bam", no_index_bam) == 0,
+           "failed to create no-index BAM copy");
+    ordered_hash = 0;
+    ordered_count = 0;
+    read_bam_order_hash(no_index_bam, 1, 2, 1, 0, "2",
+                        &ordered_hash, &ordered_count);
+    VERIFY(ordered_count == serial_count,
+           "non-strict ordered-reader fallback returned the wrong record count");
+    VERIFY(ordered_hash == serial_hash,
+           "non-strict ordered-reader fallback changed record order or contents");
+
+cleanup:
+    unlink(no_index_bam);
+    ordered_reader_env(0, 0, NULL);
+}
+
+static void test_bam_stream_reader(void)
+{
+    const char *partial_len = "test/test_bam_stream_reader.partial_len.tmp.bam";
+    const char *partial_core = "test/test_bam_stream_reader.partial_core.tmp.bam";
+    const char *partial_body = "test/test_bam_stream_reader.partial_body.tmp.bam";
+    const char *split_len = "test/test_bam_stream_reader.split_len.tmp.bam";
+    const char *split_core = "test/test_bam_stream_reader.split_core.tmp.bam";
+    const char *split_body = "test/test_bam_stream_reader.split_body.tmp.bam";
+    const char *valid_partial_len =
+        "test/test_bam_stream_reader.valid_partial_len.tmp.bam";
+    const char *valid_partial_core =
+        "test/test_bam_stream_reader.valid_partial_core.tmp.bam";
+    const char *valid_partial_body =
+        "test/test_bam_stream_reader.valid_partial_body.tmp.bam";
+    uint64_t serial_hash = 0, stream_hash = 0;
+    int serial_count = 0, stream_count = 0;
+    int ordinary_ret, stream_ret, ordinary_first, stream_first;
+
+    unlink(partial_len);
+    unlink(partial_core);
+    unlink(partial_body);
+    unlink(split_len);
+    unlink(split_core);
+    unlink(split_body);
+    unlink(valid_partial_len);
+    unlink(valid_partial_core);
+    unlink(valid_partial_body);
+
+    read_range_bam_order_hash(0, 0, 0, 0, NULL, &serial_hash, &serial_count);
+    read_bam_stream_hash("test/range.bam", 0, 0, "7",
+                         &stream_hash, &stream_count);
+    VERIFY(stream_count == serial_count,
+           "BAM stream reader returned the wrong record count");
+    VERIFY(stream_hash == serial_hash,
+           "BAM stream reader changed record order or contents");
+
+    stream_hash = 0;
+    stream_count = 0;
+    read_bam_stream_hash("test/range.bam", 2, 0, "7",
+                         &stream_hash, &stream_count);
+    VERIFY(stream_count == serial_count,
+           "thread-budgeted BAM stream reader returned the wrong record count");
+    VERIFY(stream_hash == serial_hash,
+           "thread-budgeted BAM stream reader changed record order or contents");
+
+    stream_hash = 0;
+    stream_count = 0;
+    read_bam_stream_hash("test/range.bam", 2, 1, "7",
+                         &stream_hash, &stream_count);
+    VERIFY(stream_count == serial_count,
+           "thread-pool BAM stream reader returned the wrong record count");
+    VERIFY(stream_hash == serial_hash,
+           "thread-pool BAM stream reader changed record order or contents");
+
+    stream_hash = 0;
+    stream_count = 0;
+    read_bam_stream_late_fallback_hash("test/range.bam",
+                                       &stream_hash, &stream_count);
+    VERIFY(stream_count == serial_count,
+           "non-strict BAM stream fallback returned the wrong record count");
+    VERIFY(stream_hash == serial_hash,
+           "non-strict BAM stream fallback changed record order or contents");
+
+    VERIFY(write_partial_bam_record(partial_len, 0) == 0,
+           "failed to write partial block_len BAM");
+    ordinary_ret = read_one_bam_ret(partial_len, 0);
+    stream_ret = read_one_bam_ret(partial_len, 1);
+    VERIFY(ordinary_ret == -2 && stream_ret == ordinary_ret,
+           "BAM stream reader changed partial block_len error behavior");
+
+    VERIFY(write_partial_bam_record(partial_core, 1) == 0,
+           "failed to write partial core BAM");
+    ordinary_ret = read_one_bam_ret(partial_core, 0);
+    stream_ret = read_one_bam_ret(partial_core, 1);
+    VERIFY(ordinary_ret == -3 && stream_ret == ordinary_ret,
+           "BAM stream reader changed partial core error behavior");
+
+    VERIFY(write_partial_bam_record(partial_body, 2) == 0,
+           "failed to write partial body BAM");
+    ordinary_ret = read_one_bam_ret(partial_body, 0);
+    stream_ret = read_one_bam_ret(partial_body, 1);
+    VERIFY(ordinary_ret == -4 && stream_ret == ordinary_ret,
+           "BAM stream reader changed partial body error behavior");
+
+    VERIFY(write_valid_then_partial_bam_record(valid_partial_len, 0) == 0,
+           "failed to write valid-plus-partial block_len BAM");
+    read_two_bam_rets(valid_partial_len, 0, &ordinary_first, &ordinary_ret);
+    read_two_bam_rets(valid_partial_len, 1, &stream_first, &stream_ret);
+    VERIFY(ordinary_first >= 0 && stream_first == ordinary_first &&
+           ordinary_ret == -2 && stream_ret == ordinary_ret,
+           "BAM stream reader changed terminal partial block_len behavior");
+
+    VERIFY(write_valid_then_partial_bam_record(valid_partial_core, 1) == 0,
+           "failed to write valid-plus-partial core BAM");
+    read_two_bam_rets(valid_partial_core, 0, &ordinary_first, &ordinary_ret);
+    read_two_bam_rets(valid_partial_core, 1, &stream_first, &stream_ret);
+    VERIFY(ordinary_first >= 0 && stream_first == ordinary_first &&
+           ordinary_ret == -3 && stream_ret == ordinary_ret,
+           "BAM stream reader changed terminal partial core behavior");
+
+    VERIFY(write_valid_then_partial_bam_record(valid_partial_body, 2) == 0,
+           "failed to write valid-plus-partial body BAM");
+    read_two_bam_rets(valid_partial_body, 0, &ordinary_first, &ordinary_ret);
+    read_two_bam_rets(valid_partial_body, 1, &stream_first, &stream_ret);
+    VERIFY(ordinary_first >= 0 && stream_first == ordinary_first &&
+           ordinary_ret == -4 && stream_ret == ordinary_ret,
+           "BAM stream reader changed terminal partial body behavior");
+
+    VERIFY(write_split_bam_record(split_len, 2) == 0,
+           "failed to write split block_len BAM");
+    serial_hash = stream_hash = 0;
+    serial_count = stream_count = 0;
+    read_bam_order_hash(split_len, 0, 0, 0, 0, NULL,
+                        &serial_hash, &serial_count);
+    read_bam_stream_hash(split_len, 0, 0, "7", &stream_hash, &stream_count);
+    VERIFY(stream_count == serial_count && stream_hash == serial_hash,
+           "BAM stream reader changed split block_len record");
+
+    VERIFY(write_split_bam_record(split_core, 20) == 0,
+           "failed to write split core BAM");
+    serial_hash = stream_hash = 0;
+    serial_count = stream_count = 0;
+    read_bam_order_hash(split_core, 0, 0, 0, 0, NULL,
+                        &serial_hash, &serial_count);
+    read_bam_stream_hash(split_core, 0, 0, "7", &stream_hash, &stream_count);
+    VERIFY(stream_count == serial_count && stream_hash == serial_hash,
+           "BAM stream reader changed split core record");
+
+    VERIFY(write_split_bam_record(split_body, 36) == 0,
+           "failed to write split body BAM");
+    serial_hash = stream_hash = 0;
+    serial_count = stream_count = 0;
+    read_bam_order_hash(split_body, 0, 0, 0, 0, NULL,
+                        &serial_hash, &serial_count);
+    read_bam_stream_hash(split_body, 0, 0, "7", &stream_hash, &stream_count);
+    VERIFY(stream_count == serial_count && stream_hash == serial_hash,
+           "BAM stream reader changed split body record");
+
+cleanup:
+    unlink(partial_len);
+    unlink(partial_core);
+    unlink(partial_body);
+    unlink(split_len);
+    unlink(split_core);
+    unlink(split_body);
+    unlink(valid_partial_len);
+    unlink(valid_partial_core);
+    unlink(valid_partial_body);
+    stream_reader_env(0, 0, NULL);
+}
+
 int main(int argc, char **argv)
 {
     int i;
@@ -2364,6 +3314,9 @@ int main(int argc, char **argv)
     test_bam_set1_validate_cigar();
     test_bam_set1_validate_size_limits();
     test_bam_set1_write_and_read_back();
+    test_bam_raw_block_copy();
+    test_bam_ordered_reader();
+    test_bam_stream_reader();
     test_cigar_api();
 
     return status;
