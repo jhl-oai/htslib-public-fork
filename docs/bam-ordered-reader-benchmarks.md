@@ -6,7 +6,9 @@ This note records the current state of the experimental HTSlib-level ordered
 BAM reader.  The reader is internal and opt-in via:
 
 - `HTS_BAM_ORDERED_READER=1`
-- `HTS_BAM_ORDERED_READER_THREADS=N`
+- `-@ N`, `hts_set_threads()`, or `HTS_OPT_THREAD_POOL` for the thread budget
+- `HTS_BAM_ORDERED_READER_THREADS=N` as a fallback when the caller did not
+  configure threads
 - `HTS_BAM_ORDERED_READER_REQUIRE=1` for strict activation during tests
 
 The implementation preserves the public API.  It uses local BAI/CSI virtual
@@ -79,10 +81,10 @@ Final full-job reader results:
 | ont_ul_200kb | 4 | 0.022 | 0.022 | +0.00% |
 | ont_ul_200kb | 8 | 0.015 | 0.018 | -20.00% |
 
-Those results compare ordered parsing against an already BGZF-threaded baseline.
-The ordered reader currently opens its own worker file handles, so it does not
-inherit the `-@` BGZF thread pool attached to the original input stream.  In
-that mode it was slower and should stay experimental.
+Those historical results compared ordered parsing against an already
+BGZF-threaded baseline before `-@` was wired into the ordered reader.  In that
+mode the ordered reader used `HTS_BAM_ORDERED_READER_THREADS`, so it did not
+consume the caller's `-@` thread budget.
 
 ## Ordered Reader Without Input BGZF Threads
 
@@ -119,11 +121,49 @@ The ordered reader now clears the 2x target for default single-stream
 `sam_read1()` read-discard workloads on the local BAM corpus.  Separately,
 `test/sam` and a decoded SAM `cmp` on the high-coverage slice verified that the
 reader preserves record order and contents through the existing API.  It should
-still remain opt-in for now: it depends on a local index, does not yet compose
-cleanly with caller-supplied BGZF threading, has not shown write-pipeline wins,
-and still pays per-record ownership handoff costs.  The next ordered-reader work
-should focus on worker buffer reuse, interaction with `-@`, and output/write
+still remain opt-in for now: it depends on a local index, has not shown
+write-pipeline wins, and still pays per-record ownership handoff costs.  The
+next ordered-reader work should focus on worker buffer reuse and output/write
 workloads.
+
+## `-@` Integration
+
+`hts_set_threads()` and `HTS_OPT_THREAD_POOL` now route BAM through the
+SAM-layer thread setter instead of attaching BGZF threading immediately.  For
+BAM input with `HTS_BAM_ORDERED_READER=1`, HTSlib stores a small deferred thread
+configuration.  On the first `sam_read1()` call it tries to open the ordered
+reader with that `-@` thread count.  If the ordered reader cannot activate and
+strict mode is not set, HTSlib converts the deferred configuration into the
+ordinary BGZF threaded path and continues reading normally.
+
+Current caveat: when the caller supplies `HTS_OPT_THREAD_POOL`, the ordered
+reader uses the pool size as its worker count but still creates its own worker
+threads and worker file handles internally.  It does not dispatch jobs onto the
+caller's shared `hts_tpool`, so this is a thread-budget integration rather than
+a full shared-pool integration.
+
+Correctness checks:
+
+```sh
+./test/sam
+./test/test_view -@ 4 -p /tmp/base.sam BAM
+HTS_BAM_ORDERED_READER=1 HTS_BAM_ORDERED_READER_REQUIRE=1 \
+  ./test/test_view -@ 4 -p /tmp/ordered.sam BAM
+cmp /tmp/base.sam /tmp/ordered.sam
+```
+
+Local median-of-five smoke timings for read-discard with `-@ 4` after this
+integration:
+
+| input | BGZF `-@ 4` | ordered `-@ 4` | result |
+| --- | ---: | ---: | ---: |
+| highcov chr20 10-11Mb | 0.06 | 0.09 | slower |
+| exome chr20 | 0.17 | 0.27 | slower |
+| ONT ultra-long chr20 10-10.2Mb | 0.02 | 0.03 | noisy/slower |
+
+These results mean `-@` now controls the ordered reader, but the existing BGZF
+threaded path remains faster for already-threaded read-discard workloads when
+the ordered reader is disabled or cannot activate.
 
 ## BGZF Threaded Libdeflate Cache
 

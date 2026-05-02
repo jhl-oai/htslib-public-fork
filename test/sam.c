@@ -44,6 +44,7 @@ DEALINGS IN THE SOFTWARE.  */
 #include "../htslib/faidx.h"
 #include "../htslib/khash.h"
 #include "../htslib/hts_log.h"
+#include "../htslib/thread_pool.h"
 #include "../sam_internal.h"
 
 KHASH_SET_INIT_STR(keep)
@@ -2361,12 +2362,18 @@ static uint64_t ordered_reader_record_hash(uint64_t h, const bam1_t *b)
     return h;
 }
 
-static void ordered_reader_env(int enable)
+static void ordered_reader_env(int enable, int strict, const char *threads)
 {
     if (enable) {
         setenv("HTS_BAM_ORDERED_READER", "1", 1);
-        setenv("HTS_BAM_ORDERED_READER_REQUIRE", "1", 1);
-        setenv("HTS_BAM_ORDERED_READER_THREADS", "2", 1);
+        if (strict)
+            setenv("HTS_BAM_ORDERED_READER_REQUIRE", "1", 1);
+        else
+            unsetenv("HTS_BAM_ORDERED_READER_REQUIRE");
+        if (threads)
+            setenv("HTS_BAM_ORDERED_READER_THREADS", threads, 1);
+        else
+            unsetenv("HTS_BAM_ORDERED_READER_THREADS");
     } else {
         unsetenv("HTS_BAM_ORDERED_READER");
         unsetenv("HTS_BAM_ORDERED_READER_REQUIRE");
@@ -2375,19 +2382,36 @@ static void ordered_reader_env(int enable)
 }
 
 static void read_bam_order_hash(const char *path, int use_ordered_reader,
+                                int hts_threads, int use_thread_pool,
+                                int strict_ordered_reader,
+                                const char *env_threads,
                                 uint64_t *hash, int *count)
 {
     samFile *fp = NULL;
     sam_hdr_t *hdr = NULL;
     bam1_t *b = NULL;
+    htsThreadPool p = {NULL, 0};
     int ret;
 
-    ordered_reader_env(use_ordered_reader);
+    ordered_reader_env(use_ordered_reader, strict_ordered_reader,
+                       env_threads);
 
     *hash = 1469598103934665603ULL;
     *count = 0;
     fp = sam_open(path, "rb");
     VERIFY(fp != NULL, "failed to open BAM");
+    if (hts_threads > 0) {
+        if (use_thread_pool) {
+            p.pool = hts_tpool_init(hts_threads);
+            p.qsize = hts_threads * 2;
+            VERIFY(p.pool != NULL, "failed to create BAM reader thread pool");
+            VERIFY(hts_set_thread_pool(fp, &p) == 0,
+                   "failed to set BAM reader thread pool");
+        } else {
+            VERIFY(hts_set_threads(fp, hts_threads) == 0,
+                   "failed to set BAM reader threads");
+        }
+    }
     hdr = sam_hdr_read(fp);
     VERIFY(hdr != NULL, "failed to read BAM header");
     b = bam_init1();
@@ -2404,16 +2428,24 @@ cleanup:
     sam_hdr_destroy(hdr);
     if (fp)
         sam_close(fp);
-    ordered_reader_env(0);
+    if (p.pool)
+        hts_tpool_destroy(p.pool);
+    ordered_reader_env(0, 0, NULL);
 }
 
 static void read_range_bam_order_hash(int use_ordered_reader,
+                                      int hts_threads,
+                                      int use_thread_pool,
+                                      int strict_ordered_reader,
+                                      const char *env_threads,
                                       uint64_t *hash, int *count)
 {
-    read_bam_order_hash("test/range.bam", use_ordered_reader, hash, count);
+    read_bam_order_hash("test/range.bam", use_ordered_reader,
+                        hts_threads, use_thread_pool, strict_ordered_reader,
+                        env_threads, hash, count);
 }
 
-static int copy_file_with_trailing_junk(const char *src, const char *dst)
+static int copy_file_plain(const char *src, const char *dst)
 {
     FILE *in = NULL, *out = NULL;
     unsigned char buf[8192];
@@ -2432,8 +2464,6 @@ static int copy_file_with_trailing_junk(const char *src, const char *dst)
     }
     if (ferror(in))
         goto cleanup;
-    if (fwrite("junk", 1, 4, out) != 4)
-        goto cleanup;
     ret = 0;
 
 cleanup:
@@ -2441,6 +2471,24 @@ cleanup:
         ret = -1;
     if (in)
         fclose(in);
+    return ret;
+}
+
+static int copy_file_with_trailing_junk(const char *src, const char *dst)
+{
+    int ret = copy_file_plain(src, dst);
+    FILE *out;
+
+    if (ret < 0)
+        return ret;
+
+    out = fopen(dst, "ab");
+    if (!out)
+        return -1;
+    if (fwrite("junk", 1, 4, out) != 4)
+        ret = -1;
+    if (fclose(out) != 0)
+        ret = -1;
     return ret;
 }
 
@@ -2567,8 +2615,8 @@ static void test_bam_raw_block_copy(void)
     VERIFY(sam_close(in) == 0, "failed to close raw block copy input");
     in = NULL;
 
-    read_bam_order_hash(src, 0, &src_hash, &src_count);
-    read_bam_order_hash(dst, 0, &dst_hash, &dst_count);
+    read_bam_order_hash(src, 0, 0, 0, 0, NULL, &src_hash, &src_count);
+    read_bam_order_hash(dst, 0, 0, 0, 0, NULL, &dst_hash, &dst_count);
     VERIFY(dst_count == src_count, "raw block copy changed record count");
     VERIFY(dst_hash == src_hash, "raw block copy changed record contents or order");
 
@@ -2693,18 +2741,52 @@ cleanup:
 
 static void test_bam_ordered_reader(void)
 {
+    const char *no_index_bam = "test/test_bam_ordered_reader.no_index.tmp.bam";
     uint64_t serial_hash = 0, ordered_hash = 0;
     int serial_count = 0, ordered_count = 0;
 
-    read_range_bam_order_hash(0, &serial_hash, &serial_count);
-    read_range_bam_order_hash(1, &ordered_hash, &ordered_count);
+    unlink(no_index_bam);
+
+    read_range_bam_order_hash(0, 0, 0, 0, NULL, &serial_hash, &serial_count);
+    read_range_bam_order_hash(1, 0, 0, 1, "2",
+                              &ordered_hash, &ordered_count);
     VERIFY(ordered_count == serial_count,
            "ordered BAM reader returned the wrong record count");
     VERIFY(ordered_hash == serial_hash,
            "ordered BAM reader changed record order or contents");
 
+    ordered_hash = 0;
+    ordered_count = 0;
+    read_range_bam_order_hash(1, 2, 0, 1, "256",
+                              &ordered_hash, &ordered_count);
+    VERIFY(ordered_count == serial_count,
+           "-@ controlled ordered BAM reader returned the wrong record count");
+    VERIFY(ordered_hash == serial_hash,
+           "-@ controlled ordered BAM reader changed record order or contents");
+
+    ordered_hash = 0;
+    ordered_count = 0;
+    read_range_bam_order_hash(1, 2, 1, 1, "256",
+                              &ordered_hash, &ordered_count);
+    VERIFY(ordered_count == serial_count,
+           "thread-pool controlled ordered BAM reader returned the wrong record count");
+    VERIFY(ordered_hash == serial_hash,
+           "thread-pool controlled ordered BAM reader changed record order or contents");
+
+    VERIFY(copy_file_plain("test/range.bam", no_index_bam) == 0,
+           "failed to create no-index BAM copy");
+    ordered_hash = 0;
+    ordered_count = 0;
+    read_bam_order_hash(no_index_bam, 1, 2, 1, 0, "2",
+                        &ordered_hash, &ordered_count);
+    VERIFY(ordered_count == serial_count,
+           "non-strict ordered-reader fallback returned the wrong record count");
+    VERIFY(ordered_hash == serial_hash,
+           "non-strict ordered-reader fallback changed record order or contents");
+
 cleanup:
-    ordered_reader_env(0);
+    unlink(no_index_bam);
+    ordered_reader_env(0, 0, NULL);
 }
 
 int main(int argc, char **argv)

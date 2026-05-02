@@ -3862,7 +3862,76 @@ static void *sam_format_worker(void *arg) {
     return NULL;
 }
 
+#define BAM_DEFERRED_THREADS_MAGIC 0x62746872u
+
+typedef struct bam_deferred_threads_t {
+    uint32_t magic;
+    int n_threads;
+    int qsize;
+    hts_tpool *pool;
+    int use_pool;
+} bam_deferred_threads_t;
+
+static int bam_ordered_env_enabled(void);
+
+static int bam_deferred_threads_set(htsFile *fp, int n_threads,
+                                    htsThreadPool *p)
+{
+    bam_deferred_threads_t *cfg;
+
+    if (fp->state)
+        return -2;
+    if (n_threads <= 0 && (!p || !p->pool))
+        return -1;
+
+    cfg = calloc(1, sizeof(*cfg));
+    if (!cfg)
+        return -1;
+
+    cfg->magic = BAM_DEFERRED_THREADS_MAGIC;
+    if (p && p->pool) {
+        cfg->pool = p->pool;
+        cfg->qsize = p->qsize;
+        cfg->n_threads = hts_tpool_size(p->pool);
+        cfg->use_pool = 1;
+    } else {
+        cfg->n_threads = n_threads;
+    }
+
+    if (cfg->n_threads <= 0) {
+        free(cfg);
+        return -1;
+    }
+
+    fp->state = cfg;
+    return 0;
+}
+
+static void bam_deferred_threads_destroy(bam_deferred_threads_t *cfg)
+{
+    free(cfg);
+}
+
+static int bam_deferred_threads_enable_bgzf(htsFile *fp,
+                                            bam_deferred_threads_t *cfg)
+{
+    if (!fp || !cfg || !fp->is_bgzf || !fp->fp.bgzf)
+        return -1;
+
+    if (cfg->use_pool)
+        return bgzf_thread_pool(fp->fp.bgzf, cfg->pool, cfg->qsize);
+    return bgzf_mt(fp->fp.bgzf, cfg->n_threads, 256);
+}
+
 int sam_set_thread_pool(htsFile *fp, htsThreadPool *p) {
+    if (fp->format.format == bam) {
+        if (!fp->is_write && bam_ordered_env_enabled())
+            return bam_deferred_threads_set(fp, 0, p);
+        if (fp->format.compression == bgzf)
+            return bgzf_thread_pool(fp->fp.bgzf, p->pool, p->qsize);
+        return 0;
+    }
+
     if (fp->state)
         return -2;   //already exists!
 
@@ -3892,6 +3961,14 @@ int sam_set_thread_pool(htsFile *fp, htsThreadPool *p) {
 int sam_set_threads(htsFile *fp, int nthreads) {
     if (nthreads <= 0)
         return 0;
+
+    if (fp->format.format == bam) {
+        if (!fp->is_write && bam_ordered_env_enabled())
+            return bam_deferred_threads_set(fp, nthreads, NULL);
+        if (fp->format.compression == bgzf)
+            return bgzf_mt(fp->fp.bgzf, nthreads, 256);
+        return 0;
+    }
 
     htsThreadPool p;
     p.pool = hts_tpool_init(nthreads);
@@ -4446,35 +4523,46 @@ static void bam_ordered_reader_destroy(bam_ordered_reader_t *reader)
 
 int sam_bam_state_destroy(htsFile *fp)
 {
-    bam_ordered_reader_t *reader;
+    uint32_t magic;
 
     if (!fp || !fp->state)
         return 0;
 
-    reader = (bam_ordered_reader_t *)fp->state;
-    if (reader->magic != BAM_ORDERED_READER_MAGIC)
-        return 0;
+    magic = *(uint32_t *)fp->state;
+    if (magic == BAM_ORDERED_READER_MAGIC) {
+        bam_ordered_reader_t *reader = (bam_ordered_reader_t *)fp->state;
 
-    fp->state = NULL;
-    bam_ordered_reader_destroy(reader);
+        fp->state = NULL;
+        bam_ordered_reader_destroy(reader);
+        return 0;
+    }
+    if (magic == BAM_DEFERRED_THREADS_MAGIC) {
+        bam_deferred_threads_t *cfg = (bam_deferred_threads_t *)fp->state;
+
+        fp->state = NULL;
+        bam_deferred_threads_destroy(cfg);
+        return 0;
+    }
     return 0;
 }
 
 static bam_ordered_reader_t *bam_ordered_reader_open(htsFile *fp,
-                                                     sam_hdr_t *hdr)
+                                                     sam_hdr_t *hdr,
+                                                     int n_threads)
 {
     bam_ordered_reader_t *reader = NULL;
     hts_idx_t *idx = NULL;
     char *fnidx = NULL;
     int64_t cur;
-    int n_threads, i;
+    int i;
     int mutex_init = 0, result_c_init = 0, space_c_init = 0;
 
     if (!fp || !hdr || !fp->fn || hisremote(fp->fn) || !fp->is_bgzf ||
         !fp->fp.bgzf || fp->fp.bgzf->is_gzip)
         return NULL;
 
-    n_threads = bam_ordered_env_threads();
+    if (n_threads <= 0 || n_threads > INT_MAX / 2)
+        n_threads = bam_ordered_env_threads();
     if (!hts_idx_check_local(fp->fn, HTS_FMT_BAI, &fnidx))
         return NULL;
     idx = sam_index_load2(fp, fp->fn, fnidx);
@@ -4996,11 +5084,36 @@ static int fastq_parse1(htsFile *fp, bam1_t *b) {
 // Internal component of sam_read1 below
 static inline int sam_read1_bam(htsFile *fp, sam_hdr_t *h, bam1_t *b) {
     if (fp->state) {
-        bam_ordered_reader_t *reader = (bam_ordered_reader_t *)fp->state;
-        if (reader->magic == BAM_ORDERED_READER_MAGIC)
+        uint32_t magic = *(uint32_t *)fp->state;
+        if (magic == BAM_ORDERED_READER_MAGIC) {
+            bam_ordered_reader_t *reader = (bam_ordered_reader_t *)fp->state;
             return bam_ordered_reader_next(reader, b);
+        }
+        if (magic == BAM_DEFERRED_THREADS_MAGIC) {
+            bam_deferred_threads_t *cfg =
+                (bam_deferred_threads_t *)fp->state;
+
+            if (bam_ordered_env_enabled()) {
+                bam_ordered_reader_t *reader =
+                    bam_ordered_reader_open(fp, h, cfg->n_threads);
+                if (reader) {
+                    fp->state = NULL;
+                    bam_deferred_threads_destroy(cfg);
+                    fp->state = reader;
+                    return bam_ordered_reader_next(reader, b);
+                }
+                if (bam_ordered_env_strict())
+                    return -2;
+            }
+
+            int ret = bam_deferred_threads_enable_bgzf(fp, cfg);
+            fp->state = NULL;
+            bam_deferred_threads_destroy(cfg);
+            if (ret < 0)
+                return -2;
+        }
     } else if (bam_ordered_env_enabled()) {
-        bam_ordered_reader_t *reader = bam_ordered_reader_open(fp, h);
+        bam_ordered_reader_t *reader = bam_ordered_reader_open(fp, h, 0);
         if (reader) {
             fp->state = reader;
             return bam_ordered_reader_next(reader, b);
