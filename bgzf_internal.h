@@ -34,6 +34,8 @@ typedef struct bgzf_block_data_t {
 } bgzf_block_data_t;
 
 int bgzf_read_block_data(BGZF *fp, bgzf_block_data_t *block);
+int bgzf_read_block_compressed(BGZF *fp, bgzf_block_data_t *block);
+int bgzf_decode_block_data(BGZF *fp, bgzf_block_data_t *block);
 
 /*
  * BGZF private data interface
