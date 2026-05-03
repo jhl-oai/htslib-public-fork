@@ -153,6 +153,25 @@ the tiny highcov/ONT slices.  The larger exome slice reaches roughly 1.7x at
 fixes were avoiding per-block buffer clearing and reducing split-record batch
 fragmentation.
 
+Additional 2026-05-03 larger-slice baselines used repeated local runs to get
+aggregate O(30s) timing windows.  Single-run local wall times were still short
+even for 1.8-2.0G slices, while pulling much larger remote intervals would have
+made network transfer the bottleneck.
+
+```text
+test_view -B -@8 larger slices, lower is better
+
+Input                              BGZF median   Batch median   Aggregate window
+HG00096.highcov.chr20_10-50Mb           1.55s          0.92s    20-30 runs
+HG002.ont_ul.chr20_10-40Mb              0.75s          0.70s    40-45 runs
+```
+
+The larger high-coverage short-read slice preserves the materialization win at
+larger scale.  The larger ONT slice remains stable but only modestly faster,
+which supports the current interpretation that long-read throughput is mostly
+decompression and large-record movement rather than small-record materialization
+overhead.
+
 The previous transparent stream/parse prototype on `feature/bam-throughput-product`
 was benchmarked with the same `test_view -B` shape:
 
@@ -229,8 +248,8 @@ and the previous stream/parse prototype on the local BAM corpus at `1/4/8`
 threads.  The batch path should not be slower than BGZF `-@` at `4/8` threads
 and should target at least 1.5x on medium/large read-throughput workloads.
 
-The current benchmark path now meets the local not-slower gate on the larger
-ONT slice at `-@4/-@8` and exceeds the 1.5x target on the exome short-read
-slice.  It remains prototype-only because the only real samtools consumer is
-the narrow opt-in count experiment; broader command integration still needs
-separate design and validation.
+The current benchmark path now meets the local not-slower gate on both tested
+ONT slices and exceeds the 1.5x target on exome/high-coverage short-read slices.
+It remains prototype-only because the only real samtools consumer is the narrow
+opt-in count experiment; broader command integration still needs separate design
+and validation.
