@@ -35,8 +35,11 @@ DEALINGS IN THE SOFTWARE.  */
 #include <assert.h>
 #include <signal.h>
 #include <inttypes.h>
+#include <limits.h>
+#include <pthread.h>
 #include <unistd.h>
 #include <regex.h>
+#include <ctype.h>
 
 #ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
 #include "fuzz_settings.h"
@@ -51,6 +54,7 @@ DEALINGS IN THE SOFTWARE.  */
 #include "htslib/bgzf.h"
 #include "cram/cram.h"
 #include "hts_internal.h"
+#include "bgzf_internal.h"
 #include "sam_internal.h"
 #include "htslib/hfile.h"
 #include "htslib/hts_endian.h"
@@ -777,6 +781,110 @@ static int fixup_missing_qname_nul(bam1_t *b) {
     return 0;
 }
 
+static int bam_decode1_body(BGZF *fp, bam1_t *b, int32_t block_len,
+                            const uint8_t *body)
+{
+    bam1_core_t *c = &b->core;
+    const uint8_t *x = body;
+    int raw_l_qname, rest_len, i;
+    uint32_t new_l_data;
+
+    b->l_data = 0;
+
+    if (block_len < 32)
+        return -4;
+
+    c->tid        = le_to_u32(x);
+    c->pos        = le_to_i32(x+4);
+    uint32_t x2   = le_to_u32(x+8);
+    c->bin        = x2>>16;
+    c->qual       = x2>>8&0xff;
+    c->l_qname    = x2&0xff;
+    c->l_extranul = (c->l_qname%4 != 0)? (4 - c->l_qname%4) : 0;
+    uint32_t x3   = le_to_u32(x+12);
+    c->flag       = x3>>16;
+    c->n_cigar    = x3&0xffff;
+    c->l_qseq     = le_to_u32(x+16);
+    c->mtid       = le_to_u32(x+20);
+    c->mpos       = le_to_i32(x+24);
+    c->isize      = le_to_i32(x+28);
+
+    raw_l_qname = c->l_qname;
+    new_l_data = block_len - 32 + c->l_extranul;
+    if (new_l_data > INT_MAX || c->l_qseq < 0 || c->l_qname < 1)
+        return -4;
+    if (((uint64_t) c->n_cigar << 2) + c->l_qname + c->l_extranul
+        + (((uint64_t) c->l_qseq + 1) >> 1) + c->l_qseq > (uint64_t) new_l_data)
+        return -4;
+    if (realloc_bam_data(b, new_l_data) < 0)
+        return -4;
+    b->l_data = new_l_data;
+
+    memcpy(b->data, body + 32, raw_l_qname);
+    if (b->data[raw_l_qname - 1] != '\0') {
+        if (fixup_missing_qname_nul(b) < 0)
+            return -4;
+    }
+    for (i = 0; i < c->l_extranul; ++i)
+        b->data[c->l_qname+i] = '\0';
+    c->l_qname += c->l_extranul;
+
+    rest_len = block_len - 32 - raw_l_qname;
+    if (rest_len < 0 || b->l_data < c->l_qname ||
+        b->l_data - c->l_qname != rest_len)
+        return -4;
+    memcpy(b->data + c->l_qname, body + 32 + raw_l_qname,
+           (size_t)rest_len);
+
+    if (fp && fp->is_be)
+        swap_data(c, b->l_data, b->data, 0);
+    if (bam_tag2cigar(b, 0, 0) < 0)
+        return -4;
+
+    if (c->n_cigar > 0) {
+        hts_pos_t rlen, qlen;
+        bam_cigar2rqlens(c->n_cigar, bam_get_cigar(b), &rlen, &qlen);
+        if ((b->core.flag & BAM_FUNMAP) || rlen == 0)
+            rlen = 1;
+        b->core.bin = hts_reg2bin(b->core.pos, b->core.pos + rlen, 14, 5);
+        if (c->l_qseq > 0 && !(c->flag & BAM_FUNMAP) &&
+            qlen != c->l_qseq) {
+            hts_log_error("CIGAR and query sequence lengths differ for %s",
+                          bam_get_qname(b));
+            return -4;
+        }
+    }
+
+    return 4 + block_len;
+}
+
+static int bam_validate1_body_core(int32_t block_len, const uint8_t *body)
+{
+    const uint8_t *x = body;
+    int l_qname, l_extranul, n_cigar;
+    int32_t l_qseq;
+    uint32_t new_l_data;
+    uint32_t x2, x3;
+
+    if (block_len < 32)
+        return -4;
+
+    x2 = le_to_u32(x+8);
+    l_qname = x2 & 0xff;
+    l_extranul = (l_qname % 4 != 0) ? (4 - l_qname % 4) : 0;
+    x3 = le_to_u32(x+12);
+    n_cigar = x3 & 0xffff;
+    l_qseq = le_to_u32(x+16);
+
+    new_l_data = block_len - 32 + l_extranul;
+    if (new_l_data > INT_MAX || l_qseq < 0 || l_qname < 1)
+        return -4;
+    if (((uint64_t)n_cigar << 2) + l_qname + l_extranul
+        + (((uint64_t)l_qseq + 1) >> 1) + l_qseq > (uint64_t)new_l_data)
+        return -4;
+    return 0;
+}
+
 /*
  * Note a second interface that returns a bam pointer instead would avoid bam_copy1
  * in multi-threaded handling.  This may be worth considering for htslib2.
@@ -842,8 +950,8 @@ int bam_read1(BGZF *fp, bam1_t *b)
     if (bam_tag2cigar(b, 0, 0) < 0)
         return -4;
 
-    // TODO: consider making this conditional
-    if (c->n_cigar > 0) { // recompute "bin" and check CIGAR-qlen consistency
+    if (c->n_cigar > 0) {
+        // recompute "bin" and check CIGAR-qlen consistency
         hts_pos_t rlen, qlen;
         bam_cigar2rqlens(c->n_cigar, bam_get_cigar(b), &rlen, &qlen);
         if ((b->core.flag & BAM_FUNMAP) || rlen == 0) rlen = 1;
@@ -927,6 +1035,433 @@ int bam_write1(BGZF *fp, const bam1_t *b)
     return ok? 4 + block_len : -1;
 }
 
+static int bgzf_raw_read_exact(BGZF *fp, void *data, size_t length)
+{
+    uint8_t *dst = (uint8_t *) data;
+
+    while (length > 0) {
+        ssize_t n = bgzf_raw_read(fp, dst, length);
+        if (n <= 0) {
+            if (n == 0)
+                errno = EIO;
+            return -1;
+        }
+        dst += n;
+        length -= n;
+    }
+    return 0;
+}
+
+static int bam_bgzf_header_is_valid(const uint8_t header[18])
+{
+    return header[0] == 31 && header[1] == 139 && header[2] == 8
+        && (header[3] & 4) != 0
+        && le_to_u16(header + 10) == 6
+        && header[12] == 'B' && header[13] == 'C'
+        && le_to_u16(header + 14) == 2;
+}
+
+static int bam_bgzf_is_eof_marker(const uint8_t *block, uint16_t block_len)
+{
+    static const uint8_t eof_marker[28] = {
+        0x1f, 0x8b, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0xff, 0x06, 0x00, 0x42, 0x43, 0x02, 0x00,
+        0x1b, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00
+    };
+
+    return block_len == sizeof(eof_marker) &&
+        memcmp(block, eof_marker, sizeof(eof_marker)) == 0;
+}
+
+int sam_bam_raw_copy_blocks(htsFile *in, htsFile *out)
+{
+    const size_t buf_size = 1024 * 1024;
+    BGZF *ib = NULL, *ob = NULL;
+    uint8_t *buf = NULL;
+    int ret = -1;
+
+    if (!in || !out || in->is_write || !out->is_write ||
+        in->format.format != bam || out->format.format != bam ||
+        !in->is_bgzf || !out->is_bgzf || !in->fp.bgzf || !out->fp.bgzf) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    ib = in->fp.bgzf;
+    ob = out->fp.bgzf;
+    if (ib->mt || ob->mt || ib->is_gzip || ob->is_gzip ||
+        !ib->is_compressed || !ob->is_compressed ||
+        ob->compress_level != Z_DEFAULT_COMPRESSION ||
+        out->idx || ob->idx || ob->idx_build_otf) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (ib->block_length == 0 && ib->block_offset > 0) {
+        if (bgzf_read_block(ib) < 0)
+            return -1;
+        if (ib->block_offset > ib->block_length) {
+            errno = EINVAL;
+            return -1;
+        }
+    }
+
+    if (ib->block_offset < ib->block_length) {
+        int available = ib->block_length - ib->block_offset;
+        uint8_t *src = (uint8_t *) ib->uncompressed_block + ib->block_offset;
+
+        if (bgzf_write(ob, src, available) != available)
+            return -1;
+        ib->block_offset = ib->block_length;
+    }
+
+    if (bgzf_flush(ob) < 0)
+        return -1;
+
+    buf = malloc(BGZF_MAX_BLOCK_SIZE > buf_size ? BGZF_MAX_BLOCK_SIZE : buf_size);
+    if (!buf)
+        return -1;
+
+    for (;;) {
+        uint8_t header[18];
+        uint16_t block_len;
+        uint32_t isize;
+        ssize_t n = bgzf_raw_read(ib, header, sizeof(header));
+
+        if (n < 0) {
+            break;
+        } else if (n == 0) {
+            hts_log_warning("BGZF EOF marker is absent in raw BAM block copy");
+            ret = 0;
+            break;
+        } else if (n != sizeof(header)) {
+            hts_log_error("Truncated BGZF header in raw BAM block copy");
+            errno = EIO;
+            break;
+        }
+        if (!bam_bgzf_header_is_valid(header)) {
+            hts_log_error("Invalid BGZF header in raw BAM block copy");
+            errno = EFTYPE;
+            break;
+        }
+
+        block_len = le_to_u16(header + 16) + 1;
+        if (block_len < 26) {
+            hts_log_error("Invalid BGZF block length in raw BAM block copy");
+            errno = EFTYPE;
+            break;
+        }
+
+        memcpy(buf, header, sizeof(header));
+        if (bgzf_raw_read_exact(ib, buf + sizeof(header),
+                                block_len - sizeof(header)) < 0) {
+            hts_log_error("Truncated BGZF block in raw BAM block copy");
+            break;
+        }
+
+        isize = le_to_u32(buf + block_len - 4);
+        if (isize == 0) {
+            uint8_t trailing;
+
+            if (!bam_bgzf_is_eof_marker(buf, block_len)) {
+                hts_log_error("Invalid BGZF EOF marker in raw BAM block copy");
+                errno = EFTYPE;
+                break;
+            }
+            n = bgzf_raw_read(ib, &trailing, 1);
+            if (n == 0) {
+                ret = 0;
+            } else if (n > 0) {
+                hts_log_error("Trailing data after BGZF EOF marker in raw BAM block copy");
+                errno = EFTYPE;
+            }
+            break;
+        }
+
+        if (bgzf_raw_write_full_block(ob, buf, block_len) < 0)
+            break;
+    }
+
+    free(buf);
+    return ret;
+}
+
+static uint64_t bam_voff_block_beg(const bgzf_block_data_t *block)
+{
+    return ((uint64_t)block->block_address) << 16;
+}
+
+static uint64_t bam_voff_block_end(const bgzf_block_data_t *block)
+{
+    if (block->uncomp_len >= 0x10000)
+        return ((uint64_t)(block->block_address + block->comp_len)) << 16;
+    return (((uint64_t)block->block_address) << 16) |
+           (uint64_t)block->uncomp_len;
+}
+
+static int bam_voff_spans_valid(const sam_bam_voff_span_t *spans,
+                                int n_spans)
+{
+    int i;
+
+    if (n_spans < 0 || (n_spans > 0 && !spans)) {
+        errno = EINVAL;
+        return 0;
+    }
+    for (i = 0; i < n_spans; i++) {
+        if (spans[i].beg >= spans[i].end ||
+            (i > 0 && spans[i - 1].end > spans[i].beg)) {
+            errno = EINVAL;
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int bam_voff_block_span_bounds(const bgzf_block_data_t *block,
+                                      const sam_bam_voff_span_t *span,
+                                      int *beg, int *end)
+{
+    uint64_t block_beg = bam_voff_block_beg(block);
+    uint64_t block_end = bam_voff_block_end(block);
+    uint64_t s_beg = span->beg > block_beg ? span->beg : block_beg;
+    uint64_t s_end = span->end < block_end ? span->end : block_end;
+
+    if (s_beg >= s_end)
+        return 0;
+    if ((s_beg >> 16) != (block_beg >> 16) ||
+        (s_end != block_end && (s_end >> 16) != (block_beg >> 16))) {
+        errno = EINVAL;
+        return -1;
+    }
+    *beg = (int)(s_beg & 0xffff);
+    *end = s_end == block_end ? block->uncomp_len : (int)(s_end & 0xffff);
+    if (*beg < 0 || *end < *beg || *end > block->uncomp_len) {
+        errno = EINVAL;
+        return -1;
+    }
+    return 1;
+}
+
+static int bam_voff_block_fully_covered(const bgzf_block_data_t *block,
+                                        const sam_bam_voff_span_t *spans,
+                                        int n_spans, int span_i)
+{
+    uint64_t block_beg = bam_voff_block_beg(block);
+    uint64_t block_end = bam_voff_block_end(block);
+    int covered = 0;
+
+    while (span_i < n_spans && spans[span_i].beg < block_end) {
+        int beg, end, ret;
+
+        if (spans[span_i].end <= block_beg) {
+            span_i++;
+            continue;
+        }
+        ret = bam_voff_block_span_bounds(block, &spans[span_i], &beg, &end);
+        if (ret < 0)
+            return 0;
+        if (ret > 0) {
+            if (beg != covered)
+                return 0;
+            covered = end;
+            if (covered == block->uncomp_len)
+                return 1;
+        }
+        if (spans[span_i].end <= block_end)
+            span_i++;
+        else
+            break;
+    }
+    return covered == block->uncomp_len;
+}
+
+static int bam_voff_write_block_spans(BGZF *ob, bgzf_block_data_t *block,
+                                      const sam_bam_voff_span_t *spans,
+                                      int n_spans, int span_i)
+{
+    uint64_t block_beg = bam_voff_block_beg(block);
+    uint64_t block_end = bam_voff_block_end(block);
+
+    while (span_i < n_spans && spans[span_i].beg < block_end) {
+        int beg, end, ret;
+
+        if (spans[span_i].end <= block_beg) {
+            span_i++;
+            continue;
+        }
+        ret = bam_voff_block_span_bounds(block, &spans[span_i], &beg, &end);
+        if (ret < 0)
+            return -1;
+        if (ret > 0 &&
+            bgzf_write(ob, block->uncomp_data + beg,
+                       (size_t)(end - beg)) != end - beg)
+            return -1;
+        if (spans[span_i].end <= block_end)
+            span_i++;
+        else
+            break;
+    }
+    return 0;
+}
+
+static int bam_voff_block_selected_uncomp(const bgzf_block_data_t *block,
+                                          const sam_bam_voff_span_t *spans,
+                                          int n_spans, int span_i,
+                                          uint64_t *selected)
+{
+    uint64_t block_beg = bam_voff_block_beg(block);
+    uint64_t block_end = bam_voff_block_end(block);
+
+    *selected = 0;
+    while (span_i < n_spans && spans[span_i].beg < block_end) {
+        int beg, end, ret;
+
+        if (spans[span_i].end <= block_beg) {
+            span_i++;
+            continue;
+        }
+        ret = bam_voff_block_span_bounds(block, &spans[span_i], &beg, &end);
+        if (ret < 0)
+            return -1;
+        if (ret > 0)
+            *selected += (uint64_t)(end - beg);
+        if (spans[span_i].end <= block_end)
+            span_i++;
+        else
+            break;
+    }
+    return 0;
+}
+
+static int sam_bam_raw_copy_voff_spans_core(
+        htsFile *in, htsFile *out, const sam_bam_voff_span_t *spans,
+        int n_spans, sam_bam_voff_span_stats_t *stats, int do_write)
+{
+    BGZF *ib, *ob;
+    bgzf_block_data_t *block = NULL;
+    int span_i = 0, ret = -1;
+
+    if (stats)
+        memset(stats, 0, sizeof(*stats));
+    if (!bam_voff_spans_valid(spans, n_spans))
+        return -1;
+    if (n_spans == 0)
+        return 0;
+    if (!in || in->is_write || in->format.format != bam ||
+        !in->is_bgzf || !in->fp.bgzf) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    ib = in->fp.bgzf;
+    if (ib->mt || ib->is_gzip || !ib->is_compressed) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (do_write) {
+        if (!out || !out->is_write || out->format.format != bam ||
+            !out->is_bgzf || !out->fp.bgzf) {
+            errno = EINVAL;
+            return -1;
+        }
+        ob = out->fp.bgzf;
+        if (ob->is_gzip || !ob->is_compressed ||
+            ob->compress_level != -1 ||
+            out->idx || ob->idx || ob->idx_build_otf) {
+            errno = EINVAL;
+            return -1;
+        }
+    } else {
+        ob = NULL;
+    }
+
+    block = malloc(sizeof(*block));
+    if (!block)
+        return -1;
+
+    if (bgzf_seek(ib, (int64_t)(spans[0].beg & ~UINT64_C(0xffff)),
+                  SEEK_SET) < 0)
+        goto cleanup;
+
+    while (span_i < n_spans) {
+        uint64_t block_beg, block_end;
+
+        if (bgzf_read_block_data(ib, block) < 0 || block->hit_eof) {
+            errno = EIO;
+            goto cleanup;
+        }
+        block_beg = bam_voff_block_beg(block);
+        block_end = bam_voff_block_end(block);
+
+        while (span_i < n_spans && spans[span_i].end <= block_beg)
+            span_i++;
+        if (span_i >= n_spans)
+            break;
+        if (spans[span_i].beg >= block_end)
+            continue;
+
+        if (bam_voff_block_fully_covered(block, spans, n_spans, span_i)) {
+            if (stats) {
+                stats->selected_uncomp += (uint64_t)block->uncomp_len;
+                stats->full_uncomp += (uint64_t)block->uncomp_len;
+                stats->full_blocks++;
+            }
+            if (do_write &&
+                bgzf_raw_write_full_block(ob, block->comp_data,
+                                          (size_t)block->comp_len) < 0)
+                goto cleanup;
+        } else {
+            uint64_t selected = 0;
+
+            if (bam_voff_block_selected_uncomp(block, spans, n_spans,
+                                               span_i, &selected) < 0)
+                goto cleanup;
+            if (stats) {
+                stats->selected_uncomp += selected;
+                stats->partial_uncomp += selected;
+                if (selected > 0)
+                    stats->partial_blocks++;
+            }
+            if (do_write &&
+                bam_voff_write_block_spans(ob, block, spans, n_spans,
+                                           span_i) < 0)
+                goto cleanup;
+        }
+
+        while (span_i < n_spans && spans[span_i].end <= block_end)
+            span_i++;
+    }
+
+    ret = 0;
+
+cleanup:
+    free(block);
+    return ret;
+}
+
+int sam_bam_raw_copy_voff_spans_stats(htsFile *in,
+                                      const sam_bam_voff_span_t *spans,
+                                      int n_spans,
+                                      sam_bam_voff_span_stats_t *stats)
+{
+    if (!stats) {
+        errno = EINVAL;
+        return -1;
+    }
+    return sam_bam_raw_copy_voff_spans_core(in, NULL, spans, n_spans,
+                                            stats, 0);
+}
+
+int sam_bam_raw_copy_voff_spans(htsFile *in, htsFile *out,
+                                const sam_bam_voff_span_t *spans,
+                                int n_spans)
+{
+    return sam_bam_raw_copy_voff_spans_core(in, out, spans, n_spans,
+                                            NULL, 1);
+}
+
 /*
  * Write a BAM file and append to the in-memory index simultaneously.
  */
@@ -937,6 +1472,7 @@ static int bam_write_idx1(htsFile *fp, const sam_hdr_t *h, const bam1_t *b) {
         return bam_write1(bfp, b);
 
     uint32_t block_len = b->l_data - b->core.l_extranul + 32;
+    if (b->core.n_cigar > 0xffff) block_len += 16;
     if (bgzf_flush_try(bfp, 4 + block_len) < 0)
         return -1;
     if (!bfp->mt)
@@ -1548,6 +2084,1127 @@ int sam_passes_filter(const sam_hdr_t *h, const bam1_t *b, hts_filter_t *filt)
     return t;
 }
 
+typedef struct {
+    const sam_hdr_t *h;
+    bam_batch_record_t *record;
+    bam1_t *scratch;
+} hb_view_pair;
+
+static inline uint32_t bam_view_cigar_op_at(const bam_batch_record_t *record,
+                                            int idx)
+{
+    return le_to_u32(sam_bam_batch_record_cigar(record) + ((size_t)idx << 2));
+}
+
+static int bam_view_cigar_to_str(const bam_batch_record_t *record,
+                                 kstring_t *str)
+{
+    int i, ret = 0;
+
+    ks_clear(str);
+    if (record->core.n_cigar == 0)
+        return kputs("*", str) < 0 ? -1 : 0;
+    for (i = 0; i < record->core.n_cigar; i++) {
+        uint32_t c = bam_view_cigar_op_at(record, i);
+        ret |= kputw(bam_cigar_oplen(c), str) < 0;
+        ret |= kputc_(bam_cigar_opchr(c), str) < 0;
+    }
+    ret |= kputs("", str) < 0;
+    return ret ? -1 : 0;
+}
+
+static hts_pos_t bam_view_cigar_rlen(const bam_batch_record_t *record)
+{
+    hts_pos_t rlen = 0;
+    int i;
+
+    for (i = 0; i < record->core.n_cigar; i++) {
+        uint32_t c = bam_view_cigar_op_at(record, i);
+        if (bam_cigar_type(bam_cigar_op(c)) & 2)
+            rlen += bam_cigar_oplen(c);
+    }
+    return rlen;
+}
+
+static int bam_view_cigar_hclen(const bam_batch_record_t *record)
+{
+    int hclen = 0, n = record->core.n_cigar;
+
+    if (n > 0) {
+        uint32_t c = bam_view_cigar_op_at(record, 0);
+        if (bam_cigar_op(c) == BAM_CHARD_CLIP)
+            hclen += bam_cigar_oplen(c);
+    }
+    if (n > 1) {
+        uint32_t c = bam_view_cigar_op_at(record, n - 1);
+        if (bam_cigar_op(c) == BAM_CHARD_CLIP)
+            hclen += bam_cigar_oplen(c);
+    }
+    return hclen;
+}
+
+static int bam_view_cigar_sclen(const bam_batch_record_t *record)
+{
+    int left = 0, sclen = 0, n = record->core.n_cigar;
+
+    if (n > 0) {
+        uint32_t c = bam_view_cigar_op_at(record, 0);
+        if (bam_cigar_op(c) == BAM_CSOFT_CLIP) {
+            sclen += bam_cigar_oplen(c);
+        } else if (n > 1 &&
+                   bam_cigar_op(c) == BAM_CHARD_CLIP) {
+            uint32_t c1 = bam_view_cigar_op_at(record, 1);
+            if (bam_cigar_op(c1) == BAM_CSOFT_CLIP) {
+                left = 1;
+                sclen += bam_cigar_oplen(c1);
+            }
+        }
+    }
+
+    if (n - 1 > left) {
+        uint32_t c = bam_view_cigar_op_at(record, n - 1);
+        if (bam_cigar_op(c) == BAM_CSOFT_CLIP) {
+            sclen += bam_cigar_oplen(c);
+        } else if (n - 2 > left &&
+                   bam_cigar_op(c) == BAM_CHARD_CLIP) {
+            uint32_t c1 = bam_view_cigar_op_at(record, n - 2);
+            if (bam_cigar_op(c1) == BAM_CSOFT_CLIP)
+                sclen += bam_cigar_oplen(c1);
+        }
+    }
+    return sclen;
+}
+
+static int bam_view_get_library(const sam_hdr_t *h,
+                                const bam_batch_record_t *record,
+                                kstring_t *lib)
+{
+    sam_bam_record_view_t view;
+    const uint8_t *rg;
+    int found;
+
+    sam_bam_record_view_from_batch(&view, record);
+    rg = sam_bam_record_view_aux_get(&view, "RG");
+    if (!rg)
+        return 0;
+    if (*rg != 'Z' && *rg != 'H')
+        return 0;
+    found = sam_hdr_find_tag_id((sam_hdr_t *)h, "RG", "ID",
+                                (const char *)rg + 1, "LB", lib) < 0 ? 0 : 1;
+    if (found && lib->l > 1023) {
+        lib->l = 1023;
+        lib->s[lib->l] = '\0';
+    }
+    return found;
+}
+
+static int bam_view_sym_lookup(void *data, char *str, char **end,
+                               hts_expr_val_t *res) {
+    hb_view_pair *hb = (hb_view_pair *)data;
+    const bam_batch_record_t *record = hb->record;
+    const bam1_core_t *core = &record->core;
+
+    res->is_str = 0;
+    switch(*str) {
+    case 'c':
+        if (memcmp(str, "cigar", 5) == 0) {
+            *end = str + 5;
+            res->is_str = 1;
+            return bam_view_cigar_to_str(record, ks_clear(&res->s));
+        }
+        break;
+
+    case 'e':
+        if (memcmp(str, "endpos", 6) == 0) {
+            hts_pos_t endpos;
+
+            *end = str + 6;
+            if (sam_bam_batch_record_endpos(record, hb->scratch,
+                                            &endpos) < 0)
+                return -1;
+            res->d = endpos;
+            return 0;
+        }
+        break;
+
+    case 'f':
+        if (memcmp(str, "flag", 4) == 0) {
+            str = *end = str + 4;
+            if (*str != '.') {
+                res->d = core->flag;
+                return 0;
+            } else {
+                str++;
+                if (!memcmp(str, "paired", 6)) {
+                    *end = str + 6;
+                    res->d = core->flag & BAM_FPAIRED;
+                    return 0;
+                } else if (!memcmp(str, "proper_pair", 11)) {
+                    *end = str + 11;
+                    res->d = core->flag & BAM_FPROPER_PAIR;
+                    return 0;
+                } else if (!memcmp(str, "unmap", 5)) {
+                    *end = str + 5;
+                    res->d = core->flag & BAM_FUNMAP;
+                    return 0;
+                } else if (!memcmp(str, "munmap", 6)) {
+                    *end = str + 6;
+                    res->d = core->flag & BAM_FMUNMAP;
+                    return 0;
+                } else if (!memcmp(str, "reverse", 7)) {
+                    *end = str + 7;
+                    res->d = core->flag & BAM_FREVERSE;
+                    return 0;
+                } else if (!memcmp(str, "mreverse", 8)) {
+                    *end = str + 8;
+                    res->d = core->flag & BAM_FMREVERSE;
+                    return 0;
+                } else if (!memcmp(str, "read1", 5)) {
+                    *end = str + 5;
+                    res->d = core->flag & BAM_FREAD1;
+                    return 0;
+                } else if (!memcmp(str, "read2", 5)) {
+                    *end = str + 5;
+                    res->d = core->flag & BAM_FREAD2;
+                    return 0;
+                } else if (!memcmp(str, "secondary", 9)) {
+                    *end = str + 9;
+                    res->d = core->flag & BAM_FSECONDARY;
+                    return 0;
+                } else if (!memcmp(str, "qcfail", 6)) {
+                    *end = str + 6;
+                    res->d = core->flag & BAM_FQCFAIL;
+                    return 0;
+                } else if (!memcmp(str, "dup", 3)) {
+                    *end = str + 3;
+                    res->d = core->flag & BAM_FDUP;
+                    return 0;
+                } else if (!memcmp(str, "supplementary", 13)) {
+                    *end = str + 13;
+                    res->d = core->flag & BAM_FSUPPLEMENTARY;
+                    return 0;
+                } else {
+                    hts_log_error("Unrecognised flag string");
+                    return -1;
+                }
+            }
+        }
+        break;
+
+    case 'h':
+        if (memcmp(str, "hclen", 5) == 0) {
+            *end = str + 5;
+            res->d = bam_view_cigar_hclen(record);
+            return 0;
+        }
+        break;
+
+    case 'l':
+        if (memcmp(str, "library", 7) == 0) {
+            kstring_t lib = { 0, 0, NULL };
+            int found;
+
+            *end = str + 7;
+            res->is_str = 1;
+            found = bam_view_get_library(hb->h, record, &lib);
+            if (found < 0) {
+                free(lib.s);
+                return -1;
+            }
+            if (kputs(found ? lib.s : "", ks_clear(&res->s)) < 0) {
+                free(lib.s);
+                return -1;
+            }
+            free(lib.s);
+            return 0;
+        }
+        break;
+
+    case 'm':
+        if (memcmp(str, "mapq", 4) == 0) {
+            *end = str + 4;
+            res->d = core->qual;
+            return 0;
+        } else if (memcmp(str, "mpos", 4) == 0) {
+            *end = str + 4;
+            res->d = core->mpos + 1;
+            return 0;
+        } else if (memcmp(str, "mrname", 6) == 0) {
+            const char *rn = sam_hdr_tid2name(hb->h, core->mtid);
+
+            *end = str + 6;
+            res->is_str = 1;
+            kputs(rn ? rn : "*", ks_clear(&res->s));
+            return 0;
+        } else if (memcmp(str, "mrefid", 6) == 0) {
+            *end = str + 6;
+            res->d = core->mtid;
+            return 0;
+        }
+        break;
+
+    case 'n':
+        if (memcmp(str, "ncigar", 6) == 0) {
+            *end = str + 6;
+            res->d = core->n_cigar;
+            return 0;
+        }
+        break;
+
+    case 'p':
+        if (memcmp(str, "pos", 3) == 0) {
+            *end = str + 3;
+            res->d = core->pos + 1;
+            return 0;
+        } else if (memcmp(str, "pnext", 5) == 0) {
+            *end = str + 5;
+            res->d = core->mpos + 1;
+            return 0;
+        }
+        break;
+
+    case 'q':
+        if (memcmp(str, "qlen", 4) == 0) {
+            hts_pos_t qlen;
+
+            *end = str + 4;
+            if (sam_bam_batch_record_query_len(record, hb->scratch, 0,
+                                               &qlen) < 0)
+                return -1;
+            res->d = qlen;
+            return 0;
+        } else if (memcmp(str, "qname", 5) == 0) {
+            *end = str + 5;
+            res->is_str = 1;
+            kputs((const char *)sam_bam_batch_record_qname(record),
+                  ks_clear(&res->s));
+            return 0;
+        } else if (memcmp(str, "qual", 4) == 0) {
+            *end = str + 4;
+            ks_clear(&res->s);
+            if (ks_resize(&res->s, core->l_qseq + 1) < 0)
+                return -1;
+            memcpy(res->s.s, sam_bam_batch_record_qual(record),
+                   core->l_qseq);
+            res->s.l = core->l_qseq;
+            res->is_str = 1;
+            return 0;
+        }
+        break;
+
+    case 'r':
+        if (memcmp(str, "rlen", 4) == 0) {
+            *end = str + 4;
+            res->d = bam_view_cigar_rlen(record);
+            return 0;
+        } else if (memcmp(str, "rname", 5) == 0) {
+            const char *rn = sam_hdr_tid2name(hb->h, core->tid);
+
+            *end = str + 5;
+            res->is_str = 1;
+            kputs(rn ? rn : "*", ks_clear(&res->s));
+            return 0;
+        } else if (memcmp(str, "rnext", 5) == 0) {
+            const char *rn = sam_hdr_tid2name(hb->h, core->mtid);
+
+            *end = str + 5;
+            res->is_str = 1;
+            kputs(rn ? rn : "*", ks_clear(&res->s));
+            return 0;
+        } else if (memcmp(str, "refid", 5) == 0) {
+            *end = str + 5;
+            res->d = core->tid;
+            return 0;
+        }
+        break;
+
+    case 's':
+        if (memcmp(str, "seq", 3) == 0) {
+            *end = str + 3;
+            ks_clear(&res->s);
+            if (ks_resize(&res->s, core->l_qseq + 1) < 0)
+                return -1;
+            nibble2base((uint8_t *)sam_bam_batch_record_seq(record),
+                        res->s.s, core->l_qseq);
+            res->s.s[core->l_qseq] = 0;
+            res->s.l = core->l_qseq;
+            res->is_str = 1;
+            return 0;
+        } else if (memcmp(str, "sclen", 5) == 0) {
+            *end = str + 5;
+            res->d = bam_view_cigar_sclen(record);
+            return 0;
+        }
+        break;
+
+    case 't':
+        if (memcmp(str, "tlen", 4) == 0) {
+            *end = str + 4;
+            res->d = core->isize;
+            return 0;
+        }
+        break;
+
+    case '[':
+        if (*str == '[' && str[1] && str[2] && str[3] == ']') {
+            sam_bam_record_view_t view;
+            const uint8_t *aux;
+
+            *end = str + 4;
+            sam_bam_record_view_from_batch(&view, record);
+            aux = sam_bam_record_view_aux_get(&view, str + 1);
+            if (aux) {
+                res->is_true = 1;
+                switch (*aux) {
+                case 'Z':
+                case 'H':
+                    res->is_str = 1;
+                    kputs((const char *)aux + 1, ks_clear(&res->s));
+                    break;
+
+                case 'A':
+                    res->is_str = 1;
+                    kputsn((const char *)aux + 1, 1, ks_clear(&res->s));
+                    break;
+
+                case 'i': case 'I':
+                case 's': case 'S':
+                case 'c': case 'C':
+                    res->is_str = 0;
+                    res->d = bam_aux2i((uint8_t *)aux);
+                    break;
+
+                case 'f':
+                case 'd':
+                    res->is_str = 0;
+                    res->d = bam_aux2f((uint8_t *)aux);
+                    break;
+
+                default:
+                    hts_log_error("Aux type '%c not yet supported by filters",
+                                  *aux);
+                    return -1;
+                }
+                return 0;
+            } else {
+                res->is_str = 1;
+                ks_clear(&res->s);
+                res->d = 0;
+                res->is_true = 0;
+                return 0;
+            }
+        }
+        break;
+    }
+
+    return -1;
+}
+
+enum {
+    SAM_BAM_FILTER_PRED_NUM_CMP = 1,
+    SAM_BAM_FILTER_PRED_FLAG_BITS,
+    SAM_BAM_FILTER_PRED_AUX_EXISTS,
+    SAM_BAM_FILTER_PRED_AUX_NUM_CMP,
+    SAM_BAM_FILTER_PRED_AUX_STR_CMP,
+    SAM_BAM_FILTER_PRED_LIBRARY_STR_CMP
+};
+
+enum {
+    SAM_BAM_FILTER_FIELD_MAPQ = 1,
+    SAM_BAM_FILTER_FIELD_FLAG,
+    SAM_BAM_FILTER_FIELD_REFID,
+    SAM_BAM_FILTER_FIELD_POS,
+    SAM_BAM_FILTER_FIELD_MREFID,
+    SAM_BAM_FILTER_FIELD_MPOS,
+    SAM_BAM_FILTER_FIELD_TLEN,
+    SAM_BAM_FILTER_FIELD_NCIGAR,
+    SAM_BAM_FILTER_FIELD_ENDPOS,
+    SAM_BAM_FILTER_FIELD_QLEN,
+    SAM_BAM_FILTER_FIELD_RLEN,
+    SAM_BAM_FILTER_FIELD_SCLEN,
+    SAM_BAM_FILTER_FIELD_HCLEN
+};
+
+enum {
+    SAM_BAM_FILTER_CMP_EQ = 1,
+    SAM_BAM_FILTER_CMP_NE,
+    SAM_BAM_FILTER_CMP_LT,
+    SAM_BAM_FILTER_CMP_LE,
+    SAM_BAM_FILTER_CMP_GT,
+    SAM_BAM_FILTER_CMP_GE
+};
+
+static char *sam_filter_trimdup(const char *beg, const char *end)
+{
+    char *out;
+    size_t len;
+
+    while (beg < end && isspace((unsigned char)*beg))
+        beg++;
+    while (end > beg && isspace((unsigned char)end[-1]))
+        end--;
+    len = (size_t)(end - beg);
+    out = malloc(len + 1);
+    if (!out)
+        return NULL;
+    memcpy(out, beg, len);
+    out[len] = '\0';
+    return out;
+}
+
+static const char *sam_filter_find_top_and(const char *s)
+{
+    int depth = 0, quote = 0;
+
+    for (; *s; s++) {
+        if (quote) {
+            if (*s == quote)
+                quote = 0;
+            else if (*s == '\\' && s[1])
+                s++;
+            continue;
+        }
+        if (*s == '"' || *s == '\'') {
+            quote = *s;
+        } else if (*s == '(') {
+            depth++;
+        } else if (*s == ')' && depth > 0) {
+            depth--;
+        } else if (depth == 0 && s[0] == '&' && s[1] == '&') {
+            return s;
+        }
+    }
+    return s;
+}
+
+static int sam_filter_matching_outer_parens(const char *s)
+{
+    size_t len = strlen(s), i;
+    int depth = 0, quote = 0;
+
+    if (len < 2 || s[0] != '(' || s[len - 1] != ')')
+        return 0;
+    for (i = 0; i < len; i++) {
+        if (quote) {
+            if (s[i] == quote)
+                quote = 0;
+            else if (s[i] == '\\' && i + 1 < len)
+                i++;
+            continue;
+        }
+        if (s[i] == '"' || s[i] == '\'') {
+            quote = s[i];
+        } else if (s[i] == '(') {
+            depth++;
+        } else if (s[i] == ')') {
+            depth--;
+            if (depth == 0 && i != len - 1)
+                return 0;
+        }
+    }
+    return depth == 0;
+}
+
+static char *sam_filter_strip_outer(char *term)
+{
+    char *s = term;
+
+    while (*s && isspace((unsigned char)*s))
+        s++;
+    while (sam_filter_matching_outer_parens(s)) {
+        size_t len = strlen(s);
+        s[len - 1] = '\0';
+        s++;
+        while (*s && isspace((unsigned char)*s))
+            s++;
+    }
+    return s;
+}
+
+static int sam_filter_parse_cmp(char **sp)
+{
+    char *s = *sp;
+
+    while (*s && isspace((unsigned char)*s))
+        s++;
+    if (s[0] == '=' && s[1] == '=') {
+        *sp = s + 2;
+        return SAM_BAM_FILTER_CMP_EQ;
+    }
+    if (s[0] == '!' && s[1] == '=') {
+        *sp = s + 2;
+        return SAM_BAM_FILTER_CMP_NE;
+    }
+    if (s[0] == '<' && s[1] == '=') {
+        *sp = s + 2;
+        return SAM_BAM_FILTER_CMP_LE;
+    }
+    if (s[0] == '>' && s[1] == '=') {
+        *sp = s + 2;
+        return SAM_BAM_FILTER_CMP_GE;
+    }
+    if (*s == '<') {
+        *sp = s + 1;
+        return SAM_BAM_FILTER_CMP_LT;
+    }
+    if (*s == '>') {
+        *sp = s + 1;
+        return SAM_BAM_FILTER_CMP_GT;
+    }
+    return 0;
+}
+
+static int sam_filter_parse_number(char **sp, double *value)
+{
+    char *s = *sp, *end = NULL;
+
+    while (*s && isspace((unsigned char)*s))
+        s++;
+    if ((s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) ||
+        (s[0] == '-' && s[1] == '0' && (s[2] == 'x' || s[2] == 'X'))) {
+        long long v = strtoll(s, &end, 0);
+        if (end == s)
+            return -1;
+        *value = (double)v;
+    } else {
+        *value = strtod(s, &end);
+        if (end == s)
+            return -1;
+    }
+    while (*end && isspace((unsigned char)*end))
+        end++;
+    *sp = end;
+    return 0;
+}
+
+static char *sam_filter_parse_string(char **sp)
+{
+    char *s = *sp, *out, *dst;
+    size_t len = 0;
+    int quote;
+
+    while (*s && isspace((unsigned char)*s))
+        s++;
+    if (*s != '"' && *s != '\'')
+        return NULL;
+    quote = *s++;
+    while (s[len] && s[len] != quote) {
+        if (s[len] == '\\' && s[len + 1])
+            len++;
+        len++;
+    }
+    if (s[len] != quote)
+        return NULL;
+    out = malloc(len + 1);
+    if (!out)
+        return NULL;
+    dst = out;
+    while (*s && *s != quote) {
+        if (*s == '\\' && s[1])
+            s++;
+        *dst++ = *s++;
+    }
+    *dst = '\0';
+    if (*s == quote)
+        s++;
+    while (*s && isspace((unsigned char)*s))
+        s++;
+    *sp = s;
+    return out;
+}
+
+static int sam_filter_parse_field(const char *name, int len, int *field,
+                                  int *lazy)
+{
+    *lazy = 0;
+    if (len == 4 && memcmp(name, "mapq", 4) == 0)
+        *field = SAM_BAM_FILTER_FIELD_MAPQ;
+    else if (len == 4 && memcmp(name, "flag", 4) == 0)
+        *field = SAM_BAM_FILTER_FIELD_FLAG;
+    else if (len == 5 && memcmp(name, "refid", 5) == 0)
+        *field = SAM_BAM_FILTER_FIELD_REFID;
+    else if (len == 3 && memcmp(name, "pos", 3) == 0)
+        *field = SAM_BAM_FILTER_FIELD_POS;
+    else if (len == 6 && memcmp(name, "mrefid", 6) == 0)
+        *field = SAM_BAM_FILTER_FIELD_MREFID;
+    else if ((len == 4 && memcmp(name, "mpos", 4) == 0) ||
+             (len == 5 && memcmp(name, "pnext", 5) == 0))
+        *field = SAM_BAM_FILTER_FIELD_MPOS;
+    else if (len == 4 && memcmp(name, "tlen", 4) == 0)
+        *field = SAM_BAM_FILTER_FIELD_TLEN;
+    else if (len == 6 && memcmp(name, "ncigar", 6) == 0)
+        *field = SAM_BAM_FILTER_FIELD_NCIGAR;
+    else if (len == 6 && memcmp(name, "endpos", 6) == 0)
+        *field = SAM_BAM_FILTER_FIELD_ENDPOS, *lazy = 1;
+    else if (len == 4 && memcmp(name, "qlen", 4) == 0)
+        *field = SAM_BAM_FILTER_FIELD_QLEN, *lazy = 1;
+    else if (len == 4 && memcmp(name, "rlen", 4) == 0)
+        *field = SAM_BAM_FILTER_FIELD_RLEN, *lazy = 1;
+    else if (len == 5 && memcmp(name, "sclen", 5) == 0)
+        *field = SAM_BAM_FILTER_FIELD_SCLEN, *lazy = 1;
+    else if (len == 5 && memcmp(name, "hclen", 5) == 0)
+        *field = SAM_BAM_FILTER_FIELD_HCLEN, *lazy = 1;
+    else
+        return 0;
+    return 1;
+}
+
+static int sam_filter_trailing_empty(const char *s)
+{
+    while (*s && isspace((unsigned char)*s))
+        s++;
+    return *s == '\0';
+}
+
+static void sam_bam_filter_plan_raise_class(sam_bam_filter_plan_t *plan,
+                                            sam_bam_filter_plan_class_t cls)
+{
+    if (plan->class_ < cls)
+        plan->class_ = cls;
+}
+
+static int sam_filter_parse_term(sam_bam_filter_plan_t *plan, char *term)
+{
+    sam_bam_filter_plan_pred_t *pred;
+    char *s = sam_filter_strip_outer(term), *name, *after;
+    int negate = 0, cmp, field, lazy, len;
+    double number;
+
+    if (plan->n_predicates >= SAM_BAM_FILTER_PLAN_MAX_PREDICATES)
+        return 0;
+    if (*s == '!') {
+        negate = 1;
+        s++;
+        s = sam_filter_strip_outer(s);
+    }
+
+    pred = &plan->predicates[plan->n_predicates];
+    memset(pred, 0, sizeof(*pred));
+    pred->negate = negate;
+
+    if (*s == '[' && s[1] && s[2] && s[3] == ']') {
+        pred->tag[0] = s[1];
+        pred->tag[1] = s[2];
+        s += 4;
+        while (*s && isspace((unsigned char)*s))
+            s++;
+        if (*s == '\0') {
+            pred->kind = SAM_BAM_FILTER_PRED_AUX_EXISTS;
+            plan->n_predicates++;
+            sam_bam_filter_plan_raise_class(plan,
+                                            SAM_BAM_FILTER_PLAN_LAZY_RAW_VIEW_SAFE);
+            return 1;
+        }
+        cmp = sam_filter_parse_cmp(&s);
+        if (!cmp)
+            return 0;
+        pred->cmp = cmp;
+        while (*s && isspace((unsigned char)*s))
+            s++;
+        if (*s == '"' || *s == '\'') {
+            char *parsed = sam_filter_parse_string(&s);
+            if (!parsed || !sam_filter_trailing_empty(s)) {
+                free(parsed);
+                return 0;
+            }
+            pred->string = parsed;
+            pred->kind = SAM_BAM_FILTER_PRED_AUX_STR_CMP;
+        } else {
+            if (sam_filter_parse_number(&s, &number) < 0 ||
+                !sam_filter_trailing_empty(s))
+                return 0;
+            pred->number = number;
+            pred->kind = SAM_BAM_FILTER_PRED_AUX_NUM_CMP;
+        }
+        plan->n_predicates++;
+        sam_bam_filter_plan_raise_class(plan,
+                                        SAM_BAM_FILTER_PLAN_LAZY_RAW_VIEW_SAFE);
+        return 1;
+    }
+
+    name = s;
+    while (*s && (isalnum((unsigned char)*s) || *s == '_' || *s == '.'))
+        s++;
+    len = (int)(s - name);
+    if (len <= 0)
+        return 0;
+
+    if (len == 7 && memcmp(name, "library", 7) == 0) {
+        char *parsed;
+
+        cmp = sam_filter_parse_cmp(&s);
+        if (cmp != SAM_BAM_FILTER_CMP_EQ && cmp != SAM_BAM_FILTER_CMP_NE)
+            return 0;
+        parsed = sam_filter_parse_string(&s);
+        if (!parsed || !sam_filter_trailing_empty(s)) {
+            free(parsed);
+            return 0;
+        }
+        pred->string = parsed;
+        pred->kind = SAM_BAM_FILTER_PRED_LIBRARY_STR_CMP;
+        pred->cmp = cmp;
+        plan->n_predicates++;
+        sam_bam_filter_plan_raise_class(plan,
+                                        SAM_BAM_FILTER_PLAN_LAZY_RAW_VIEW_SAFE);
+        return 1;
+    }
+
+    if (!sam_filter_parse_field(name, len, &field, &lazy))
+        return 0;
+    pred->field = field;
+    while (*s && isspace((unsigned char)*s))
+        s++;
+    if (field == SAM_BAM_FILTER_FIELD_FLAG && *s == '&') {
+        s++;
+        if (sam_filter_parse_number(&s, &number) < 0 ||
+            !sam_filter_trailing_empty(s))
+            return 0;
+        pred->kind = SAM_BAM_FILTER_PRED_FLAG_BITS;
+        pred->number = number;
+        plan->n_predicates++;
+        sam_bam_filter_plan_raise_class(plan,
+                                        SAM_BAM_FILTER_PLAN_RAW_VIEW_SAFE);
+        return 1;
+    }
+
+    after = s;
+    cmp = sam_filter_parse_cmp(&after);
+    if (!cmp)
+        return 0;
+    s = after;
+    if (sam_filter_parse_number(&s, &number) < 0 ||
+        !sam_filter_trailing_empty(s))
+        return 0;
+    pred->kind = SAM_BAM_FILTER_PRED_NUM_CMP;
+    pred->cmp = cmp;
+    pred->number = number;
+    plan->n_predicates++;
+    sam_bam_filter_plan_raise_class(plan, lazy
+                                    ? SAM_BAM_FILTER_PLAN_LAZY_RAW_VIEW_SAFE
+                                    : SAM_BAM_FILTER_PLAN_RAW_VIEW_SAFE);
+    return 1;
+}
+
+int sam_bam_filter_plan_init(sam_bam_filter_plan_t *plan, const char *expr)
+{
+    char *owned_expr = NULL, *stripped_expr = NULL;
+    const char *s;
+
+    if (!plan) {
+        errno = EINVAL;
+        return -1;
+    }
+    memset(plan, 0, sizeof(*plan));
+    if (!expr)
+        return 0;
+    owned_expr = sam_filter_trimdup(expr, expr + strlen(expr));
+    if (!owned_expr)
+        return -1;
+    stripped_expr = sam_filter_strip_outer(owned_expr);
+    s = stripped_expr;
+    while (*s) {
+        const char *end = sam_filter_find_top_and(s);
+        char *term = sam_filter_trimdup(s, end);
+        int ok;
+
+        if (!term) {
+            sam_bam_filter_plan_destroy(plan);
+            free(owned_expr);
+            return -1;
+        }
+        ok = sam_filter_parse_term(plan, term);
+        free(term);
+        if (!ok) {
+            sam_bam_filter_plan_destroy(plan);
+            plan->class_ = SAM_BAM_FILTER_PLAN_MATERIALIZE_REQUIRED;
+            free(owned_expr);
+            return 0;
+        }
+        s = end;
+        if (s[0] == '&' && s[1] == '&')
+            s += 2;
+        while (*s && isspace((unsigned char)*s))
+            s++;
+    }
+    if (plan->n_predicates == 0)
+        plan->class_ = SAM_BAM_FILTER_PLAN_MATERIALIZE_REQUIRED;
+    free(owned_expr);
+    return 0;
+}
+
+void sam_bam_filter_plan_destroy(sam_bam_filter_plan_t *plan)
+{
+    int i;
+
+    if (!plan)
+        return;
+    for (i = 0; i < plan->n_predicates; i++)
+        free(plan->predicates[i].string);
+    memset(plan, 0, sizeof(*plan));
+}
+
+int sam_bam_filter_plan_is_usable(const sam_bam_filter_plan_t *plan)
+{
+    return plan && plan->n_predicates > 0 &&
+           (plan->class_ == SAM_BAM_FILTER_PLAN_RAW_VIEW_SAFE ||
+            plan->class_ == SAM_BAM_FILTER_PLAN_LAZY_RAW_VIEW_SAFE);
+}
+
+sam_bam_filter_plan_class_t sam_bam_filter_plan_class(
+        const sam_bam_filter_plan_t *plan)
+{
+    return plan ? plan->class_ : SAM_BAM_FILTER_PLAN_UNUSABLE;
+}
+
+static int sam_filter_cmp_number(double lhs, int cmp, double rhs)
+{
+    switch (cmp) {
+    case SAM_BAM_FILTER_CMP_EQ: return lhs == rhs;
+    case SAM_BAM_FILTER_CMP_NE: return lhs != rhs;
+    case SAM_BAM_FILTER_CMP_LT: return lhs < rhs;
+    case SAM_BAM_FILTER_CMP_LE: return lhs <= rhs;
+    case SAM_BAM_FILTER_CMP_GT: return lhs > rhs;
+    case SAM_BAM_FILTER_CMP_GE: return lhs >= rhs;
+    default: return 0;
+    }
+}
+
+static int sam_filter_cmp_string(const char *lhs, int cmp, const char *rhs)
+{
+    int c;
+
+    if (!lhs || !rhs)
+        return 0;
+    c = strcmp(lhs, rhs);
+    switch (cmp) {
+    case SAM_BAM_FILTER_CMP_EQ: return c == 0;
+    case SAM_BAM_FILTER_CMP_NE: return c != 0;
+    case SAM_BAM_FILTER_CMP_LT: return c < 0;
+    case SAM_BAM_FILTER_CMP_LE: return c <= 0;
+    case SAM_BAM_FILTER_CMP_GT: return c > 0;
+    case SAM_BAM_FILTER_CMP_GE: return c >= 0;
+    default: return 0;
+    }
+}
+
+static int sam_filter_record_number(const sam_hdr_t *h,
+                                    const bam_batch_record_t *record,
+                                    bam1_t *scratch, int field,
+                                    double *value)
+{
+    const bam1_core_t *core = &record->core;
+    hts_pos_t len;
+
+    (void)h;
+    switch (field) {
+    case SAM_BAM_FILTER_FIELD_MAPQ:
+        *value = core->qual; return 0;
+    case SAM_BAM_FILTER_FIELD_FLAG:
+        *value = core->flag; return 0;
+    case SAM_BAM_FILTER_FIELD_REFID:
+        *value = core->tid; return 0;
+    case SAM_BAM_FILTER_FIELD_POS:
+        *value = core->pos + 1; return 0;
+    case SAM_BAM_FILTER_FIELD_MREFID:
+        *value = core->mtid; return 0;
+    case SAM_BAM_FILTER_FIELD_MPOS:
+        *value = core->mpos + 1; return 0;
+    case SAM_BAM_FILTER_FIELD_TLEN:
+        *value = core->isize; return 0;
+    case SAM_BAM_FILTER_FIELD_NCIGAR:
+        *value = core->n_cigar; return 0;
+    case SAM_BAM_FILTER_FIELD_ENDPOS:
+        if (sam_bam_batch_record_endpos(record, scratch, &len) < 0)
+            return -1;
+        *value = len; return 0;
+    case SAM_BAM_FILTER_FIELD_QLEN:
+        if (sam_bam_batch_record_query_len(record, scratch, 0, &len) < 0)
+            return -1;
+        *value = len; return 0;
+    case SAM_BAM_FILTER_FIELD_RLEN:
+        *value = bam_view_cigar_rlen(record); return 0;
+    case SAM_BAM_FILTER_FIELD_SCLEN:
+        *value = bam_view_cigar_sclen(record); return 0;
+    case SAM_BAM_FILTER_FIELD_HCLEN:
+        *value = bam_view_cigar_hclen(record); return 0;
+    default:
+        errno = EINVAL;
+        return -1;
+    }
+}
+
+static int sam_filter_aux_number(const uint8_t *aux, double *value)
+{
+    if (!aux)
+        return 0;
+    switch (*aux) {
+    case 'i': case 'I': case 's': case 'S': case 'c': case 'C':
+        *value = bam_aux2i((uint8_t *)aux);
+        return 1;
+    case 'f': case 'd':
+        *value = bam_aux2f((uint8_t *)aux);
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static const char *sam_filter_aux_string(const uint8_t *aux, char tmp[2])
+{
+    if (!aux)
+        return NULL;
+    switch (*aux) {
+    case 'Z':
+    case 'H':
+        return (const char *)aux + 1;
+    case 'A':
+        tmp[0] = (char)aux[1];
+        tmp[1] = '\0';
+        return tmp;
+    default:
+        return NULL;
+    }
+}
+
+static int sam_bam_filter_plan_eval_pred(const sam_hdr_t *h,
+                                         bam_batch_record_t *record,
+                                         bam1_t *scratch,
+                                         const sam_bam_filter_plan_pred_t *pred,
+                                         int *out)
+{
+    sam_bam_record_view_t view;
+    const uint8_t *aux;
+    double value;
+    char tmp[2];
+    int pass = 0;
+
+    sam_bam_record_view_from_batch(&view, record);
+    switch (pred->kind) {
+    case SAM_BAM_FILTER_PRED_NUM_CMP:
+        if (sam_filter_record_number(h, record, scratch, pred->field,
+                                     &value) < 0)
+            return -1;
+        pass = sam_filter_cmp_number(value, pred->cmp, pred->number);
+        break;
+    case SAM_BAM_FILTER_PRED_FLAG_BITS:
+        pass = ((uint32_t)record->core.flag & (uint32_t)pred->number) != 0;
+        break;
+    case SAM_BAM_FILTER_PRED_AUX_EXISTS:
+        aux = sam_bam_record_view_aux_get(&view, pred->tag);
+        if (!aux && errno == EINVAL)
+            return -1;
+        pass = aux != NULL;
+        break;
+    case SAM_BAM_FILTER_PRED_AUX_NUM_CMP:
+        aux = sam_bam_record_view_aux_get(&view, pred->tag);
+        if (!aux) {
+            if (errno == EINVAL)
+                return -1;
+            pass = 0;
+            break;
+        }
+        pass = sam_filter_aux_number(aux, &value)
+               ? sam_filter_cmp_number(value, pred->cmp, pred->number) : 0;
+        break;
+    case SAM_BAM_FILTER_PRED_AUX_STR_CMP:
+        aux = sam_bam_record_view_aux_get(&view, pred->tag);
+        if (!aux) {
+            if (errno == EINVAL)
+                return -1;
+            pass = 0;
+            break;
+        }
+        pass = sam_filter_cmp_string(sam_filter_aux_string(aux, tmp),
+                                     pred->cmp, pred->string);
+        break;
+    case SAM_BAM_FILTER_PRED_LIBRARY_STR_CMP: {
+        kstring_t lib = { 0, 0, NULL };
+        int found = bam_view_get_library(h, record, &lib);
+
+        if (found < 0) {
+            free(lib.s);
+            return -1;
+        }
+        pass = found ? sam_filter_cmp_string(lib.s, pred->cmp, pred->string)
+                     : 0;
+        free(lib.s);
+        break;
+    }
+    default:
+        errno = EINVAL;
+        return -1;
+    }
+    if (pred->negate)
+        pass = !pass;
+    *out = pass;
+    return 0;
+}
+
+int sam_bam_batch_record_passes_filter_plan(const sam_hdr_t *h,
+                                            bam_batch_record_t *record,
+                                            bam1_t *scratch,
+                                            const sam_bam_filter_plan_t *plan,
+                                            int *materialized)
+{
+    int local_materialized = 0, *mat;
+    int i, pass;
+
+    if (!sam_bam_filter_plan_is_usable(plan))
+        return -2;
+    mat = materialized ? materialized : &local_materialized;
+    if (*mat)
+        return -2;
+    if (sam_bam_batch_record_validate_decode(record, scratch, mat) < 0)
+        return -1;
+    if (*mat)
+        return -2;
+    for (i = 0; i < plan->n_predicates; i++) {
+        if (sam_bam_filter_plan_eval_pred(h, record, scratch,
+                                          &plan->predicates[i], &pass) < 0)
+            return -1;
+        if (!pass)
+            return 0;
+    }
+    return 1;
+}
+
+int sam_bam_batch_record_passes_filter(const sam_hdr_t *h,
+                                       bam_batch_record_t *record,
+                                       bam1_t *scratch,
+                                       hts_filter_t *filt,
+                                       int *materialized)
+{
+    hb_view_pair hb = {h, record, scratch};
+    hts_expr_val_t res = HTS_EXPR_VAL_INIT;
+    int local_materialized = 0;
+    int *mat = materialized ? materialized : &local_materialized;
+    int t;
+
+    if (!filt)
+        return 1;
+    if (*mat) {
+        if (!scratch) {
+            errno = EINVAL;
+            return -1;
+        }
+        return sam_passes_filter(h, scratch, filt);
+    }
+    if (sam_bam_batch_record_validate_decode(record, scratch, mat) < 0)
+        return -1;
+    if (*mat)
+        return sam_passes_filter(h, scratch, filt);
+
+    if (hts_filter_eval2(filt, &hb, bam_view_sym_lookup, &res)) {
+        hts_log_error("Couldn't process filter expression");
+        hts_expr_val_free(&res);
+        return -1;
+    }
+
+    t = res.is_true;
+    hts_expr_val_free(&res);
+    return t;
+}
+
 static int cram_readrec(BGZF *ignored, void *fpv, void *bv, int *tid, hts_pos_t *beg, hts_pos_t *end)
 {
     htsFile *fp = fpv;
@@ -1808,6 +3465,159 @@ hts_itr_t *sam_itr_regions(const hts_idx_t *idx, sam_hdr_t *hdr, hts_reglist_t *
     else
         return hts_itr_regions(idx, reglist, regcount, bam_name2id_wrapper, hdr,
                    hts_itr_multi_bam, sam_readrec, bam_pseek, bam_ptell);
+}
+
+static int sam_reglist_interval_cmp(const void *av, const void *bv)
+{
+    const hts_pair_pos_t *a = (const hts_pair_pos_t *)av;
+    const hts_pair_pos_t *b = (const hts_pair_pos_t *)bv;
+
+    if (a->beg < b->beg) return -1;
+    if (a->beg > b->beg) return 1;
+    if (a->end < b->end) return -1;
+    if (a->end > b->end) return 1;
+    return 0;
+}
+
+hts_reglist_t *sam_reglist_dup_merged(const hts_reglist_t *reglist,
+                                      int count, int *out_count)
+{
+    hts_reglist_t *out = NULL;
+    int i, used = 0;
+
+    if (out_count)
+        *out_count = 0;
+    if (!reglist || count <= 0 || !out_count)
+        return NULL;
+
+    out = (hts_reglist_t *)calloc((size_t)count, sizeof(*out));
+    if (!out)
+        return NULL;
+
+    for (i = 0; i < count; i++) {
+        const hts_reglist_t *src = &reglist[i];
+        hts_reglist_t *dst;
+        uint32_t j, n = 0;
+
+        if (src->count == 0)
+            continue;
+        if (!src->intervals)
+            goto fail;
+
+        dst = &out[used];
+        dst->reg = src->reg;
+        dst->tid = src->tid;
+        dst->intervals = (hts_pair_pos_t *)malloc((size_t)src->count *
+                                                  sizeof(*dst->intervals));
+        if (!dst->intervals)
+            goto fail;
+        memcpy(dst->intervals, src->intervals,
+               (size_t)src->count * sizeof(*dst->intervals));
+        qsort(dst->intervals, src->count, sizeof(*dst->intervals),
+              sam_reglist_interval_cmp);
+
+        for (j = 0; j < src->count; j++) {
+            hts_pair_pos_t *cur = &dst->intervals[j];
+
+            if (n > 0 && dst->intervals[n - 1].end >= cur->beg) {
+                if (dst->intervals[n - 1].end < cur->end)
+                    dst->intervals[n - 1].end = cur->end;
+                continue;
+            }
+            if (n != j)
+                dst->intervals[n] = *cur;
+            n++;
+        }
+
+        dst->count = n;
+        dst->min_beg = dst->intervals[0].beg;
+        dst->max_end = dst->intervals[n - 1].end;
+        used++;
+    }
+
+    if (used == 0)
+        goto fail;
+    *out_count = used;
+    return out;
+
+fail:
+    hts_reglist_free(out, count);
+    return NULL;
+}
+
+int sam_itr_next_filtered(htsFile *fp, hts_itr_t *iter, sam_hdr_t *h,
+                          bam1_t *record, sam_region_overlap_f filter,
+                          void *filter_data)
+{
+    int ret;
+
+    if (!filter)
+        return sam_itr_next(fp, iter, record);
+
+    while ((ret = sam_itr_next(fp, iter, record)) >= 0) {
+        hts_pos_t end;
+        int keep;
+
+        if (record->core.tid < 0)
+            continue;
+        end = bam_endpos(record);
+        keep = filter(filter_data, h, record->core.tid, record->core.pos,
+                      end);
+        if (keep < 0)
+            return -2;
+        if (keep)
+            return ret;
+    }
+    return ret;
+}
+
+int sam_bam_itr_next_batch_filtered(htsFile *fp, hts_itr_t *iter,
+                                    sam_hdr_t *h, bam_batch_t *batch,
+                                    sam_region_overlap_f filter,
+                                    void *filter_data, bam1_t *scratch)
+{
+    int ret;
+
+    if (!filter)
+        return sam_bam_itr_next_batch(fp, iter, h, batch);
+
+    while ((ret = sam_bam_itr_next_batch(fp, iter, h, batch)) >= 0) {
+        int i, keep = 0;
+
+        for (i = 0; i < batch->n_records; i++) {
+            bam_batch_record_t *record = &batch->records[i];
+            hts_pos_t end;
+            int pass;
+
+            if (record->core.tid < 0)
+                continue;
+            if (sam_bam_batch_record_endpos(record, scratch, &end) < 0) {
+                sam_bam_batch_destroy(batch);
+                return -2;
+            }
+            pass = filter(filter_data, h, record->core.tid,
+                          record->core.pos, end);
+            if (pass < 0) {
+                sam_bam_batch_destroy(batch);
+                return -2;
+            }
+            if (pass) {
+                if (keep != i)
+                    batch->records[keep] = *record;
+                keep++;
+            }
+        }
+
+        batch->n_records = keep;
+        batch->data = NULL;
+        batch->len = 0;
+        batch->n_segments = 0;
+        batch->segments = NULL;
+        if (keep > 0)
+            return keep;
+        sam_bam_batch_destroy(batch);
+    }
+    return ret;
 }
 
 /**********************
@@ -2993,6 +4803,21 @@ typedef struct sp_bams {
     struct SAM_state *fd;
 } sp_bams;
 
+// Output job - a block of batch record views copied from raw BAM input.
+typedef struct sp_bam_views {
+    int serial;
+
+    bam_batch_record_t *records;
+    int n_records, a_records;
+    uint8_t *data;
+    size_t data_len, data_alloc;
+    bam_batch_t batch;
+    int *ranges, n_ranges;
+    int owns_batch;
+
+    struct SAM_state *fd;
+} sp_bam_views;
+
 // Input job - a block of SAM text
 typedef struct sp_lines {
     struct sp_lines *next;
@@ -3027,6 +4852,7 @@ typedef struct SAM_state {
     sp_bams *bams;
 
     sp_bams *curr_bam;
+    sp_bam_views *curr_views;
     int curr_idx;
     int serial;
 
@@ -3064,7 +4890,12 @@ static SAM_state *sam_state_create(htsFile *fp) {
 }
 
 static int sam_format1_append(const bam_hdr_t *h, const bam1_t *b, kstring_t *str);
+static int sam_format_batch_record_append(const bam_hdr_t *h,
+                                          const bam_batch_record_t *record,
+                                          kstring_t *str);
 static void *sam_format_worker(void *arg);
+static void *sam_format_batch_worker(void *arg);
+static void *sam_dispatcher_write(void *vp);
 
 static void sam_state_err(SAM_state *fd, int errcode) {
     pthread_mutex_lock(&fd->command_m);
@@ -3086,6 +4917,40 @@ static void sam_free_sp_bams(sp_bams *b) {
         free(b->bams);
     }
     free(b);
+}
+
+static void sam_free_sp_bam_views(sp_bam_views *b) {
+    if (!b)
+        return;
+    if (b->owns_batch)
+        sam_bam_batch_destroy(&b->batch);
+    free(b->ranges);
+    free(b->records);
+    free(b->data);
+    free(b);
+}
+
+static int sam_start_threaded_output(htsFile *fp, const sam_hdr_t *h) {
+    SAM_state *fd = (SAM_state *)fp->state;
+
+    if (!fd->h) {
+        // NB: discard const.  We don't actually modify sam_hdr_t here,
+        // just data pointed to by it, but our cached pointer must be
+        // non-const as sam_hdr_destroy takes non-const.
+        fd->h = (sam_hdr_t *)h;
+        fd->h->ref_count++;
+
+        if (pthread_create(&fd->dispatcher, NULL, sam_dispatcher_write,
+                           fp) != 0)
+            return -2;
+        fd->dispatcher_set = 1;
+    }
+
+    if (fd->h != h) {
+        hts_log_error("SAM multi-threaded writing does not support changing header");
+        return -2;
+    }
+    return 0;
 }
 
 // Destroys the state produce by sam_state_create.
@@ -3125,6 +4990,14 @@ int sam_state_destroy(htsFile *fp) {
                 sp_bams *gb = fd->curr_bam;
                 if (!ret && gb && gb->nbams > 0 && fd->q)
                     ret = hts_tpool_dispatch(fd->p, fd->q, sam_format_worker, gb);
+                fd->curr_bam = NULL;
+                sp_bam_views *gv = fd->curr_views;
+                if (!ret && gv && gv->n_records > 0 && fd->q)
+                    ret = hts_tpool_dispatch(fd->p, fd->q,
+                                             sam_format_batch_worker, gv);
+                else
+                    sam_free_sp_bam_views(gv);
+                fd->curr_views = NULL;
 
                 // Flush and drain output
                 if (fd->q)
@@ -3183,6 +5056,8 @@ int sam_state_destroy(htsFile *fp) {
 
         if (fd->curr_bam)
             sam_free_sp_bams(fd->curr_bam);
+        if (fd->curr_views)
+            sam_free_sp_bam_views(fd->curr_views);
 
         // Decrement counter by one, maybe destroying too.
         // This is to permit the caller using bam_hdr_destroy
@@ -3317,6 +5192,10 @@ static void *sam_parse_eof(void *arg) {
 // Cleanup function - result for sam_parse_worker; job for sam_format_worker
 static void cleanup_sp_bams(void *arg) {
     sam_free_sp_bams((sp_bams *) arg);
+}
+
+static void cleanup_sp_bam_views(void *arg) {
+    sam_free_sp_bam_views((sp_bam_views *) arg);
 }
 
 // Runs in its own thread.
@@ -3716,7 +5595,4959 @@ static void *sam_format_worker(void *arg) {
     return NULL;
 }
 
+// Run from one of the worker threads.
+// Convert copied raw BAM record views to a block of text SAM records.
+static void *sam_format_batch_worker(void *arg) {
+    sp_bam_views *gv = (sp_bam_views *)arg;
+    sp_lines *gl = NULL;
+    int i;
+    SAM_state *fd = gv->fd;
+
+    pthread_mutex_lock(&fd->lines_m);
+    if (fd->lines) {
+        gl = fd->lines;
+        fd->lines = gl->next;
+    }
+    pthread_mutex_unlock(&fd->lines_m);
+
+    if (gl == NULL) {
+        gl = calloc(1, sizeof(*gl));
+        if (!gl) {
+            sam_state_err(fd, ENOMEM);
+            sam_free_sp_bam_views(gv);
+            return NULL;
+        }
+        gl->alloc = gl->data_size = 0;
+        gl->data = NULL;
+    }
+    gl->serial = gv->serial;
+    gl->next = NULL;
+    gl->bams = NULL;
+
+    kstring_t ks = {0, gl->alloc, gl->data};
+
+    if (gv->owns_batch) {
+        int r;
+
+        for (r = 0; r < gv->n_ranges; r++) {
+            int beg = gv->ranges[r * 2];
+            int end_i = gv->ranges[r * 2 + 1];
+
+            for (i = beg; i < end_i; i++) {
+                if (sam_format_batch_record_append(fd->h,
+                                                   &gv->batch.records[i],
+                                                   &ks) < 0) {
+                    sam_state_err(fd, errno ? errno : EIO);
+                    goto err;
+                }
+                kputc('\n', &ks);
+            }
+        }
+    } else {
+        for (i = 0; i < gv->n_records; i++) {
+            if (sam_format_batch_record_append(fd->h, &gv->records[i], &ks) < 0) {
+                sam_state_err(fd, errno ? errno : EIO);
+                goto err;
+            }
+            kputc('\n', &ks);
+        }
+    }
+
+    gl->data_size = ks.l;
+    gl->alloc = ks.m;
+    gl->data = ks.s;
+    sam_free_sp_bam_views(gv);
+    return gl;
+
+ err:
+    if (gl) {
+        free(ks.s);
+        free(gl);
+    }
+    sam_free_sp_bam_views(gv);
+    return NULL;
+}
+
+#define BAM_DEFERRED_THREADS_MAGIC 0x62746872u
+#define BAM_STREAM_READER_MAGIC 0x62737472u
+#define BAM_BATCH_REQUEST_MAGIC 0x62627172u
+#define BAM_STREAM_READER_DEFAULT_CHUNK 32768
+#define BAM_STREAM_PARSE_BATCH_RECORDS 16384
+#define BAM_STREAM_PARSE_BATCH_BYTES (16u << 20)
+#define BAM_STREAM_DEFAULT_QSIZE 64
+#define BAM_BATCH_VIEW_INIT_RECORDS 512
+// Fused jobs must drain in order before dispatching the next physical block
+// range: a BAM record can span BGZF blocks, and the next job cannot know its
+// carry-in until the previous job has been parsed.
+#define BAM_STREAM_FUSED_MAX_IN_FLIGHT 1
+#define BAM_STREAM_FUSED_BLOCKS_PER_JOB 64
+
+typedef struct bam_batch_request_t {
+    uint32_t magic;
+} bam_batch_request_t;
+
+typedef struct bam_deferred_threads_t {
+    uint32_t magic;
+    int n_threads;
+    int qsize;
+    hts_tpool *pool;
+    int use_pool;
+} bam_deferred_threads_t;
+
+typedef struct bam_stream_reader_t {
+    uint32_t magic;
+    BGZF *bgzf;
+    bgzf_block_data_t *serial_block;
+    bgzf_block_data_t *block;
+    hts_tpool *pool;
+    hts_tpool_process *decode_q;
+    hts_tpool_process *parse_q;
+    hts_tpool_process *fused_q;
+    hts_tpool_result *block_result;
+    hts_tpool_result *parse_result;
+    struct bam_stream_parse_job_t *parse_batch;
+    int own_pool;
+    int qsize;
+    int in_flight;
+    int parse_in_flight;
+    int fused_in_flight;
+    int input_eof;
+    int input_error;
+    int input_paused_after_empty;
+    int parse_input_eof;
+    int parse_input_error;
+    int parse_hit_limit;
+    int pending_frame_error;
+    int parse_views;
+    size_t block_off;
+    size_t seek_block_off;
+    size_t parse_i;
+    uint8_t *carry;
+    size_t carry_len;
+    size_t carry_cap;
+    uint64_t carry_voff_beg;
+    uint8_t *buf;
+    size_t off;
+    size_t len;
+    size_t cap;
+    size_t chunk_size;
+    int eof;
+} bam_stream_reader_t;
+
+typedef struct bam_stream_decode_job_t {
+    bgzf_block_data_t block;
+} bam_stream_decode_job_t;
+
+typedef struct bam_stream_parse_job_t {
+    uint8_t *data;
+    const uint8_t *ref_data;
+    size_t len;
+    size_t cap;
+    int n_records;
+    int n_parsed;
+    int ret;
+    int is_be;
+    int hit_limit;
+    int need_voff;
+    uint64_t voff_beg;
+    uint64_t voff_end;
+    uint64_t voff_next;
+    bgzf_block_data_t *fused_block;
+    bgzf_block_data_t *fused_blocks;
+    int n_fused_blocks;
+    bam_batch_segment_t *segments;
+    int n_segments;
+    int m_segments;
+    bam1_t *records;
+    bam_batch_record_t *views;
+    sam_hdr_t *view_header;
+    hts_tpool_result *owned_block_result;
+    uint8_t *carry_out;
+    size_t carry_out_len;
+    size_t carry_out_cap;
+    uint64_t carry_voff_beg;
+    size_t block_off_end;
+    int errcode;
+} bam_stream_parse_job_t;
+
+typedef struct bam_stream_fused_job_t {
+    bgzf_block_data_t block;
+    bgzf_block_data_t *extra_blocks;
+    int n_extra_blocks;
+    uint8_t *carry;
+    size_t carry_len;
+    size_t carry_cap;
+    uint64_t carry_voff_beg;
+    size_t start_off;
+    uint64_t limit_voff;
+    sam_hdr_t *h;
+    int is_be;
+    int need_voff;
+    int already_decoded;
+} bam_stream_fused_job_t;
+
+static int bam_ordered_env_enabled(void);
+static int bam_batch_env_enabled(void);
+static int bam_stream_env_enabled(void);
+static int bam_stream_parse_env_enabled(void);
+static int bam_batch_fused_env_enabled(void);
+
+static int bam_stream_env_strict(void)
+{
+    const char *env = getenv("HTS_BAM_STREAM_READER_REQUIRE");
+    return env && *env && strcmp(env, "0") != 0;
+}
+
+static int bam_stream_env_enabled(void)
+{
+    const char *env = getenv("HTS_BAM_STREAM_READER");
+    return env && *env && strcmp(env, "0") != 0;
+}
+
+static int bam_batch_env_enabled(void)
+{
+    const char *env = getenv("HTS_BAM_BATCH_READER");
+    return env && *env && strcmp(env, "0") != 0;
+}
+
+static int bam_batch_env_strict(void)
+{
+    const char *env = getenv("HTS_BAM_BATCH_READER_REQUIRE");
+    return env && *env && strcmp(env, "0") != 0;
+}
+
+static int bam_stream_parse_env_enabled(void)
+{
+    const char *env = getenv("HTS_BAM_STREAM_PARSE");
+    return env && *env && strcmp(env, "0") != 0;
+}
+
+static int bam_batch_parse_env_enabled(void)
+{
+    const char *env = getenv("HTS_BAM_BATCH_PARSE");
+    return env && *env && strcmp(env, "0") != 0;
+}
+
+static int bam_batch_fused_env_enabled(void)
+{
+    const char *env = getenv("HTS_BAM_BATCH_FUSED");
+    return env && *env && strcmp(env, "0") != 0;
+}
+
+static size_t bam_stream_env_chunk_size(void)
+{
+    const char *env = getenv("HTS_BAM_STREAM_READER_CHUNK");
+    char *end = NULL;
+    long n;
+
+    if (!env || !*env)
+        return BAM_STREAM_READER_DEFAULT_CHUNK;
+
+    errno = 0;
+    n = strtol(env, &end, 10);
+    if (errno || end == env || *end || n < 1 ||
+        n > BGZF_MAX_BLOCK_SIZE)
+        return BAM_STREAM_READER_DEFAULT_CHUNK;
+    return (size_t)n;
+}
+
+static int bam_deferred_threads_set(htsFile *fp, int n_threads,
+                                    htsThreadPool *p)
+{
+    bam_deferred_threads_t *cfg;
+
+    if (fp->state)
+        return -2;
+    if (n_threads <= 0 && (!p || !p->pool))
+        return -1;
+
+    cfg = calloc(1, sizeof(*cfg));
+    if (!cfg)
+        return -1;
+
+    cfg->magic = BAM_DEFERRED_THREADS_MAGIC;
+    if (p && p->pool) {
+        cfg->pool = p->pool;
+        cfg->qsize = p->qsize;
+        cfg->n_threads = hts_tpool_size(p->pool);
+        cfg->use_pool = 1;
+    } else {
+        cfg->n_threads = n_threads;
+    }
+
+    if (cfg->n_threads <= 0) {
+        free(cfg);
+        return -1;
+    }
+
+    fp->state = cfg;
+    return 0;
+}
+
+static void bam_deferred_threads_destroy(bam_deferred_threads_t *cfg)
+{
+    free(cfg);
+}
+
+static int bam_batch_state_is_request(const htsFile *fp)
+{
+    return fp && fp->state &&
+           *(uint32_t *)fp->state == BAM_BATCH_REQUEST_MAGIC;
+}
+
+static void bam_batch_request_destroy(htsFile *fp)
+{
+    if (bam_batch_state_is_request(fp)) {
+        free(fp->state);
+        fp->state = NULL;
+    }
+}
+
+static int bam_deferred_threads_enable_bgzf(htsFile *fp,
+                                            bam_deferred_threads_t *cfg)
+{
+    if (!fp || !cfg || !fp->is_bgzf || !fp->fp.bgzf)
+        return -1;
+
+    if (cfg->use_pool)
+        return bgzf_thread_pool(fp->fp.bgzf, cfg->pool, cfg->qsize);
+    return bgzf_mt(fp->fp.bgzf, cfg->n_threads, 256);
+}
+
+static void bam_stream_decode_job_free(void *arg)
+{
+    free(arg);
+}
+
+static void bam_stream_parse_job_free(void *arg)
+{
+    bam_stream_parse_job_t *job = (bam_stream_parse_job_t *)arg;
+    int i;
+
+    if (!job)
+        return;
+    if (job->records) {
+        for (i = 0; i < job->n_parsed; i++)
+            free(job->records[i].data);
+        free(job->records);
+    }
+    free(job->fused_block);
+    free(job->fused_blocks);
+    free(job->segments);
+    free(job->views);
+    if (job->owned_block_result)
+        hts_tpool_delete_result(job->owned_block_result, 1);
+    free(job->carry_out);
+    free(job->data);
+    free(job);
+}
+
+static void bam_stream_fused_job_free(void *arg)
+{
+    bam_stream_fused_job_t *job = (bam_stream_fused_job_t *)arg;
+
+    if (!job)
+        return;
+    free(job->extra_blocks);
+    free(job->carry);
+    free(job);
+}
+
+static void *bam_stream_decode_worker(void *arg)
+{
+    bam_stream_decode_job_t *job = (bam_stream_decode_job_t *)arg;
+
+    if (bgzf_decode_block_data(NULL, &job->block) < 0 && !job->block.errcode)
+        job->block.errcode = BGZF_ERR_ZLIB;
+    return job;
+}
+
+static int bam_stream_parse_job_build_views(bam_stream_parse_job_t *job,
+                                            sam_hdr_t *h);
+
+static void *bam_stream_parse_worker(void *arg)
+{
+    bam_stream_parse_job_t *job = (bam_stream_parse_job_t *)arg;
+    BGZF fake_bgzf = {0};
+    const uint8_t *data = job->data ? job->data : job->ref_data;
+    size_t off = 0;
+
+    fake_bgzf.is_be = job->is_be;
+    job->records = calloc((size_t)job->n_records, sizeof(*job->records));
+    if (!job->records) {
+        job->ret = -4;
+        return job;
+    }
+
+    while (job->n_parsed < job->n_records) {
+        int32_t block_len;
+        int ret;
+
+        if (job->len - off < 4) {
+            job->ret = -2;
+            return job;
+        }
+        block_len = le_to_i32(data + off);
+        if (block_len < 32 || job->len - off < 4 + (size_t)block_len) {
+            job->ret = -4;
+            return job;
+        }
+        ret = bam_decode1_body(job->is_be ? &fake_bgzf : NULL,
+                               &job->records[job->n_parsed], block_len,
+                               data + off + 4);
+        if (ret < 0) {
+            job->ret = ret;
+            return job;
+        }
+        off += 4 + (size_t)block_len;
+        job->n_parsed++;
+    }
+
+    job->ret = 0;
+    return job;
+}
+
+static void *bam_stream_parse_view_worker(void *arg)
+{
+    bam_stream_parse_job_t *job = (bam_stream_parse_job_t *)arg;
+
+    job->ret = bam_stream_parse_job_build_views(job, job->view_header);
+    return job;
+}
+
+static uint64_t bam_stream_block_voff(const bgzf_block_data_t *block,
+                                      size_t offset)
+{
+    if (offset >= 0x10000)
+        return ((uint64_t)(block->block_address + block->comp_len)) << 16;
+    return ((uint64_t)block->block_address << 16) | offset;
+}
+
+static int bam_stream_reader_init_threads(bam_stream_reader_t *reader,
+                                          bam_deferred_threads_t *cfg,
+                                          int parse_views)
+{
+    int qsize;
+    int enable_fused_views = parse_views && bam_batch_fused_env_enabled();
+    int enable_parse_views = parse_views && bam_batch_parse_env_enabled();
+    int enable_parse_records = !parse_views && bam_stream_parse_env_enabled();
+
+    if (!cfg || cfg->n_threads <= 1)
+        return 0;
+
+    if (cfg->use_pool) {
+        reader->pool = cfg->pool;
+        reader->own_pool = 0;
+    } else {
+        reader->pool = hts_tpool_init(cfg->n_threads);
+        if (!reader->pool)
+            return -1;
+        reader->own_pool = 1;
+    }
+
+    qsize = cfg->qsize;
+    if (qsize <= 0)
+        qsize = BAM_STREAM_DEFAULT_QSIZE;
+    if (qsize <= 0)
+        qsize = 2;
+    reader->qsize = qsize;
+    reader->decode_q = hts_tpool_process_init(reader->pool, qsize, 0);
+    if (!reader->decode_q) {
+        if (reader->own_pool) {
+            hts_tpool_destroy(reader->pool);
+            reader->pool = NULL;
+            reader->own_pool = 0;
+        }
+        return -1;
+    }
+    if (enable_fused_views) {
+        int fqsize = qsize < BAM_STREAM_FUSED_MAX_IN_FLIGHT
+                     ? qsize : BAM_STREAM_FUSED_MAX_IN_FLIGHT;
+
+        if (fqsize <= 0)
+            fqsize = 1;
+        reader->fused_q = hts_tpool_process_init(reader->pool, fqsize, 0);
+        if (!reader->fused_q) {
+            hts_tpool_process_destroy(reader->decode_q);
+            reader->decode_q = NULL;
+            if (reader->own_pool) {
+                hts_tpool_destroy(reader->pool);
+                reader->pool = NULL;
+                reader->own_pool = 0;
+            }
+            return -1;
+        }
+        return 0;
+    }
+    if (enable_parse_views || enable_parse_records) {
+        reader->parse_q = hts_tpool_process_init(reader->pool, qsize, 0);
+        if (!reader->parse_q) {
+            hts_tpool_process_destroy(reader->decode_q);
+            reader->decode_q = NULL;
+            if (reader->own_pool) {
+                hts_tpool_destroy(reader->pool);
+                reader->pool = NULL;
+                reader->own_pool = 0;
+            }
+            return -1;
+        }
+        reader->parse_views = enable_parse_views;
+    }
+
+    return 0;
+}
+
+static bam_stream_reader_t *bam_stream_reader_open(htsFile *fp,
+                                                   bam_deferred_threads_t *cfg,
+                                                   int parse_views)
+{
+    bam_stream_reader_t *reader;
+
+    if (!fp || !fp->is_bgzf || !fp->fp.bgzf || fp->fp.bgzf->is_gzip ||
+        fp->fp.bgzf->mt)
+        return NULL;
+
+    reader = calloc(1, sizeof(*reader));
+    if (!reader)
+        return NULL;
+
+    reader->magic = BAM_STREAM_READER_MAGIC;
+    reader->bgzf = fp->fp.bgzf;
+    reader->chunk_size = bam_stream_env_chunk_size();
+    reader->serial_block = calloc(1, sizeof(*reader->serial_block));
+    if (!reader->serial_block) {
+        free(reader);
+        return NULL;
+    }
+    if (bam_stream_reader_init_threads(reader, cfg, parse_views) < 0) {
+        free(reader->serial_block);
+        free(reader);
+        return NULL;
+    }
+    if (fp->fp.bgzf->block_length > fp->fp.bgzf->block_offset) {
+        reader->block = reader->serial_block;
+        reader->block->block_address = fp->fp.bgzf->block_address;
+        reader->block->comp_len = fp->fp.bgzf->block_clength;
+        reader->block->uncomp_len = fp->fp.bgzf->block_length;
+        reader->block_off = (size_t)fp->fp.bgzf->block_offset;
+        memcpy(reader->block->uncomp_data, fp->fp.bgzf->uncompressed_block,
+               (size_t)fp->fp.bgzf->block_length);
+    } else {
+        reader->seek_block_off = (size_t)fp->fp.bgzf->block_offset;
+    }
+    return reader;
+}
+
+static void bam_stream_reader_destroy(bam_stream_reader_t *reader)
+{
+    if (!reader)
+        return;
+    if (reader->block_result)
+        hts_tpool_delete_result(reader->block_result, 1);
+    if (reader->parse_result)
+        hts_tpool_delete_result(reader->parse_result, 1);
+    if (reader->parse_q)
+        hts_tpool_process_destroy(reader->parse_q);
+    if (reader->fused_q)
+        hts_tpool_process_destroy(reader->fused_q);
+    if (reader->decode_q)
+        hts_tpool_process_destroy(reader->decode_q);
+    if (reader->own_pool && reader->pool)
+        hts_tpool_destroy(reader->pool);
+    free(reader->serial_block);
+    free(reader->carry);
+    free(reader->buf);
+    free(reader);
+}
+
+static int bam_stream_reader_reserve(bam_stream_reader_t *reader,
+                                     size_t extra)
+{
+    uint8_t *new_buf;
+    size_t avail = reader->len - reader->off;
+    size_t need = avail + extra;
+    size_t new_cap;
+
+    if (need <= reader->cap - reader->off)
+        return 0;
+
+    if (reader->off > 0 && avail > 0)
+        memmove(reader->buf, reader->buf + reader->off, avail);
+    reader->off = 0;
+    reader->len = avail;
+    if (need <= reader->cap)
+        return 0;
+
+    new_cap = reader->cap ? reader->cap : reader->chunk_size;
+    while (new_cap < need) {
+        if (new_cap > SIZE_MAX / 2) {
+            errno = ENOMEM;
+            return -1;
+        }
+        new_cap *= 2;
+    }
+
+    new_buf = realloc(reader->buf, new_cap);
+    if (!new_buf) {
+        errno = ENOMEM;
+        return -1;
+    }
+    reader->buf = new_buf;
+    reader->cap = new_cap;
+    return 0;
+}
+
+static void bam_stream_reader_release_block(bam_stream_reader_t *reader)
+{
+    if (reader->block_result) {
+        hts_tpool_delete_result(reader->block_result, 1);
+        reader->block_result = NULL;
+    }
+    reader->block = NULL;
+    reader->block_off = 0;
+}
+
+static int bam_stream_reader_dispatch_block(bam_stream_reader_t *reader)
+{
+    bam_stream_decode_job_t *job;
+
+    if (reader->input_eof || reader->input_error)
+        return reader->input_error ? -1 : 0;
+
+    job = malloc(sizeof(*job));
+    if (!job)
+        return -1;
+    job->block.block_address = 0;
+    job->block.comp_len = 0;
+    job->block.uncomp_len = 0;
+    job->block.hit_eof = 0;
+    job->block.errcode = 0;
+
+    if (bgzf_read_block_compressed(reader->bgzf, &job->block) < 0) {
+        free(job);
+        reader->input_error = 1;
+        return -1;
+    }
+    if (job->block.hit_eof) {
+        free(job);
+        reader->input_eof = 1;
+        return 0;
+    }
+
+    int maybe_empty = (le_to_u32(job->block.comp_data +
+                                 job->block.comp_len - 4) == 0);
+
+    if (hts_tpool_dispatch3(reader->pool, reader->decode_q,
+                            bam_stream_decode_worker, job,
+                            bam_stream_decode_job_free,
+                            bam_stream_decode_job_free, 0) < 0) {
+        free(job);
+        reader->input_error = 1;
+        return -1;
+    }
+    reader->in_flight++;
+    if (maybe_empty)
+        reader->input_paused_after_empty = 1;
+    return 0;
+}
+
+static int bam_stream_reader_fill_decode(bam_stream_reader_t *reader)
+{
+    while (!reader->input_eof && !reader->input_error &&
+           !reader->input_paused_after_empty &&
+           reader->in_flight < reader->qsize) {
+        if (bam_stream_reader_dispatch_block(reader) < 0)
+            return -1;
+    }
+    return reader->input_error ? -1 : 0;
+}
+
+static int bam_stream_reader_next_parallel_block(bam_stream_reader_t *reader)
+{
+    BGZF *bgzf = reader->bgzf;
+
+    bam_stream_reader_release_block(reader);
+
+    for (;;) {
+        hts_tpool_result *result;
+        bgzf_block_data_t *block;
+
+        if (bam_stream_reader_fill_decode(reader) < 0 &&
+            reader->in_flight == 0)
+            return -1;
+        if (reader->in_flight == 0)
+            return reader->input_eof ? 0 : -1;
+
+        result = hts_tpool_next_result_wait(reader->decode_q);
+        if (!result) {
+            reader->input_error = 1;
+            return -1;
+        }
+        reader->in_flight--;
+        block = &((bam_stream_decode_job_t *)hts_tpool_result_data(result))->block;
+        reader->block_result = result;
+        reader->block = block;
+        reader->block_off = 0;
+
+        if (block->errcode) {
+            bgzf->errcode |= block->errcode;
+            return -1;
+        }
+
+        if (bgzf_block_data_update_index(bgzf, block) < 0)
+            return -1;
+        if (block->uncomp_len == 0) {
+            bam_stream_reader_release_block(reader);
+            reader->input_paused_after_empty = 0;
+            continue;
+        }
+        return 1;
+    }
+}
+
+static int bam_stream_reader_next_serial_block(bam_stream_reader_t *reader)
+{
+    BGZF *bgzf = reader->bgzf;
+
+    bam_stream_reader_release_block(reader);
+    reader->block = reader->serial_block;
+    if (bgzf_read_block_data(bgzf, reader->block) < 0) {
+        reader->block = NULL;
+        return -1;
+    }
+    reader->block_off = 0;
+    if (reader->block->hit_eof)
+        return 0;
+
+    bgzf->block_address = reader->block->block_address;
+    bgzf->block_clength = reader->block->comp_len;
+    bgzf->block_length = reader->block->uncomp_len;
+    bgzf->block_offset = 0;
+    return 1;
+}
+
+static int bam_stream_reader_next_block(bam_stream_reader_t *reader)
+{
+    int ret;
+
+    if (reader->decode_q)
+        ret = bam_stream_reader_next_parallel_block(reader);
+    else
+        ret = bam_stream_reader_next_serial_block(reader);
+
+    if (ret > 0 && reader->block) {
+        BGZF *bgzf = reader->bgzf;
+        if (reader->seek_block_off) {
+            reader->block_off =
+                reader->seek_block_off <= (size_t)reader->block->uncomp_len
+                ? reader->seek_block_off : (size_t)reader->block->uncomp_len;
+            reader->seek_block_off = 0;
+        }
+        bgzf->block_address = reader->block->block_address;
+        bgzf->block_clength = reader->block->comp_len;
+        bgzf->block_length = reader->block->uncomp_len;
+        bgzf->block_offset = (int)reader->block_off;
+    }
+    return ret;
+}
+
+static ssize_t bam_stream_reader_read_block_bytes(bam_stream_reader_t *reader,
+                                                  uint8_t *dst, size_t len)
+{
+    BGZF *bgzf = reader->bgzf;
+    size_t copied = 0;
+
+    while (copied < len) {
+        int n;
+        size_t avail;
+
+        if (!reader->block ||
+            reader->block_off >= (size_t)reader->block->uncomp_len) {
+            int ret = bam_stream_reader_next_block(reader);
+            if (ret < 0)
+                return copied ? (ssize_t)copied : -1;
+            if (ret == 0)
+                break;
+        }
+
+        avail = (size_t)reader->block->uncomp_len - reader->block_off;
+        if (avail == 0)
+            continue;
+        n = (int)avail;
+        if ((size_t)n > len - copied)
+            n = (int)(len - copied);
+
+        memcpy(dst + copied, reader->block->uncomp_data + reader->block_off,
+               (size_t)n);
+        reader->block_off += (size_t)n;
+        bgzf->block_offset = (int)reader->block_off;
+        copied += (size_t)n;
+    }
+
+    return (ssize_t)copied;
+}
+
+static int bam_stream_reader_need(bam_stream_reader_t *reader, size_t need)
+{
+    while (reader->len - reader->off < need && !reader->eof) {
+        size_t want = need - (reader->len - reader->off);
+        ssize_t n;
+
+        if (want > reader->chunk_size)
+            want = reader->chunk_size;
+        if (want > SIZE_MAX - reader->len) {
+            errno = ENOMEM;
+            return -2;
+        }
+        if (bam_stream_reader_reserve(reader, want) < 0)
+            return -2;
+
+        n = bam_stream_reader_read_block_bytes(reader, reader->buf + reader->len,
+                                               want);
+        if (n < 0)
+            return -2;
+        if (n == 0) {
+            reader->eof = 1;
+            break;
+        }
+        reader->len += (size_t)n;
+    }
+
+    if (reader->len - reader->off >= need)
+        return 0;
+    return reader->len == reader->off ? -1 : -2;
+}
+
+static int bam_stream_parse_job_reserve(bam_stream_parse_job_t *job,
+                                        size_t extra)
+{
+    uint8_t *new_data;
+    size_t need = job->len + extra;
+    size_t new_cap;
+
+    if (need <= job->cap)
+        return 0;
+
+    new_cap = job->cap ? job->cap : BAM_STREAM_PARSE_BATCH_BYTES;
+    while (new_cap < need) {
+        if (new_cap > SIZE_MAX / 2) {
+            errno = ENOMEM;
+            return -1;
+        }
+        new_cap *= 2;
+    }
+
+    new_data = realloc(job->data, new_cap);
+    if (!new_data) {
+        errno = ENOMEM;
+        return -1;
+    }
+    job->data = new_data;
+    job->cap = new_cap;
+    return 0;
+}
+
+static int bam_stream_reader_carry_reserve(bam_stream_reader_t *reader,
+                                           size_t need)
+{
+    uint8_t *new_carry;
+    size_t new_cap;
+
+    if (need <= reader->carry_cap)
+        return 0;
+
+    new_cap = reader->carry_cap ? reader->carry_cap : 256;
+    while (new_cap < need) {
+        if (new_cap > SIZE_MAX / 2) {
+            errno = ENOMEM;
+            return -1;
+        }
+        new_cap *= 2;
+    }
+
+    new_carry = realloc(reader->carry, new_cap);
+    if (!new_carry) {
+        errno = ENOMEM;
+        return -1;
+    }
+    reader->carry = new_carry;
+    reader->carry_cap = new_cap;
+    return 0;
+}
+
+static int bam_stream_reader_carry_append(bam_stream_reader_t *reader,
+                                          const uint8_t *src, size_t len)
+{
+    if (bam_stream_reader_carry_reserve(reader, reader->carry_len + len) < 0)
+        return -2;
+    memcpy(reader->carry + reader->carry_len, src, len);
+    reader->carry_len += len;
+    return 0;
+}
+
+static int bam_stream_reader_carry_reserve_frame(bam_stream_reader_t *reader,
+                                                 const uint8_t *data,
+                                                 size_t pos, size_t end)
+{
+    int32_t block_len;
+    size_t frame_len;
+
+    if (end - pos < 4)
+        return 0;
+    block_len = le_to_i32(data + pos);
+    if (block_len < 32)
+        return 0;
+    frame_len = 4 + (size_t)block_len;
+    if (frame_len > BAM_STREAM_PARSE_BATCH_BYTES)
+        return 0;
+    if (frame_len <= end - pos)
+        return 0;
+    if (reader->carry_len == 0 && reader->block)
+        reader->carry_voff_beg = bam_stream_block_voff(reader->block, pos);
+    return bam_stream_reader_carry_reserve(reader, frame_len) < 0 ? -2 : 0;
+}
+
+static int bam_stream_reader_carry_error(bam_stream_reader_t *reader)
+{
+    if (reader->carry_len == 0)
+        return -1;
+    if (reader->carry_len < 4)
+        return -2;
+    if (reader->carry_len < 4 + 32)
+        return -3;
+    return -4;
+}
+
+static int bam_stream_reader_next_frame(bam_stream_reader_t *reader,
+                                        bam_stream_parse_job_t *job)
+{
+    int32_t block_len;
+    size_t frame_len, avail;
+    int ret;
+
+    ret = bam_stream_reader_need(reader, 4);
+    if (ret < 0) {
+        if (ret == -2)
+            reader->off = reader->len;
+        return ret;
+    }
+
+    block_len = le_to_i32(reader->buf + reader->off);
+    if (block_len < 32) {
+        reader->off += 4;
+        return -4;
+    }
+    frame_len = 4 + (size_t)block_len;
+
+    ret = bam_stream_reader_need(reader, 4 + 32);
+    if (ret < 0) {
+        reader->off = reader->len;
+        return -3;
+    }
+
+    if (bam_validate1_body_core(block_len, reader->buf + reader->off + 4) < 0) {
+        reader->off += 4 + 32;
+        return -4;
+    }
+
+    ret = bam_stream_reader_need(reader, frame_len);
+    if (ret < 0) {
+        avail = reader->len - reader->off;
+        reader->off = reader->len;
+        return avail < 4 + 32 ? -3 : -4;
+    }
+
+    if (job) {
+        if (bam_stream_parse_job_reserve(job, frame_len) < 0)
+            return -2;
+        memcpy(job->data + job->len, reader->buf + reader->off, frame_len);
+        job->len += frame_len;
+        job->n_records++;
+        reader->off += frame_len;
+        return 1;
+    }
+
+    return 1;
+}
+
+static int bam_stream_reader_next_serial(bam_stream_reader_t *reader, bam1_t *b)
+{
+    int32_t block_len;
+    size_t frame_len;
+    int ret = bam_stream_reader_next_frame(reader, NULL);
+
+    if (ret < 0)
+        return ret;
+
+    block_len = le_to_i32(reader->buf + reader->off);
+    frame_len = 4 + (size_t)block_len;
+    ret = bam_decode1_body(reader->bgzf, b, block_len,
+                           reader->buf + reader->off + 4);
+    reader->off += frame_len;
+    return ret;
+}
+
+static void bam_batch_record_view_set(bam_batch_record_t *view,
+                                      const uint8_t *frame, size_t frame_len,
+                                      uint64_t voff_beg, uint64_t voff_end)
+{
+    const uint8_t *body = frame + 4;
+    uint32_t x2 = le_to_u32(body + 8);
+    uint32_t x3 = le_to_u32(body + 12);
+
+    view->frame = frame;
+    view->frame_len = frame_len;
+    view->body = body + 32;
+    view->raw_l_data = (uint32_t)(frame_len - 4 - 32);
+    view->voff_beg = voff_beg;
+    view->voff_end = voff_end;
+    view->endpos = 0;
+    view->flags = BAM_BATCH_RECORD_F_RAW_LAYOUT_VALID;
+    view->core.tid = le_to_i32(body);
+    view->core.pos = le_to_i32(body + 4);
+    view->core.bin = x2 >> 16;
+    view->core.qual = (x2 >> 8) & 0xff;
+    view->core.l_qname = x2 & 0xff;
+    view->core.l_extranul = (-view->core.l_qname) & 3;
+    view->core.flag = x3 >> 16;
+    view->core.n_cigar = x3 & 0xffff;
+    view->core.l_qseq = le_to_i32(body + 16);
+    view->core.mtid = le_to_i32(body + 20);
+    view->core.mpos = le_to_i32(body + 24);
+    view->core.isize = le_to_i32(body + 28);
+}
+
+static int bam_body_header_valid(const uint8_t *body, sam_hdr_t *h)
+{
+    int32_t tid, mtid;
+
+    if (!h)
+        return 1;
+    tid = le_to_i32(body);
+    mtid = le_to_i32(body + 20);
+    return tid >= -1 && tid < h->n_targets &&
+           mtid >= -1 && mtid < h->n_targets;
+}
+
+static int bam_batch_record_view_tid_valid(const bam_batch_record_t *view,
+                                           sam_hdr_t *h)
+{
+    if (!h)
+        return 1;
+    return view->core.tid >= -1 && view->core.tid < h->n_targets &&
+           view->core.mtid >= -1 && view->core.mtid < h->n_targets;
+}
+
+static int sam_bam_batch_record_decode_status(
+        bam_batch_record_t *record, int *needs_materialize);
+static int sam_bam_batch_record_materialize_validated(
+        const bam_batch_record_t *record, bam1_t *scratch, int *materialized);
+
+int sam_bam_batch_record_cg_candidate(const bam_batch_record_t *record)
+{
+    const uint8_t *cigar;
+    uint32_t first;
+
+    if (!record || record->core.n_cigar == 0 || record->core.tid < 0 ||
+        record->core.pos < 0)
+        return 0;
+    cigar = sam_bam_batch_record_cigar(record);
+    first = le_to_u32(cigar);
+    return first == (((uint32_t)record->core.l_qseq << BAM_CIGAR_SHIFT) |
+                     BAM_CSOFT_CLIP);
+}
+
+static int bam_batch_record_view_append(bam_batch_record_t **views,
+                                        int *n_views, int *m_views,
+                                        const uint8_t *frame,
+                                        size_t frame_len,
+                                        uint64_t voff_beg,
+                                        uint64_t voff_end,
+                                        sam_hdr_t *h)
+{
+    bam_batch_record_t *new_views;
+    bam_batch_record_t view;
+    int new_m;
+
+    bam_batch_record_view_set(&view, frame, frame_len, voff_beg, voff_end);
+    if (!bam_batch_record_view_tid_valid(&view, h)) {
+        errno = ERANGE;
+        return -3;
+    }
+    {
+        int needs_materialize = 0;
+        if (sam_bam_batch_record_decode_status(&view, &needs_materialize) < 0)
+            return -4;
+    }
+
+    if (*n_views == *m_views) {
+        new_m = *m_views ? (*m_views > INT_MAX / 2
+                            ? INT_MAX : *m_views * 2)
+                         : BAM_BATCH_VIEW_INIT_RECORDS;
+        if (new_m == *m_views ||
+            (size_t)new_m > SIZE_MAX / sizeof(*new_views)) {
+            errno = ENOMEM;
+            return -1;
+        }
+        new_views = realloc(*views, (size_t)new_m * sizeof(*new_views));
+        if (!new_views) {
+            errno = ENOMEM;
+            return -1;
+        }
+        *views = new_views;
+        *m_views = new_m;
+    }
+
+    (*views)[(*n_views)++] = view;
+    return 0;
+}
+
+static int bam_stream_parse_job_reserve_view_data(bam_stream_parse_job_t *job,
+                                                  size_t extra)
+{
+    const uint8_t *old_data = job->data;
+    int i;
+
+    if (bam_stream_parse_job_reserve(job, extra) < 0)
+        return -2;
+    if (old_data && old_data != job->data) {
+        for (i = 0; i < job->n_records; i++) {
+            if (!(job->views[i].flags & BAM_BATCH_RECORD_F_OWNED))
+                continue;
+            size_t frame_off = (size_t)(job->views[i].frame - old_data);
+            size_t body_off = (size_t)(job->views[i].body - old_data);
+
+            job->views[i].frame = job->data + frame_off;
+            job->views[i].body = job->data + body_off;
+        }
+        for (i = 0; i < job->n_segments; i++) {
+            if (job->segments[i].flags & BAM_BATCH_SEGMENT_F_OWNED) {
+                size_t data_off = (size_t)(job->segments[i].data - old_data);
+
+                job->segments[i].data = job->data + data_off;
+            }
+        }
+    }
+    return 0;
+}
+
+static int bam_stream_parse_job_append_segment(bam_stream_parse_job_t *job,
+                                               const uint8_t *data,
+                                               size_t len, uint32_t flags)
+{
+    bam_batch_segment_t *segments;
+    int new_m;
+
+    if (len == 0)
+        return 0;
+    if (!data) {
+        errno = EINVAL;
+        return -2;
+    }
+    if (job->n_segments > 0) {
+        bam_batch_segment_t *last = &job->segments[job->n_segments - 1];
+
+        if (last->flags == flags && last->data + last->len == data) {
+            last->len += len;
+            return 0;
+        }
+    }
+    if (job->n_segments == job->m_segments) {
+        new_m = job->m_segments ? (job->m_segments > INT_MAX / 2
+                                   ? INT_MAX : job->m_segments * 2)
+                                : 16;
+        if (new_m == job->m_segments ||
+            (size_t)new_m > SIZE_MAX / sizeof(*segments)) {
+            errno = ENOMEM;
+            return -2;
+        }
+        segments = realloc(job->segments, (size_t)new_m * sizeof(*segments));
+        if (!segments) {
+            errno = ENOMEM;
+            return -2;
+        }
+        job->segments = segments;
+        job->m_segments = new_m;
+    }
+    job->segments[job->n_segments].data = data;
+    job->segments[job->n_segments].len = len;
+    job->segments[job->n_segments].flags = flags;
+    job->n_segments++;
+    return 0;
+}
+
+static int bam_stream_fused_carry_reserve(uint8_t **carry, size_t *cap,
+                                          size_t need)
+{
+    uint8_t *new_carry;
+    size_t new_cap;
+
+    if (need <= *cap)
+        return 0;
+    new_cap = *cap ? *cap : 256;
+    while (new_cap < need) {
+        if (new_cap > SIZE_MAX / 2) {
+            errno = ENOMEM;
+            return -2;
+        }
+        new_cap *= 2;
+    }
+    new_carry = realloc(*carry, new_cap);
+    if (!new_carry) {
+        errno = ENOMEM;
+        return -2;
+    }
+    *carry = new_carry;
+    *cap = new_cap;
+    return 0;
+}
+
+static int bam_stream_fused_copy_carry_out(bam_stream_parse_job_t *out,
+                                           const uint8_t *src, size_t len,
+                                           uint64_t voff_beg)
+{
+    if (len == 0)
+        return 0;
+    out->carry_out = malloc(len);
+    if (!out->carry_out) {
+        errno = ENOMEM;
+        return -2;
+    }
+    memcpy(out->carry_out, src, len);
+    out->carry_out_len = len;
+    out->carry_out_cap = len;
+    out->carry_voff_beg = voff_beg;
+    return 0;
+}
+
+static int bam_stream_fused_append_view(bam_stream_parse_job_t *out,
+                                        int *m_views, const uint8_t *frame,
+                                        size_t frame_len, uint64_t voff_beg,
+                                        uint64_t voff_end, sam_hdr_t *h)
+{
+    int vret = bam_batch_record_view_append(&out->views, &out->n_records,
+                                            m_views, frame, frame_len,
+                                            voff_beg, voff_end, h);
+    if (vret == -3 || vret == -4)
+        return vret;
+    return vret < 0 ? -2 : 0;
+}
+
+static int bam_stream_fused_append_copied_view(bam_stream_parse_job_t *out,
+                                               int *m_views,
+                                               const uint8_t *frame,
+                                               size_t frame_len,
+                                               uint64_t voff_beg,
+                                               uint64_t voff_end,
+                                               sam_hdr_t *h)
+{
+    size_t old_len = out->len;
+    int ret;
+
+    if (bam_stream_parse_job_reserve_view_data(out, frame_len) < 0)
+        return -2;
+    memcpy(out->data + old_len, frame, frame_len);
+    ret = bam_stream_fused_append_view(out, m_views, out->data + old_len,
+                                       frame_len, voff_beg, voff_end, h);
+    if (ret < 0)
+        return ret;
+    out->views[out->n_records - 1].flags |= BAM_BATCH_RECORD_F_OWNED;
+    out->len += frame_len;
+    return bam_stream_parse_job_append_segment(out, out->data + old_len,
+                                               frame_len,
+                                               BAM_BATCH_SEGMENT_F_OWNED);
+}
+
+static bgzf_block_data_t *bam_stream_fused_job_block(
+        bam_stream_fused_job_t *job, int i)
+{
+    return i == 0 ? &job->block : &job->extra_blocks[i - 1];
+}
+
+static void *bam_stream_fused_worker_multi(bam_stream_fused_job_t *job)
+{
+    bam_stream_parse_job_t *out;
+    uint8_t *carry = NULL;
+    size_t carry_len = 0, carry_cap = 0;
+    uint64_t carry_voff_beg = job->carry_voff_beg;
+    int n_blocks = 1 + job->n_extra_blocks;
+    int m_views = 0;
+    int bi;
+
+    out = calloc(1, sizeof(*out));
+    if (!out) {
+        bam_stream_fused_job_free(job);
+        return NULL;
+    }
+    out->is_be = job->is_be;
+    out->need_voff = job->need_voff;
+    out->fused_blocks = calloc((size_t)n_blocks, sizeof(*out->fused_blocks));
+    if (!out->fused_blocks) {
+        out->ret = -2;
+        bam_stream_fused_job_free(job);
+        return out;
+    }
+
+    carry = job->carry;
+    carry_len = job->carry_len;
+    carry_cap = job->carry_cap;
+    job->carry = NULL;
+    job->carry_len = job->carry_cap = 0;
+
+    for (bi = 0; bi < n_blocks && out->ret == 0 && !out->hit_limit; bi++) {
+        bgzf_block_data_t *job_block = bam_stream_fused_job_block(job, bi);
+        bgzf_block_data_t *block;
+        uint8_t *data;
+        size_t pos, end;
+
+        if (!(bi == 0 && job->already_decoded) &&
+            bgzf_decode_block_data(NULL, job_block) < 0) {
+            out->ret = -2;
+            out->errcode = job_block->errcode ? job_block->errcode
+                                               : BGZF_ERR_ZLIB;
+            break;
+        }
+
+        out->fused_blocks[out->n_fused_blocks] = *job_block;
+        block = &out->fused_blocks[out->n_fused_blocks++];
+        end = block->uncomp_len > 0 ? (size_t)block->uncomp_len : 0;
+        pos = bi == 0 && job->start_off <= end ? job->start_off : 0;
+        out->block_off_end = pos;
+        if (end == 0)
+            continue;
+        data = block->uncomp_data;
+
+        if (carry_len) {
+            int32_t block_len;
+            size_t frame_len, need, avail;
+            uint64_t voff_end;
+            int ret;
+
+            if (carry_voff_beg >= job->limit_voff) {
+                out->hit_limit = 1;
+                break;
+            }
+            while (carry_len < 4 && pos < end) {
+                if (bam_stream_fused_carry_reserve(&carry, &carry_cap,
+                                                   carry_len + 1) < 0) {
+                    out->ret = -2;
+                    break;
+                }
+                carry[carry_len++] = data[pos++];
+            }
+            if (out->ret < 0)
+                break;
+            if (carry_len < 4) {
+                out->block_off_end = pos;
+                continue;
+            }
+
+            block_len = le_to_i32(carry);
+            if (block_len < 32) {
+                out->ret = -4;
+                break;
+            }
+            frame_len = 4 + (size_t)block_len;
+            if (bam_stream_fused_carry_reserve(&carry, &carry_cap,
+                                               frame_len) < 0) {
+                out->ret = -2;
+                break;
+            }
+            need = frame_len - carry_len;
+            avail = end - pos;
+            if (need > avail)
+                need = avail;
+            memcpy(carry + carry_len, data + pos, need);
+            carry_len += need;
+            pos += need;
+            if (carry_len < frame_len) {
+                out->block_off_end = pos;
+                continue;
+            }
+
+            if (bam_validate1_body_core(block_len, carry + 4) < 0) {
+                out->ret = -4;
+                break;
+            }
+            if (!bam_body_header_valid(carry + 4, job->h)) {
+                out->ret = -3;
+                break;
+            }
+            voff_end = bam_stream_block_voff(block, pos);
+            ret = bam_stream_fused_append_copied_view(
+                    out, &m_views, carry, frame_len, carry_voff_beg,
+                    voff_end, job->h);
+            if (ret < 0) {
+                out->ret = ret;
+                break;
+            }
+            carry_len = 0;
+        }
+
+        while (pos + 4 <= end) {
+            int32_t block_len = le_to_i32(data + pos);
+            size_t frame_len;
+            uint64_t voff_beg =
+                job->need_voff || job->limit_voff != UINT64_MAX
+                ? bam_stream_block_voff(block, pos) : 0;
+            uint64_t voff_end;
+            int ret;
+
+            if (voff_beg >= job->limit_voff) {
+                out->hit_limit = 1;
+                break;
+            }
+            if (block_len < 32) {
+                out->ret = -4;
+                break;
+            }
+            frame_len = 4 + (size_t)block_len;
+            if (frame_len > end - pos) {
+                if (bam_stream_fused_carry_reserve(&carry, &carry_cap,
+                                                   end - pos) < 0) {
+                    out->ret = -2;
+                    break;
+                }
+                memcpy(carry, data + pos, end - pos);
+                carry_len = end - pos;
+                carry_voff_beg = bam_stream_block_voff(block, pos);
+                pos = end;
+                break;
+            }
+            if (bam_validate1_body_core(block_len, data + pos + 4) < 0) {
+                out->ret = -4;
+                break;
+            }
+            if (!bam_body_header_valid(data + pos + 4, job->h)) {
+                out->ret = -3;
+                break;
+            }
+
+            voff_end = job->need_voff
+                       ? bam_stream_block_voff(block, pos + frame_len) : 0;
+            ret = bam_stream_fused_append_view(
+                    out, &m_views, data + pos, frame_len, voff_beg,
+                    voff_end, job->h);
+            if (ret == 0)
+                ret = bam_stream_parse_job_append_segment(
+                        out, data + pos, frame_len, 0);
+            if (ret < 0) {
+                out->ret = ret;
+                break;
+            }
+            pos += frame_len;
+        }
+
+        if (out->ret == 0 && !out->hit_limit && pos < end &&
+            pos + 4 > end) {
+            if (bam_stream_fused_carry_reserve(&carry, &carry_cap,
+                                               end - pos) < 0) {
+                out->ret = -2;
+                break;
+            }
+            memcpy(carry, data + pos, end - pos);
+            carry_len = end - pos;
+            carry_voff_beg = bam_stream_block_voff(block, pos);
+            pos = end;
+        }
+        out->block_off_end = pos;
+    }
+
+    if (out->ret == 0 && carry_len) {
+        out->carry_out = carry;
+        out->carry_out_len = carry_len;
+        out->carry_out_cap = carry_cap;
+        out->carry_voff_beg = carry_voff_beg;
+        carry = NULL;
+    }
+
+    free(carry);
+    bam_stream_fused_job_free(job);
+    return out;
+}
+
+static void *bam_stream_fused_worker(void *arg)
+{
+    bam_stream_fused_job_t *job = (bam_stream_fused_job_t *)arg;
+    bam_stream_parse_job_t *out;
+    uint8_t *carry = NULL;
+    size_t carry_len = 0, carry_cap = 0;
+    uint8_t *data;
+    size_t start, pos, end, batch_end;
+    int m_views = 0;
+    int copy_mode = 0;
+
+    if (job->n_extra_blocks > 0)
+        return bam_stream_fused_worker_multi(job);
+
+    out = calloc(1, sizeof(*out));
+    if (!out) {
+        bam_stream_fused_job_free(job);
+        return NULL;
+    }
+    out->is_be = job->is_be;
+    out->need_voff = job->need_voff;
+
+    if (!job->already_decoded &&
+        bgzf_decode_block_data(NULL, &job->block) < 0) {
+        out->ret = -2;
+        out->errcode = job->block.errcode ? job->block.errcode
+                                          : BGZF_ERR_ZLIB;
+        bam_stream_fused_job_free(job);
+        return out;
+    }
+
+    out->fused_block = malloc(sizeof(*out->fused_block));
+    if (!out->fused_block) {
+        out->ret = -2;
+        bam_stream_fused_job_free(job);
+        return out;
+    }
+    *out->fused_block = job->block;
+
+    end = job->block.uncomp_len > 0 ? (size_t)job->block.uncomp_len : 0;
+    start = job->start_off <= end ? job->start_off : end;
+    pos = start;
+    batch_end = start;
+    out->block_off_end = pos;
+    if (end == 0) {
+        out->ret = 0;
+        bam_stream_fused_job_free(job);
+        return out;
+    }
+
+    carry = job->carry;
+    carry_len = job->carry_len;
+    carry_cap = job->carry_cap;
+    job->carry = NULL;
+    job->carry_len = job->carry_cap = 0;
+
+    data = out->fused_block->uncomp_data;
+    if (carry_len) {
+        int32_t block_len;
+        size_t frame_len, need, avail;
+        uint64_t voff_end;
+        int ret;
+
+        while (carry_len < 4 && pos < end) {
+            if (bam_stream_fused_carry_reserve(&carry, &carry_cap,
+                                               carry_len + 1) < 0) {
+                out->ret = -2;
+                goto done;
+            }
+            carry[carry_len++] = data[pos++];
+        }
+        if (carry_len < 4) {
+            out->carry_out = carry;
+            out->carry_out_len = carry_len;
+            out->carry_out_cap = carry_cap;
+            out->carry_voff_beg = job->carry_voff_beg;
+            carry = NULL;
+            out->block_off_end = pos;
+            out->ret = 0;
+            goto done;
+        }
+
+        block_len = le_to_i32(carry);
+        if (block_len < 32) {
+            out->ret = -4;
+            goto done;
+        }
+        frame_len = 4 + (size_t)block_len;
+        if (bam_stream_fused_carry_reserve(&carry, &carry_cap,
+                                           frame_len) < 0) {
+            out->ret = -2;
+            goto done;
+        }
+        need = frame_len - carry_len;
+        avail = end - pos;
+        if (need > avail)
+            need = avail;
+        memcpy(carry + carry_len, data + pos, need);
+        carry_len += need;
+        pos += need;
+        if (carry_len < frame_len) {
+            out->carry_out = carry;
+            out->carry_out_len = carry_len;
+            out->carry_out_cap = carry_cap;
+            out->carry_voff_beg = job->carry_voff_beg;
+            carry = NULL;
+            out->block_off_end = pos;
+            out->ret = 0;
+            goto done;
+        }
+
+        if (bam_validate1_body_core(block_len, carry + 4) < 0) {
+            out->ret = -4;
+            goto done;
+        }
+        if (!bam_body_header_valid(carry + 4, job->h)) {
+            out->ret = -3;
+            goto done;
+        }
+        out->data = carry;
+        out->len = frame_len;
+        out->cap = carry_cap;
+        carry = NULL;
+        copy_mode = 1;
+        if (pos < end &&
+            bam_stream_parse_job_reserve_view_data(out, end - pos) < 0) {
+            out->ret = -2;
+            goto done;
+        }
+        voff_end = bam_stream_block_voff(out->fused_block, pos);
+        ret = bam_stream_fused_append_view(out, &m_views, out->data,
+                                           frame_len, job->carry_voff_beg,
+                                           voff_end, job->h);
+        if (ret < 0) {
+            out->ret = ret;
+            goto done;
+        }
+        out->views[out->n_records - 1].flags |= BAM_BATCH_RECORD_F_OWNED;
+        if (bam_stream_parse_job_append_segment(
+                    out, out->data, frame_len,
+                    BAM_BATCH_SEGMENT_F_OWNED) < 0) {
+            out->ret = -2;
+            goto done;
+        }
+        batch_end = pos;
+    }
+
+    while (pos + 4 <= end) {
+        int32_t block_len = le_to_i32(data + pos);
+        size_t frame_len;
+        uint64_t voff_beg = job->need_voff || job->limit_voff != UINT64_MAX
+                             ? bam_stream_block_voff(out->fused_block, pos) : 0;
+        uint64_t voff_end;
+        int ret;
+
+        if (voff_beg >= job->limit_voff) {
+            out->hit_limit = 1;
+            break;
+        }
+        if (block_len < 32) {
+            out->ret = -4;
+            break;
+        }
+        frame_len = 4 + (size_t)block_len;
+        if (frame_len > end - pos) {
+            if (bam_stream_fused_copy_carry_out(
+                        out, data + pos, end - pos,
+                        bam_stream_block_voff(out->fused_block, pos)) < 0)
+                out->ret = -2;
+            pos = end;
+            break;
+        }
+        if (bam_validate1_body_core(block_len, data + pos + 4) < 0) {
+            out->ret = -4;
+            break;
+        }
+        if (!bam_body_header_valid(data + pos + 4, job->h)) {
+            out->ret = -3;
+            break;
+        }
+
+        voff_end = job->need_voff
+                   ? bam_stream_block_voff(out->fused_block, pos + frame_len)
+                   : 0;
+        if (copy_mode) {
+            ret = bam_stream_fused_append_copied_view(
+                    out, &m_views, data + pos, frame_len, voff_beg,
+                    voff_end, job->h);
+        } else {
+            ret = bam_stream_fused_append_view(
+                    out, &m_views, data + pos, frame_len, voff_beg,
+                    voff_end, job->h);
+        }
+        if (ret < 0) {
+            out->ret = ret;
+            break;
+        }
+        pos += frame_len;
+        batch_end = pos;
+    }
+
+    if (out->ret == 0 && pos < end && pos + 4 > end) {
+        if (bam_stream_fused_copy_carry_out(
+                    out, data + pos, end - pos,
+                    bam_stream_block_voff(out->fused_block, pos)) < 0)
+            out->ret = -2;
+        pos = end;
+    }
+    if (!copy_mode) {
+        out->ref_data = data + start;
+        out->len = batch_end - start;
+    }
+    out->block_off_end = pos;
+    out->ret = out->ret ? out->ret : 0;
+
+done:
+    free(carry);
+    bam_stream_fused_job_free(job);
+    return out;
+}
+
+static int bam_stream_parse_job_append_owned_frame(bam_stream_parse_job_t *job,
+                                                  const uint8_t *frame,
+                                                  size_t frame_len)
+{
+    if (bam_stream_parse_job_reserve(job, frame_len) < 0)
+        return -2;
+    memcpy(job->data + job->len, frame, frame_len);
+    job->len += frame_len;
+    job->n_records++;
+    return 0;
+}
+
+static uint64_t bam_stream_parse_job_voff(const bam_stream_parse_job_t *job,
+                                          size_t offset);
+
+static int bam_stream_parse_job_build_views(bam_stream_parse_job_t *job,
+                                            sam_hdr_t *h)
+{
+    bam_batch_record_t *views = NULL;
+    const uint8_t *data = job->data ? job->data : job->ref_data;
+    size_t pos = 0;
+    int expected_records = job->n_records;
+    int n_records = 0, m_views = 0;
+
+    if (!data && job->len) {
+        job->n_records = 0;
+        return -4;
+    }
+    if (expected_records > 0) {
+        views = malloc((size_t)expected_records * sizeof(*views));
+        if (!views) {
+            job->n_records = 0;
+            return -2;
+        }
+        m_views = expected_records;
+    }
+
+    while (pos + 4 <= job->len) {
+        int32_t block_len = le_to_i32(data + pos);
+        size_t frame_len;
+        int vret;
+
+        if (block_len < 32) {
+            free(views);
+            job->n_records = 0;
+            return -4;
+        }
+        frame_len = 4 + (size_t)block_len;
+        if (frame_len > job->len - pos ||
+            bam_validate1_body_core(block_len, data + pos + 4) < 0) {
+            if (n_records > 0) {
+                job->views = views;
+                job->n_records = n_records;
+                return -4;
+            }
+            free(views);
+            job->n_records = 0;
+            return -4;
+        }
+        vret = bam_batch_record_view_append(&views, &n_records, &m_views,
+                                            data + pos, frame_len,
+                                            job->need_voff
+                                            ? bam_stream_parse_job_voff(job, pos) : 0,
+                                            job->need_voff
+                                            ? bam_stream_parse_job_voff(job, pos + frame_len) : 0,
+                                            h);
+        if (vret < 0) {
+            if ((vret == -3 || vret == -4) && n_records > 0) {
+                job->views = views;
+                job->n_records = n_records;
+                return vret;
+            }
+            free(views);
+            job->n_records = 0;
+            return (vret == -3 || vret == -4) ? vret : -2;
+        }
+        if (job->data)
+            views[n_records - 1].flags |= BAM_BATCH_RECORD_F_OWNED;
+        pos += frame_len;
+    }
+
+    if (pos != job->len || n_records != expected_records) {
+        free(views);
+        job->n_records = 0;
+        return -4;
+    }
+    job->views = views;
+    job->n_records = n_records;
+    return 0;
+}
+
+static uint64_t bam_stream_parse_job_voff(const bam_stream_parse_job_t *job,
+                                          size_t offset)
+{
+    size_t block_off;
+
+    if (!job->voff_next) {
+        if (offset == 0)
+            return job->voff_beg;
+        if (offset == job->len)
+            return job->voff_end;
+        return 0;
+    }
+
+    block_off = (size_t)(job->voff_beg & 0xffff) + offset;
+    if (block_off >= 0x10000)
+        return job->voff_next;
+    return (job->voff_beg & ~UINT64_C(0xffff)) | block_off;
+}
+
+static int bam_stream_parse_job_detach_ref_data(bam_stream_parse_job_t *job)
+{
+    uint8_t *data;
+
+    if (job->data || job->owned_block_result)
+        return 0;
+    if (!job->ref_data || !job->len)
+        return -2;
+
+    data = malloc(job->len);
+    if (!data) {
+        errno = ENOMEM;
+        return -2;
+    }
+    memcpy(data, job->ref_data, job->len);
+    job->data = data;
+    job->cap = job->len;
+    job->ref_data = NULL;
+    return 0;
+}
+
+static int bam_stream_reader_extend_owned_job_from_block(
+        bam_stream_reader_t *reader, bam_stream_parse_job_t *job,
+        int build_views, sam_hdr_t *h)
+{
+    BGZF *bgzf = reader->bgzf;
+    uint8_t *data = reader->block->uncomp_data;
+    size_t pos = reader->block_off;
+    size_t end = (size_t)reader->block->uncomp_len;
+
+    while (pos + 4 <= end &&
+           job->n_records < BAM_STREAM_PARSE_BATCH_RECORDS &&
+           job->len < BAM_STREAM_PARSE_BATCH_BYTES) {
+        int32_t block_len = le_to_i32(data + pos);
+        size_t frame_len;
+
+        if (block_len < 32) {
+            reader->pending_frame_error = -4;
+            break;
+        }
+        frame_len = 4 + (size_t)block_len;
+        if (job->len + frame_len > BAM_STREAM_PARSE_BATCH_BYTES)
+            break;
+        if (frame_len > end - pos)
+            break;
+        if (bam_validate1_body_core(block_len, data + pos + 4) < 0) {
+            reader->pending_frame_error = -4;
+            break;
+        }
+        if (!build_views && !bam_body_header_valid(data + pos + 4, h)) {
+            reader->pending_frame_error = -3;
+            errno = ERANGE;
+            break;
+        }
+        if (build_views) {
+            bam_batch_record_t view;
+
+            bam_batch_record_view_set(
+                    &view, data + pos, frame_len,
+                    bam_stream_block_voff(reader->block, pos),
+                    bam_stream_block_voff(reader->block, pos + frame_len));
+            if (!bam_batch_record_view_tid_valid(&view, h)) {
+                reader->pending_frame_error = -3;
+                errno = ERANGE;
+                break;
+            }
+        }
+        if (bam_stream_parse_job_append_owned_frame(job, data + pos,
+                                                   frame_len) < 0)
+            return -2;
+        pos += frame_len;
+    }
+
+    reader->block_off = pos;
+    bgzf->block_offset = (int)reader->block_off;
+
+    if (pos < end && !reader->pending_frame_error &&
+        job->n_records < BAM_STREAM_PARSE_BATCH_RECORDS &&
+        job->len < BAM_STREAM_PARSE_BATCH_BYTES) {
+        if (bam_stream_reader_carry_append(reader, data + pos, end - pos) < 0)
+            return -2;
+        reader->block_off = end;
+        bgzf->block_offset = (int)reader->block_off;
+        bam_stream_reader_release_block(reader);
+    } else if (pos == end || reader->pending_frame_error) {
+        bam_stream_reader_release_block(reader);
+    }
+
+    return 0;
+}
+
+static int bam_stream_reader_build_parse_job(bam_stream_reader_t *reader,
+                                             bam_stream_parse_job_t **job_out,
+                                             int build_views, sam_hdr_t *h,
+                                             uint64_t limit_voff,
+                                             int *hit_limit,
+                                             int need_voff,
+                                             int keep_view_voffs)
+{
+    BGZF *bgzf = reader->bgzf;
+    bam_stream_parse_job_t *job;
+    uint8_t *data;
+    bam_batch_record_t *views = NULL;
+    size_t start, pos, end;
+    int n_records = 0;
+    int m_views = 0;
+
+    if (hit_limit)
+        *hit_limit = 0;
+
+    for (;;) {
+        if (!reader->block ||
+            reader->block_off >= (size_t)reader->block->uncomp_len) {
+            int ret = bam_stream_reader_next_block(reader);
+            if (ret < 0)
+                return -2;
+            if (ret == 0) {
+                int err;
+                reader->parse_input_eof = 1;
+                err = bam_stream_reader_carry_error(reader);
+                return err == -1 ? 0 : err;
+            }
+        }
+
+        data = reader->block->uncomp_data;
+        end = (size_t)reader->block->uncomp_len;
+
+        if (reader->carry_len) {
+            int32_t block_len;
+            size_t frame_len, need, avail;
+
+            if (reader->carry_voff_beg >= limit_voff) {
+                if (hit_limit)
+                    *hit_limit = 1;
+                return 0;
+            }
+            if (reader->carry_len < 4) {
+                need = 4 - reader->carry_len;
+                avail = end - reader->block_off;
+                if (need > avail)
+                    need = avail;
+                if (bam_stream_reader_carry_append(reader,
+                                                   data + reader->block_off,
+                                                   need) < 0)
+                    return -2;
+                reader->block_off += need;
+                bgzf->block_offset = (int)reader->block_off;
+                if (reader->carry_len < 4)
+                    continue;
+            }
+
+            block_len = le_to_i32(reader->carry);
+            if (block_len < 32) {
+                reader->carry_len = 0;
+                return -4;
+            }
+            frame_len = 4 + (size_t)block_len;
+            if (frame_len <= BAM_STREAM_PARSE_BATCH_BYTES &&
+                bam_stream_reader_carry_reserve(reader, frame_len) < 0)
+                return -2;
+            need = frame_len - reader->carry_len;
+            avail = end - reader->block_off;
+            if (need > avail)
+                need = avail;
+            if (bam_stream_reader_carry_append(reader, data + reader->block_off,
+                                               need) < 0)
+                return -2;
+            reader->block_off += need;
+            bgzf->block_offset = (int)reader->block_off;
+            if (reader->carry_len < frame_len)
+                continue;
+            if (!keep_view_voffs &&
+                bam_validate1_body_core(block_len, reader->carry + 4) < 0) {
+                reader->carry_len = 0;
+                return -4;
+            }
+            if (!build_views &&
+                !bam_body_header_valid(reader->carry + 4, h)) {
+                reader->carry_len = 0;
+                errno = ERANGE;
+                return -3;
+            }
+
+            job = calloc(1, sizeof(*job));
+            if (!job)
+                return -2;
+            job->data = reader->carry;
+            job->len = frame_len;
+            job->cap = reader->carry_cap;
+            job->n_records = 1;
+            job->is_be = bgzf->is_be;
+            job->need_voff = need_voff;
+            job->voff_beg = reader->carry_voff_beg;
+            job->voff_end = bgzf_tell(bgzf);
+            reader->carry = NULL;
+            reader->carry_len = reader->carry_cap = 0;
+            if (!build_views && !keep_view_voffs && reader->block_off < end) {
+                int eret = bam_stream_reader_extend_owned_job_from_block(
+                        reader, job, build_views, h);
+                if (eret < 0) {
+                    bam_stream_parse_job_free(job);
+                    return eret;
+                }
+            }
+            if (build_views) {
+                int vret = bam_stream_parse_job_build_views(job, h);
+
+                if (vret < 0) {
+                    bam_stream_parse_job_free(job);
+                    if (vret == -3)
+                        errno = ERANGE;
+                    return vret;
+                }
+            }
+            if (hit_limit)
+                job->hit_limit = *hit_limit;
+            *job_out = job;
+            return 1;
+        }
+
+        start = reader->block_off;
+        pos = start;
+        while (pos + 4 <= end) {
+            int32_t block_len = le_to_i32(data + pos);
+            size_t frame_len;
+            uint64_t voff_beg = need_voff || limit_voff != UINT64_MAX
+                                 ? bam_stream_block_voff(reader->block, pos)
+                                 : 0;
+
+            if (voff_beg >= limit_voff) {
+                if (hit_limit)
+                    *hit_limit = 1;
+                break;
+            }
+            if (block_len < 32) {
+                if (pos == start) {
+                    reader->block_off += 4;
+                    bgzf->block_offset = (int)reader->block_off;
+                    return -4;
+                }
+                reader->pending_frame_error = -4;
+                break;
+            }
+            frame_len = 4 + (size_t)block_len;
+            if (pos + frame_len > end)
+                break;
+            if (!keep_view_voffs &&
+                bam_validate1_body_core(block_len, data + pos + 4) < 0) {
+                if (pos == start) {
+                    reader->block_off += 4 + 32;
+                    bgzf->block_offset = (int)reader->block_off;
+                    return -4;
+                }
+                reader->pending_frame_error = -4;
+                break;
+            }
+            if (!build_views &&
+                !bam_body_header_valid(data + pos + 4, h)) {
+                if (pos == start) {
+                    reader->block_off += 4 + 32;
+                    bgzf->block_offset = (int)reader->block_off;
+                    errno = ERANGE;
+                    return -3;
+                }
+                reader->pending_frame_error = -3;
+                errno = ERANGE;
+                break;
+            }
+            if (build_views) {
+                int vret = bam_batch_record_view_append(
+                        &views, &n_records, &m_views, data + pos, frame_len,
+                        voff_beg,
+                        need_voff ? bam_stream_block_voff(reader->block,
+                                                          pos + frame_len) : 0,
+                        h);
+                if (vret < 0) {
+                    if ((vret == -3 || vret == -4) && n_records > 0) {
+                        reader->pending_frame_error = vret;
+                        break;
+                    }
+                    free(views);
+                    return (vret == -3 || vret == -4) ? vret : -2;
+                }
+            }
+            pos += frame_len;
+            if (!build_views)
+                n_records++;
+        }
+
+        if (n_records == 0 && hit_limit && *hit_limit) {
+            free(views);
+            return 0;
+        }
+
+        if (n_records > 0) {
+            job = calloc(1, sizeof(*job));
+            if (!job) {
+                free(views);
+                return -2;
+            }
+            job->ref_data = data + start;
+            job->len = pos - start;
+            job->n_records = n_records;
+            job->is_be = bgzf->is_be;
+            job->hit_limit = hit_limit ? *hit_limit : 0;
+            job->need_voff = need_voff;
+            if (need_voff) {
+                job->voff_beg = bam_stream_block_voff(reader->block, start);
+                job->voff_end = bam_stream_block_voff(reader->block, pos);
+                job->voff_next =
+                    ((uint64_t)(reader->block->block_address +
+                                reader->block->comp_len)) << 16;
+            }
+            job->views = views;
+            views = NULL;
+            reader->block_off = pos;
+            bgzf->block_offset = (int)reader->block_off;
+
+            if (pos < end && !reader->pending_frame_error &&
+                !(hit_limit && *hit_limit)) {
+                if (bam_stream_reader_carry_reserve_frame(reader, data, pos,
+                                                          end) < 0) {
+                    bam_stream_parse_job_free(job);
+                    return -2;
+                }
+                if (bam_stream_reader_carry_append(reader, data + pos,
+                                                   end - pos) < 0) {
+                    bam_stream_parse_job_free(job);
+                    return -2;
+                }
+                reader->block_off = end;
+                bgzf->block_offset = (int)reader->block_off;
+            }
+
+            if (!(hit_limit && *hit_limit)) {
+                job->owned_block_result = reader->block_result;
+                reader->block_result = NULL;
+                reader->block = NULL;
+            }
+            *job_out = job;
+            return 1;
+        }
+
+        if (pos < end) {
+            if (bam_stream_reader_carry_reserve_frame(reader, data, pos,
+                                                      end) < 0)
+                return -2;
+            if (bam_stream_reader_carry_append(reader, data + pos,
+                                               end - pos) < 0)
+                return -2;
+            reader->block_off = end;
+            bgzf->block_offset = (int)reader->block_off;
+            bam_stream_reader_release_block(reader);
+            continue;
+        }
+
+        bam_stream_reader_release_block(reader);
+    }
+}
+
+static int bam_stream_reader_dispatch_parse(bam_stream_reader_t *reader,
+                                            bam_stream_parse_job_t *job,
+                                            int build_views)
+{
+    if (bam_stream_parse_job_detach_ref_data(job) < 0) {
+        bam_stream_parse_job_free(job);
+        return -1;
+    }
+    if (hts_tpool_dispatch3(reader->pool, reader->parse_q,
+                            build_views ? bam_stream_parse_view_worker
+                                        : bam_stream_parse_worker,
+                            job,
+                            bam_stream_parse_job_free,
+                            bam_stream_parse_job_free, 0) < 0) {
+        bam_stream_parse_job_free(job);
+        return -1;
+    }
+    reader->parse_in_flight++;
+    return 0;
+}
+
+static int bam_stream_reader_fill_parse(bam_stream_reader_t *reader)
+{
+    while (!reader->parse_input_eof && !reader->parse_input_error &&
+           !reader->pending_frame_error &&
+           reader->parse_in_flight < reader->qsize) {
+        bam_stream_parse_job_t *job = NULL;
+        int ret = bam_stream_reader_build_parse_job(reader, &job, 0, NULL,
+                                                    UINT64_MAX, NULL, 0, 0);
+
+        if (ret > 0) {
+            if (bam_stream_reader_dispatch_parse(reader, job, 0) < 0) {
+                reader->parse_input_error = -2;
+                return -1;
+            }
+        } else if (ret == 0) {
+            break;
+        } else {
+            reader->parse_input_error = ret;
+            return -1;
+        }
+    }
+
+    return reader->parse_input_error ? -1 : 0;
+}
+
+static void bam_stream_reader_release_parse_batch(bam_stream_reader_t *reader)
+{
+    if (reader->parse_result) {
+        hts_tpool_delete_result(reader->parse_result, 1);
+        reader->parse_result = NULL;
+    }
+    reader->parse_batch = NULL;
+    reader->parse_i = 0;
+}
+
+static int bam_stream_reader_next_parsed(bam_stream_reader_t *reader, bam1_t *b)
+{
+    for (;;) {
+        if (reader->parse_batch) {
+            bam_stream_parse_job_t *job = reader->parse_batch;
+
+            if (reader->parse_i < (size_t)job->n_parsed) {
+                bam1_t *src = &job->records[reader->parse_i++];
+                if ((bam_get_mempolicy(b) & BAM_USER_OWNS_DATA) != 0) {
+                    if (bam_copy1(b, src) < 0)
+                        return -4;
+                } else {
+                    free(b->data);
+                    *b = *src;
+                    src->data = NULL;
+                    src->l_data = src->m_data = 0;
+                }
+                return 36 + b->l_data - b->core.l_extranul;
+            }
+
+            if (job->ret < 0) {
+                int ret = job->ret;
+                bam_stream_reader_release_parse_batch(reader);
+                return ret;
+            }
+            bam_stream_reader_release_parse_batch(reader);
+        }
+
+        if (bam_stream_reader_fill_parse(reader) < 0 &&
+            reader->parse_in_flight == 0)
+            return reader->parse_input_error;
+
+        if (reader->parse_in_flight == 0) {
+            if (reader->pending_frame_error) {
+                int ret = reader->pending_frame_error;
+                reader->pending_frame_error = 0;
+                if (ret == -3)
+                    errno = ERANGE;
+                return ret;
+            }
+            if (reader->parse_input_error)
+                return reader->parse_input_error;
+            if (reader->parse_input_eof)
+                return -1;
+        }
+
+        if (reader->parse_in_flight > 0) {
+            hts_tpool_result *result =
+                hts_tpool_next_result_wait(reader->parse_q);
+            if (!result) {
+                reader->parse_input_error = -2;
+                return -2;
+            }
+            reader->parse_in_flight--;
+            reader->parse_result = result;
+            reader->parse_batch =
+                (bam_stream_parse_job_t *)hts_tpool_result_data(result);
+            reader->parse_i = 0;
+        }
+    }
+}
+
+static int bam_stream_reader_next(bam_stream_reader_t *reader, bam1_t *b)
+{
+    if (reader->parse_q)
+        return bam_stream_reader_next_parsed(reader, b);
+    return bam_stream_reader_next_serial(reader, b);
+}
+
+static void bam_stream_reader_reset_parse_queue(bam_stream_reader_t *reader)
+{
+    if (!reader->parse_q)
+        return;
+    if (reader->parse_result) {
+        hts_tpool_delete_result(reader->parse_result, 1);
+        reader->parse_result = NULL;
+    }
+    reader->parse_batch = NULL;
+    reader->parse_i = 0;
+    hts_tpool_process_reset(reader->parse_q, 1);
+    reader->parse_in_flight = 0;
+    reader->parse_hit_limit = 0;
+}
+
+static int bam_stream_reader_fill_view_parse(bam_stream_reader_t *reader,
+                                             sam_hdr_t *h,
+                                             uint64_t limit_voff,
+                                             int need_voff)
+{
+    while (!reader->parse_input_eof && !reader->parse_input_error &&
+           !reader->pending_frame_error && !reader->parse_hit_limit &&
+           reader->parse_in_flight < reader->qsize) {
+        bam_stream_parse_job_t *job = NULL;
+        int hit_limit = 0;
+        int ret = bam_stream_reader_build_parse_job(reader, &job, 0, h,
+                                                    limit_voff, &hit_limit,
+                                                    need_voff, 1);
+
+        if (ret > 0) {
+            job->view_header = h;
+            job->hit_limit = hit_limit;
+            job->need_voff = need_voff;
+            if (bam_stream_reader_dispatch_parse(reader, job, 1) < 0) {
+                reader->parse_input_error = -2;
+                reader->parse_input_eof = 1;
+                return -1;
+            }
+            if (hit_limit) {
+                reader->parse_hit_limit = 1;
+                break;
+            }
+        } else if (ret == 0) {
+            if (hit_limit)
+                reader->parse_hit_limit = 1;
+            break;
+        } else {
+            reader->parse_input_error = ret;
+            reader->parse_input_eof = 1;
+            if (ret == -3)
+                errno = ERANGE;
+            return -1;
+        }
+    }
+
+    return reader->parse_input_error ? -1 : 0;
+}
+
+static int bam_stream_reader_next_view_job(bam_stream_reader_t *reader,
+                                           sam_hdr_t *h,
+                                           bam_stream_parse_job_t **job_out,
+                                           uint64_t limit_voff,
+                                           int *hit_limit,
+                                           int need_voff)
+{
+    *job_out = NULL;
+    if (hit_limit)
+        *hit_limit = 0;
+
+    for (;;) {
+        if (!reader->parse_input_eof && !reader->parse_input_error &&
+            !reader->pending_frame_error && !reader->parse_hit_limit &&
+            bam_stream_reader_fill_view_parse(reader, h, limit_voff,
+                                              need_voff) < 0 &&
+            reader->parse_in_flight == 0)
+            return reader->parse_input_error;
+
+        if (reader->parse_in_flight > 0) {
+            hts_tpool_result *result =
+                hts_tpool_next_result_wait(reader->parse_q);
+            bam_stream_parse_job_t *job;
+
+            if (!result) {
+                reader->parse_input_error = -2;
+                reader->parse_input_eof = 1;
+                return -2;
+            }
+            reader->parse_in_flight--;
+            job = (bam_stream_parse_job_t *)hts_tpool_result_data(result);
+            hts_tpool_delete_result(result, 0);
+
+            if (job->ret < 0) {
+                int ret = job->ret;
+
+                if (job->views && job->n_records > 0) {
+                    reader->pending_frame_error = ret;
+                    reader->parse_input_eof = 1;
+                    bam_stream_reader_reset_parse_queue(reader);
+                    *job_out = job;
+                    return job->n_records;
+                }
+
+                bam_stream_parse_job_free(job);
+                reader->parse_input_eof = 1;
+                bam_stream_reader_reset_parse_queue(reader);
+                if (ret == -3)
+                    errno = ERANGE;
+                return ret;
+            }
+
+            if (!job->views) {
+                bam_stream_parse_job_free(job);
+                reader->parse_input_error = -2;
+                reader->parse_input_eof = 1;
+                bam_stream_reader_reset_parse_queue(reader);
+                return -2;
+            }
+
+            if (hit_limit)
+                *hit_limit = job->hit_limit;
+            if (job->hit_limit)
+                reader->parse_hit_limit = 0;
+            *job_out = job;
+            return job->n_records;
+        }
+
+        if (reader->pending_frame_error) {
+            int ret = reader->pending_frame_error;
+
+            reader->pending_frame_error = 0;
+            reader->parse_input_eof = 1;
+            if (ret == -3)
+                errno = ERANGE;
+            return ret;
+        }
+        if (reader->parse_input_error)
+            return reader->parse_input_error;
+        if (reader->parse_hit_limit) {
+            reader->parse_hit_limit = 0;
+            if (hit_limit)
+                *hit_limit = 1;
+            return 0;
+        }
+        if (reader->parse_input_eof)
+            return 0;
+    }
+}
+
+static int bam_stream_reader_dispatch_fused(bam_stream_reader_t *reader,
+                                            sam_hdr_t *h,
+                                            uint64_t limit_voff,
+                                            int need_voff)
+{
+    bam_stream_fused_job_t *job;
+    int stop_after_first = 0;
+
+    if (reader->input_eof || reader->input_error)
+        return reader->input_error ? -1 : 0;
+
+    if (reader->block &&
+        reader->block_off >= (size_t)reader->block->uncomp_len)
+        bam_stream_reader_release_block(reader);
+
+    job = calloc(1, sizeof(*job));
+    if (!job)
+        return -1;
+    job->h = h;
+    job->is_be = reader->bgzf->is_be;
+    job->limit_voff = limit_voff;
+    job->need_voff = need_voff;
+
+    if (reader->block) {
+        job->block = *reader->block;
+        job->start_off = reader->block_off;
+        job->already_decoded = 1;
+        if (job->block.uncomp_len == 0) {
+            stop_after_first = 1;
+            reader->input_paused_after_empty = 1;
+        }
+        bam_stream_reader_release_block(reader);
+    } else {
+        job->start_off = reader->seek_block_off;
+        reader->seek_block_off = 0;
+        if (bgzf_read_block_compressed(reader->bgzf, &job->block) < 0) {
+            free(job);
+            reader->input_error = 1;
+            return -1;
+        }
+        if (job->block.hit_eof) {
+            free(job);
+            reader->input_eof = 1;
+            if (reader->carry_len) {
+                reader->pending_frame_error =
+                    bam_stream_reader_carry_error(reader);
+                free(reader->carry);
+                reader->carry = NULL;
+                reader->carry_len = reader->carry_cap = 0;
+            }
+            return 0;
+        }
+        if (le_to_u32(job->block.comp_data + job->block.comp_len - 4) == 0) {
+            stop_after_first = 1;
+            reader->input_paused_after_empty = 1;
+        }
+    }
+
+    while (!stop_after_first &&
+           1 + job->n_extra_blocks < BAM_STREAM_FUSED_BLOCKS_PER_JOB) {
+        bgzf_block_data_t *new_blocks, *block;
+
+        new_blocks = realloc(job->extra_blocks,
+                             (size_t)(job->n_extra_blocks + 1) *
+                             sizeof(*job->extra_blocks));
+        if (!new_blocks)
+            break;
+        job->extra_blocks = new_blocks;
+        block = &job->extra_blocks[job->n_extra_blocks];
+        memset(block, 0, sizeof(*block));
+
+        if (bgzf_read_block_compressed(reader->bgzf, block) < 0) {
+            reader->input_error = 1;
+            break;
+        }
+        if (block->hit_eof) {
+            reader->input_eof = 1;
+            break;
+        }
+        job->n_extra_blocks++;
+        if (le_to_u32(block->comp_data + block->comp_len - 4) == 0) {
+            reader->input_paused_after_empty = 1;
+            break;
+        }
+    }
+
+    job->carry = reader->carry;
+    job->carry_len = reader->carry_len;
+    job->carry_cap = reader->carry_cap;
+    job->carry_voff_beg = reader->carry_voff_beg;
+    reader->carry = NULL;
+    reader->carry_len = reader->carry_cap = 0;
+
+    if (hts_tpool_dispatch3(reader->pool, reader->fused_q,
+                            bam_stream_fused_worker, job,
+                            bam_stream_fused_job_free,
+                            bam_stream_parse_job_free, 0) < 0) {
+        bam_stream_fused_job_free(job);
+        reader->input_error = 1;
+        return -1;
+    }
+    reader->fused_in_flight++;
+    return 1;
+}
+
+static int bam_stream_reader_fill_fused(bam_stream_reader_t *reader,
+                                        sam_hdr_t *h,
+                                        uint64_t limit_voff,
+                                        int need_voff)
+{
+    while (!reader->input_eof && !reader->input_error &&
+           !reader->input_paused_after_empty &&
+           !reader->pending_frame_error &&
+           !reader->parse_hit_limit &&
+           reader->fused_in_flight < BAM_STREAM_FUSED_MAX_IN_FLIGHT) {
+        int ret = bam_stream_reader_dispatch_fused(reader, h, limit_voff,
+                                                   need_voff);
+
+        if (ret < 0) {
+            reader->parse_input_error = -2;
+            return -1;
+        }
+        if (ret == 0)
+            break;
+    }
+    return reader->parse_input_error ? -1 : 0;
+}
+
+static void bam_stream_reader_accept_fused_carry(
+        bam_stream_reader_t *reader, bam_stream_parse_job_t *job)
+{
+    if (!job->carry_out)
+        return;
+    free(reader->carry);
+    reader->carry = job->carry_out;
+    reader->carry_len = job->carry_out_len;
+    reader->carry_cap = job->carry_out_cap;
+    reader->carry_voff_beg = job->carry_voff_beg;
+    job->carry_out = NULL;
+    job->carry_out_len = job->carry_out_cap = 0;
+    if (reader->input_eof && reader->carry_len) {
+        reader->pending_frame_error = bam_stream_reader_carry_error(reader);
+        free(reader->carry);
+        reader->carry = NULL;
+        reader->carry_len = reader->carry_cap = 0;
+    }
+}
+
+static int bam_stream_reader_update_fused_block(bam_stream_reader_t *reader,
+                                                bam_stream_parse_job_t *job)
+{
+    BGZF *bgzf = reader->bgzf;
+    bgzf_block_data_t *block = job->fused_blocks && job->n_fused_blocks > 0
+                               ? &job->fused_blocks[job->n_fused_blocks - 1]
+                               : job->fused_block;
+    size_t block_off;
+    int i;
+
+    if (job->errcode && job->n_records <= 0) {
+        bgzf->errcode |= job->errcode;
+        return -2;
+    }
+    if (!block)
+        return -2;
+    if (job->fused_blocks) {
+        for (i = 0; i < job->n_fused_blocks; i++) {
+            if (bgzf_block_data_update_index(bgzf, &job->fused_blocks[i]) < 0)
+                return -2;
+        }
+    } else if (bgzf_block_data_update_index(bgzf, block) < 0) {
+        return -2;
+    }
+
+    block_off = job->block_off_end <= (size_t)block->uncomp_len
+                ? job->block_off_end : (size_t)block->uncomp_len;
+    bgzf->block_address = block->block_address;
+    bgzf->block_clength = block->comp_len;
+    bgzf->block_length = block->uncomp_len;
+    bgzf->block_offset = (int)block_off;
+    if (job->errcode)
+        bgzf->errcode |= job->errcode;
+    if (block->uncomp_len == 0)
+        reader->input_paused_after_empty = 0;
+    return 0;
+}
+
+static int bam_stream_reader_next_fused_job(bam_stream_reader_t *reader,
+                                            sam_hdr_t *h,
+                                            bam_stream_parse_job_t **job_out,
+                                            uint64_t limit_voff,
+                                            int *hit_limit,
+                                            int need_voff)
+{
+    *job_out = NULL;
+    if (hit_limit)
+        *hit_limit = 0;
+
+    for (;;) {
+        if (reader->fused_in_flight == 0 &&
+            !reader->input_eof && !reader->input_error &&
+            !reader->pending_frame_error && !reader->parse_hit_limit &&
+            bam_stream_reader_fill_fused(reader, h, limit_voff,
+                                         need_voff) < 0 &&
+            reader->fused_in_flight == 0)
+            return reader->parse_input_error;
+
+        if (reader->fused_in_flight > 0) {
+            hts_tpool_result *result =
+                hts_tpool_next_result_wait(reader->fused_q);
+            bam_stream_parse_job_t *job;
+
+            if (!result) {
+                reader->parse_input_error = -2;
+                reader->input_eof = 1;
+                return -2;
+            }
+            reader->fused_in_flight--;
+            job = (bam_stream_parse_job_t *)hts_tpool_result_data(result);
+            hts_tpool_delete_result(result, 0);
+            if (!job) {
+                reader->parse_input_error = -2;
+                reader->input_eof = 1;
+                return -2;
+            }
+
+            if (bam_stream_reader_update_fused_block(reader, job) < 0) {
+                int ret = job->errcode ? -2 : -2;
+                bam_stream_parse_job_free(job);
+                reader->parse_input_error = ret;
+                reader->input_eof = 1;
+                return ret;
+            }
+            bam_stream_reader_accept_fused_carry(reader, job);
+
+            if (job->ret < 0) {
+                int ret = job->ret;
+
+                if (job->views && job->n_records > 0) {
+                    reader->pending_frame_error = ret;
+                    reader->input_eof = 1;
+                    *job_out = job;
+                    return job->n_records;
+                }
+
+                bam_stream_parse_job_free(job);
+                reader->input_eof = 1;
+                if (ret == -3)
+                    errno = ERANGE;
+                return ret;
+            }
+
+            if (hit_limit)
+                *hit_limit = job->hit_limit;
+            if (job->hit_limit)
+                reader->parse_hit_limit = 1;
+
+            if (job->views && job->n_records > 0) {
+                if (!job->hit_limit && !reader->pending_frame_error)
+                    (void)bam_stream_reader_fill_fused(reader, h,
+                                                       limit_voff, need_voff);
+                *job_out = job;
+                return job->n_records;
+            }
+
+            bam_stream_parse_job_free(job);
+            if (reader->parse_hit_limit) {
+                reader->parse_hit_limit = 0;
+                if (hit_limit)
+                    *hit_limit = 1;
+                return 0;
+            }
+            continue;
+        }
+
+        if (reader->pending_frame_error) {
+            int ret = reader->pending_frame_error;
+
+            reader->pending_frame_error = 0;
+            reader->input_eof = 1;
+            if (ret == -3)
+                errno = ERANGE;
+            return ret;
+        }
+        if (reader->parse_input_error)
+            return reader->parse_input_error;
+        if (reader->input_error)
+            return -2;
+        if (reader->input_eof)
+            return 0;
+    }
+}
+
+void sam_bam_batch_destroy(bam_batch_t *batch)
+{
+    if (!batch)
+        return;
+    if (batch->impl)
+        bam_stream_parse_job_free(batch->impl);
+    memset(batch, 0, sizeof(*batch));
+}
+
+int sam_bam_batch_record_to_bam1(const bam_batch_record_t *record, bam1_t *bam)
+{
+    BGZF fake_bgzf = {0};
+    int32_t block_len;
+
+    if (!record || !bam || !record->frame || record->frame_len < 36 ||
+        record->frame_len - 4 > INT32_MAX)
+        return -2;
+
+    block_len = (int32_t)(record->frame_len - 4);
+    fake_bgzf.is_be = ed_is_big();
+    return bam_decode1_body(fake_bgzf.is_be ? &fake_bgzf : NULL, bam,
+                            block_len, record->frame + 4);
+}
+
+static int sam_bam_batch_record_materialize_validated(
+        const bam_batch_record_t *record, bam1_t *scratch, int *materialized)
+{
+    if (!scratch) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (sam_bam_batch_record_to_bam1(record, scratch) < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (materialized)
+        *materialized = 1;
+    return 0;
+}
+
+static int sam_bam_batch_record_cg_fixup_needed(
+        const bam_batch_record_t *record, int *needed)
+{
+    sam_bam_record_view_t view;
+    const uint8_t *cg;
+
+    *needed = 0;
+    if (!sam_bam_batch_record_cg_candidate(record))
+        return 0;
+
+    sam_bam_record_view_from_batch(&view, record);
+    cg = sam_bam_record_view_aux_get(&view, "CG");
+    if (!cg) {
+        if (errno == EINVAL)
+            return -1;
+        return 0;
+    }
+    if (*cg == 'B' && (cg[1] == 'I' || cg[1] == 'i')) {
+        uint32_t cg_len = le_to_u32(cg + 2);
+
+        if (cg_len >= record->core.n_cigar && cg_len < 1U << 29)
+            *needed = 1;
+    }
+    return 0;
+}
+
+static int sam_bam_batch_record_decode_status(
+        bam_batch_record_t *record, int *needs_materialize)
+{
+    const uint8_t *cigar;
+    hts_pos_t rlen = 0, qlen = 0;
+    int cg_fixup = 0, k;
+
+    *needs_materialize = 0;
+    if (!record || !record->body || record->core.l_qname < 1) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (record->flags & BAM_BATCH_RECORD_F_RAW_WRITE_SAFE)
+        return 0;
+    if (record->flags & BAM_BATCH_RECORD_F_NEEDS_MATERIALIZE) {
+        *needs_materialize = 1;
+        return 0;
+    }
+
+    if (sam_bam_batch_record_qname(record)[record->core.l_qname - 1] != '\0') {
+        *needs_materialize = 1;
+        record->flags |= BAM_BATCH_RECORD_F_NEEDS_MATERIALIZE;
+        return 0;
+    }
+
+    if (sam_bam_batch_record_cg_fixup_needed(record, &cg_fixup) < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (cg_fixup) {
+        *needs_materialize = 1;
+        record->flags |= BAM_BATCH_RECORD_F_NEEDS_MATERIALIZE;
+        return 0;
+    }
+
+    if (record->core.n_cigar == 0) {
+        record->endpos = record->core.pos + 1;
+        record->flags |= BAM_BATCH_RECORD_F_RAW_WRITE_SAFE |
+                         BAM_BATCH_RECORD_F_ENDPOS_VALID;
+        return 0;
+    }
+
+    cigar = sam_bam_batch_record_cigar(record);
+    for (k = 0; k < record->core.n_cigar; k++) {
+        uint32_t c = le_to_u32(cigar + ((size_t)k << 2));
+        int op = bam_cigar_op(c);
+
+        if (bam_cigar_type(op) & 2)
+            rlen += bam_cigar_oplen(c);
+        if (bam_cigar_type(op) & 1)
+            qlen += bam_cigar_oplen(c);
+    }
+    if ((record->core.flag & BAM_FUNMAP) || rlen == 0)
+        rlen = 1;
+    if (record->core.bin != hts_reg2bin(record->core.pos,
+                                        record->core.pos + rlen, 14, 5)) {
+        *needs_materialize = 1;
+        record->flags |= BAM_BATCH_RECORD_F_NEEDS_MATERIALIZE;
+        return 0;
+    }
+    if (record->core.l_qseq > 0 && !(record->core.flag & BAM_FUNMAP) &&
+        qlen != record->core.l_qseq) {
+        int qname_len = record->core.l_qname > 0 ? record->core.l_qname - 1 : 0;
+        hts_log_error("CIGAR and query sequence lengths differ for %.*s",
+                      qname_len, sam_bam_batch_record_qname(record));
+        errno = EINVAL;
+        return -1;
+    }
+    record->endpos = record->core.pos + rlen;
+    record->flags |= BAM_BATCH_RECORD_F_RAW_WRITE_SAFE |
+                     BAM_BATCH_RECORD_F_ENDPOS_VALID;
+    return 0;
+}
+
+int sam_bam_batch_record_validate_decode(bam_batch_record_t *record,
+                                         bam1_t *scratch, int *materialized)
+{
+    int needs_materialize = 0;
+
+    if (materialized)
+        *materialized = 0;
+    if (sam_bam_batch_record_decode_status(record, &needs_materialize) < 0)
+        return -1;
+    if (needs_materialize)
+        return sam_bam_batch_record_materialize_validated(record, scratch,
+                                                         materialized);
+    return 0;
+}
+
+static int sam_bam_batch_record_raw_layout_valid(bam_batch_record_t *record)
+{
+    size_t raw_l_data, need, seq_len;
+
+    if (record && (record->flags & BAM_BATCH_RECORD_F_RAW_LAYOUT_VALID))
+        return 0;
+
+    if (!record || !record->frame || !record->body ||
+        record->frame_len < 36 || record->frame_len > INT_MAX ||
+        record->frame + 36 != record->body ||
+        record->raw_l_data != record->frame_len - 36 ||
+        le_to_i32(record->frame) != (int32_t)(record->frame_len - 4) ||
+        record->core.l_qname < 1 || record->core.l_qseq < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    raw_l_data = record->raw_l_data;
+    need = (size_t)record->core.l_qname;
+    if (need > raw_l_data ||
+        (size_t)record->core.n_cigar > (SIZE_MAX - need) >> 2) {
+        errno = EINVAL;
+        return -1;
+    }
+    need += (size_t)record->core.n_cigar << 2;
+    seq_len = ((size_t)record->core.l_qseq + 1) >> 1;
+    if (seq_len > SIZE_MAX - need) {
+        errno = EINVAL;
+        return -1;
+    }
+    need += seq_len;
+    if ((size_t)record->core.l_qseq > SIZE_MAX - need) {
+        errno = EINVAL;
+        return -1;
+    }
+    need += (size_t)record->core.l_qseq;
+    if (need > raw_l_data) {
+        errno = EINVAL;
+        return -1;
+    }
+    record->flags |= BAM_BATCH_RECORD_F_RAW_LAYOUT_VALID;
+    return 0;
+}
+
+static int sam_bam_batch_record_raw_write_safe(
+        bam_batch_record_t *record)
+{
+    int needs_materialize = 0;
+
+    if (sam_bam_batch_record_raw_layout_valid(record) < 0)
+        return -1;
+    if (sam_bam_batch_record_decode_status(record, &needs_materialize) < 0)
+        return -1;
+    return needs_materialize ? 1 : 0;
+}
+
+int sam_bam_batch_record_raw_write_status(bam_batch_record_t *record)
+{
+    return sam_bam_batch_record_raw_write_safe(record);
+}
+
+static int sam_bam_raw_write_get_bgzf_common(htsFile *fp, BGZF **bfp,
+                                             int allow_hts_index)
+{
+    if (!fp || !fp->is_write || !fp->is_bgzf || !fp->fp.bgzf) {
+        errno = EINVAL;
+        return -2;
+    }
+    if (fp->format.format != bam)
+        return -2;
+    *bfp = fp->fp.bgzf;
+    if ((!allow_hts_index && fp->idx) || (*bfp)->idx ||
+        (*bfp)->idx_build_otf) {
+        errno = EINVAL;
+        return -2;
+    }
+    return 0;
+}
+
+static int sam_bam_raw_write_get_bgzf(htsFile *fp, BGZF **bfp)
+{
+    return sam_bam_raw_write_get_bgzf_common(fp, bfp, 0);
+}
+
+static int sam_bam_raw_write_get_bgzf_indexed(htsFile *fp, BGZF **bfp)
+{
+    return sam_bam_raw_write_get_bgzf_common(fp, bfp, 1);
+}
+
+static int sam_bam_raw_write_frames_bgzf(BGZF *bfp, const void *data, size_t len)
+{
+    if (!bfp || !data || len == 0) {
+        errno = EINVAL;
+        return -2;
+    }
+#ifdef SSIZE_MAX
+    if (len > (size_t)SSIZE_MAX) {
+        errno = EOVERFLOW;
+        return -2;
+    }
+#endif
+
+    if (bfp->is_compressed && bgzf_flush_try(bfp, len) < 0)
+        return -1;
+    return bgzf_write_small(bfp, data, len) == (ssize_t)len ? 0 : -1;
+}
+
+static int sam_bam_raw_write_frames(htsFile *fp, const void *data, size_t len)
+{
+    BGZF *bfp;
+
+    if (sam_bam_raw_write_get_bgzf(fp, &bfp) < 0)
+        return -2;
+    return sam_bam_raw_write_frames_bgzf(bfp, data, len);
+}
+
+#define BAM_BATCH_PACKED_WRITE_MAX (1024 * 1024)
+
+static int sam_bam_batch_write1_ranges_packed(BGZF *bfp,
+                                              const bam_batch_t *batch,
+                                              const int *ranges,
+                                              int n_ranges,
+                                              size_t total_len)
+{
+    uint8_t *buf, *dst;
+    int ri;
+
+    buf = malloc(total_len);
+    if (!buf) {
+        errno = ENOMEM;
+        return -2;
+    }
+    dst = buf;
+    for (ri = 0; ri < n_ranges; ri++) {
+        int i, beg = ranges[ri * 2], end_i = ranges[ri * 2 + 1];
+
+        for (i = beg; i < end_i; i++) {
+            bam_batch_record_t *rec = &batch->records[i];
+
+            memcpy(dst, rec->frame, rec->frame_len);
+            dst += rec->frame_len;
+        }
+    }
+
+    if (sam_bam_raw_write_frames_bgzf(bfp, buf, total_len) < 0) {
+        free(buf);
+        return -1;
+    }
+    free(buf);
+    return 0;
+}
+
+static int sam_bam_raw_write_index_push(htsFile *fp, const sam_hdr_t *h,
+                                        BGZF *bfp, bam_batch_record_t *record)
+{
+    hts_pos_t endpos;
+
+    if (!fp->idx)
+        return 0;
+    if (sam_bam_batch_record_endpos(record, NULL, &endpos) < 0)
+        return -2;
+    if (bgzf_idx_push(bfp, fp->idx, record->core.tid, record->core.pos,
+                      endpos, bgzf_tell(bfp),
+                      !(record->core.flag & BAM_FUNMAP)) < 0) {
+        int qname_len = record->core.l_qname > 0 ? record->core.l_qname - 1 : 0;
+        const char *rname = h && record->core.tid >= 0
+                            ? sam_hdr_tid2name(h, record->core.tid) : "*";
+        hts_pos_t rlen = h && record->core.tid >= 0
+                         ? sam_hdr_tid2len(h, record->core.tid) : 0;
+
+        hts_log_error("Read '%.*s' with ref_name='%s', ref_length=%"PRIhts_pos", flags=%d, pos=%"PRIhts_pos" cannot be indexed",
+                      qname_len, sam_bam_batch_record_qname(record),
+                      rname ? rname : "*", rlen, record->core.flag,
+                      record->core.pos + 1);
+        return -1;
+    }
+    return 0;
+}
+
+static int sam_bam_raw_write_record_indexed(htsFile *fp, const sam_hdr_t *h,
+                                            bam_batch_record_t *record)
+{
+    BGZF *bfp;
+    hts_pos_t endpos;
+    int ret;
+
+    if (sam_bam_raw_write_get_bgzf_indexed(fp, &bfp) < 0)
+        return -2;
+    if (fp->idx && sam_bam_batch_record_endpos(record, NULL, &endpos) < 0)
+        return -2;
+    if (bfp->is_compressed && bgzf_flush_try(bfp, record->frame_len) < 0)
+        return -1;
+    if (fp->idx && !bfp->mt)
+        hts_idx_amend_last(fp->idx, bgzf_tell(bfp));
+    if (bgzf_write_small(bfp, record->frame, record->frame_len) !=
+        (ssize_t)record->frame_len)
+        return -1;
+    ret = sam_bam_raw_write_index_push(fp, h, bfp, record);
+    return ret < 0 ? ret : 0;
+}
+
+static int sam_bam_batch_write1_range_indexed(htsFile *fp, const sam_hdr_t *h,
+                                              const bam_batch_t *batch,
+                                              int beg, int end_i)
+{
+    int i;
+
+    if (!batch || beg < 0 || end_i < beg || end_i > batch->n_records ||
+        (end_i > beg && !batch->records)) {
+        errno = EINVAL;
+        return -2;
+    }
+    for (i = beg; i < end_i; i++) {
+        bam_batch_record_t *rec = &batch->records[i];
+        hts_pos_t endpos;
+
+        if (sam_bam_batch_record_raw_write_safe(rec) != 0)
+            return -2;
+        if (fp->idx &&
+            sam_bam_batch_record_endpos(rec, NULL, &endpos) < 0)
+            return -2;
+    }
+    for (i = beg; i < end_i; i++) {
+        bam_batch_record_t *rec = &batch->records[i];
+        int raw_safe;
+
+        raw_safe = sam_bam_raw_write_record_indexed(fp, h, rec);
+        if (raw_safe < 0)
+            return raw_safe;
+    }
+    return 0;
+}
+
+#define BAM_RAW_FLAG_OFFSET (4 + 14)
+
+static void sam_bam_raw_store_frame_flag(uint8_t *frame, uint16_t flag)
+{
+    u16_to_le(flag, frame + BAM_RAW_FLAG_OFFSET);
+}
+
+static int sam_bam_batch_write1_range_flags_copy(
+        htsFile *fp, const bam_batch_t *batch, int beg, int end_i,
+        uint16_t set_flags, uint16_t clear_flags)
+{
+    uint8_t *buf = NULL, *dst;
+    BGZF *bfp;
+    size_t len = 0;
+    int i, ret;
+
+    for (i = beg; i < end_i; i++) {
+        bam_batch_record_t *rec = &batch->records[i];
+
+        if (sam_bam_batch_record_raw_layout_valid(rec) < 0)
+            return -2;
+        if (rec->frame_len > SIZE_MAX - len) {
+            errno = EOVERFLOW;
+            return -2;
+        }
+        len += rec->frame_len;
+    }
+#ifdef SSIZE_MAX
+    if (len > (size_t)SSIZE_MAX) {
+        errno = EOVERFLOW;
+        return -2;
+    }
+#endif
+    if (sam_bam_raw_write_get_bgzf(fp, &bfp) < 0)
+        return -2;
+
+    buf = malloc(len);
+    if (!buf) {
+        errno = ENOMEM;
+        return -2;
+    }
+    dst = buf;
+    for (i = beg; i < end_i; i++) {
+        bam_batch_record_t *rec = &batch->records[i];
+        uint16_t flag = (uint16_t)((rec->core.flag | set_flags) & ~clear_flags);
+
+        memcpy(dst, rec->frame, rec->frame_len);
+        sam_bam_raw_store_frame_flag(dst, flag);
+        dst += rec->frame_len;
+    }
+
+    if (bfp->is_compressed && bgzf_flush_try(bfp, len) < 0) {
+        free(buf);
+        return -1;
+    }
+    ret = bgzf_write_small(bfp, buf, len) == (ssize_t)len ? 0 : -1;
+    free(buf);
+    return ret;
+}
+
+int sam_bam_batch_record_write1(htsFile *fp, const sam_hdr_t *h,
+                                bam_batch_record_t *record)
+{
+    int raw_safe, ret;
+
+    (void)h;
+    raw_safe = sam_bam_batch_record_raw_write_safe(record);
+    if (raw_safe != 0)
+        return -2;
+    if (fp->idx) {
+        ret = sam_bam_raw_write_record_indexed(fp, h, record);
+        return ret < 0 ? ret : (int)record->frame_len;
+    }
+
+    ret = sam_bam_raw_write_frames(fp, record->frame, record->frame_len);
+    return ret < 0 ? ret : (int)record->frame_len;
+}
+
+int sam_bam_batch_record_write1_aux_filtered(htsFile *fp, const sam_hdr_t *h,
+                                             bam_batch_record_t *record,
+                                             sam_bam_aux_filter_f filter,
+                                             void *filter_data)
+{
+    const uint8_t *aux, *end, *s, *prefix;
+    size_t prefix_len, new_aux_len = 0, block_len, frame_len;
+    uint8_t block_len_le[4];
+    uint8_t *keep_map = NULL;
+    BGZF *bfp;
+    int dropped = 0, raw_safe, ret, n_aux = 0, m_aux = 0, idx;
+
+    (void)h;
+    if (!filter)
+        return sam_bam_batch_record_write1(fp, h, record);
+    raw_safe = sam_bam_batch_record_raw_write_safe(record);
+    if (raw_safe != 0)
+        return -2;
+
+    aux = sam_bam_batch_record_aux(record);
+    end = record->body + record->raw_l_data;
+    prefix = record->frame + 4;
+    if (aux < record->body || aux > end) {
+        errno = EINVAL;
+        return -2;
+    }
+    prefix_len = (size_t)(aux - prefix);
+
+    s = aux;
+    while (s < end) {
+        const uint8_t *value, *next;
+        char tag[2];
+        int keep;
+
+        if (end - s < 3) {
+            errno = EINVAL;
+            free(keep_map);
+            return -2;
+        }
+        tag[0] = s[0];
+        tag[1] = s[1];
+        value = s + 2;
+        next = sam_bam_record_view_aux_skip(value, end);
+        if (!next) {
+            errno = EINVAL;
+            free(keep_map);
+            return -2;
+        }
+        keep = filter(tag, value, filter_data);
+        if (keep < 0) {
+            errno = EINVAL;
+            free(keep_map);
+            return -2;
+        }
+        if (n_aux == m_aux) {
+            int new_m = m_aux ? (m_aux > INT_MAX / 2 ? INT_MAX : m_aux * 2) : 8;
+            uint8_t *new_keep;
+
+            if (new_m == m_aux ||
+                (size_t)new_m > SIZE_MAX / sizeof(*keep_map)) {
+                errno = ENOMEM;
+                free(keep_map);
+                return -2;
+            }
+            new_keep = realloc(keep_map, (size_t)new_m * sizeof(*keep_map));
+            if (!new_keep) {
+                errno = ENOMEM;
+                free(keep_map);
+                return -2;
+            }
+            keep_map = new_keep;
+            m_aux = new_m;
+        }
+        keep_map[n_aux++] = keep ? 1 : 0;
+        if (keep) {
+            new_aux_len += (size_t)(next - s);
+        } else {
+            dropped = 1;
+        }
+        s = next;
+    }
+
+    if (!dropped) {
+        free(keep_map);
+        return sam_bam_batch_record_write1(fp, h, record);
+    }
+    if (fp->idx) {
+        free(keep_map);
+        return -2;
+    }
+
+    block_len = prefix_len + new_aux_len;
+    frame_len = 4 + block_len;
+    if (block_len > INT32_MAX || frame_len > INT_MAX) {
+        errno = EOVERFLOW;
+        free(keep_map);
+        return -2;
+    }
+    if (sam_bam_raw_write_get_bgzf(fp, &bfp) < 0) {
+        free(keep_map);
+        return -2;
+    }
+    if (bfp->is_compressed && bgzf_flush_try(bfp, frame_len) < 0) {
+        free(keep_map);
+        return -1;
+    }
+
+    u32_to_le((uint32_t)block_len, block_len_le);
+    ret = bgzf_write_small(bfp, block_len_le, sizeof(block_len_le)) == 4 &&
+          bgzf_write_small(bfp, prefix, prefix_len) == (ssize_t)prefix_len;
+    for (s = aux, idx = 0; s < end; idx++) {
+        const uint8_t *value = s + 2;
+        const uint8_t *next = sam_bam_record_view_aux_skip(value, end);
+
+        if (idx >= n_aux || !next) {
+            ret = 0;
+            break;
+        }
+        if (keep_map[idx]) {
+            size_t len = (size_t)(next - s);
+            ret = ret &&
+                  bgzf_write_small(bfp, s, len) == (ssize_t)len;
+        }
+        s = next;
+    }
+
+    free(keep_map);
+    return ret ? (int)frame_len : -1;
+}
+
+static int sam_bam_batch_record_sam_write_safe(bam_batch_record_t *record)
+{
+    int cg_fixup = 0;
+
+    if (sam_bam_batch_record_raw_layout_valid(record) < 0)
+        return -1;
+    if (sam_bam_batch_record_qname(record)[record->core.l_qname - 1] != '\0')
+        return 1;
+    if (sam_bam_batch_record_cg_fixup_needed(record, &cg_fixup) < 0)
+        return -1;
+    return cg_fixup ? 1 : 0;
+}
+
+static int sam_bam_batch_record_validate_sam_cigar(
+        const bam_batch_record_t *record)
+{
+    const uint8_t *cigar;
+    hts_pos_t qlen = 0;
+    int k;
+
+    if (!record)
+        return -1;
+    cigar = sam_bam_batch_record_cigar(record);
+    for (k = 0; k < record->core.n_cigar; k++) {
+        uint32_t c = le_to_u32(cigar + ((size_t)k << 2));
+        int op = bam_cigar_op(c);
+
+        if (bam_cigar_type(op) & 1)
+            qlen += bam_cigar_oplen(c);
+    }
+    if (record->core.n_cigar > 0 && record->core.l_qseq > 0 &&
+        !(record->core.flag & BAM_FUNMAP) && qlen != record->core.l_qseq) {
+        int qname_len = record->core.l_qname > 0 ? record->core.l_qname - 1 : 0;
+
+        hts_log_error("CIGAR and query sequence lengths differ for %.*s",
+                      qname_len, sam_bam_batch_record_qname(record));
+        errno = EINVAL;
+        return -1;
+    }
+    return 0;
+}
+
+static int sam_bam_batch_sam_validate_ranges(const bam_batch_t *batch,
+                                             const int *ranges, int n_ranges)
+{
+    int r;
+
+    if (!batch || n_ranges < 0 || (n_ranges > 0 && !ranges)) {
+        errno = EINVAL;
+        return -2;
+    }
+    for (r = 0; r < n_ranges; r++) {
+        int beg = ranges[r * 2];
+        int end_i = ranges[r * 2 + 1];
+        int i;
+
+        if (beg < 0 || end_i < beg || end_i > batch->n_records ||
+            (end_i > beg && !batch->records)) {
+            errno = EINVAL;
+            return -2;
+        }
+        for (i = beg; i < end_i; i++) {
+            bam_batch_record_t *rec = &batch->records[i];
+
+            if (sam_bam_batch_record_sam_write_safe(rec) != 0)
+                return -2;
+        }
+    }
+    return 0;
+}
+
+static sp_bam_views *sam_bam_view_job_alloc(SAM_state *fd)
+{
+    sp_bam_views *gv = calloc(1, sizeof(*gv));
+
+    if (!gv)
+        return NULL;
+    gv->a_records = SAM_NBAM;
+    gv->records = calloc(gv->a_records, sizeof(*gv->records));
+    if (!gv->records) {
+        free(gv);
+        return NULL;
+    }
+    gv->fd = fd;
+    return gv;
+}
+
+static int sam_bam_view_job_append(sp_bam_views *gv,
+                                   const bam_batch_record_t *rec)
+{
+    bam_batch_record_t *dst;
+    uint8_t *new_data;
+    size_t data_off, new_len, new_alloc;
+
+    if (gv->n_records == gv->a_records) {
+        int new_a = gv->a_records > INT_MAX / 2
+                    ? INT_MAX : gv->a_records * 2;
+        bam_batch_record_t *new_records;
+
+        if (new_a == gv->a_records) {
+            errno = ENOMEM;
+            return -1;
+        }
+        new_records = realloc(gv->records,
+                              (size_t)new_a * sizeof(*new_records));
+        if (!new_records) {
+            errno = ENOMEM;
+            return -1;
+        }
+        gv->records = new_records;
+        gv->a_records = new_a;
+    }
+    if ((size_t)rec->raw_l_data > SIZE_MAX - gv->data_len) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    new_len = gv->data_len + (size_t)rec->raw_l_data;
+    if (new_len > gv->data_alloc) {
+        new_alloc = gv->data_alloc ? gv->data_alloc : SAM_NBYTES;
+        while (new_alloc < new_len) {
+            if (new_alloc > SIZE_MAX / 2) {
+                new_alloc = new_len;
+                break;
+            }
+            new_alloc *= 2;
+        }
+        new_data = realloc(gv->data, new_alloc);
+        if (!new_data) {
+            errno = ENOMEM;
+            return -1;
+        }
+        gv->data = new_data;
+        gv->data_alloc = new_alloc;
+    }
+
+    data_off = gv->data_len;
+    memcpy(gv->data + data_off, rec->body, rec->raw_l_data);
+    gv->data_len = new_len;
+
+    dst = &gv->records[gv->n_records++];
+    *dst = *rec;
+    dst->frame = NULL;
+    dst->frame_len = 0;
+    dst->body = gv->data + data_off;
+    dst->voff_beg = dst->voff_end = 0;
+    return 0;
+}
+
+static int sam_bam_view_job_dispatch(SAM_state *fd, sp_bam_views **job)
+{
+    sp_bam_views *gv = *job;
+    int ret = 0;
+
+    if (!gv || (!gv->owns_batch && gv->n_records == 0) ||
+        (gv->owns_batch && gv->n_ranges == 0)) {
+        sam_free_sp_bam_views(gv);
+        *job = NULL;
+        return 0;
+    }
+    gv->serial = fd->serial++;
+    pthread_mutex_lock(&fd->command_m);
+    if (fd->errcode != 0) {
+        ret = -fd->errcode;
+    } else if (hts_tpool_dispatch3(fd->p, fd->q, sam_format_batch_worker, gv,
+                                   cleanup_sp_bam_views,
+                                   cleanup_sp_lines, 0) < 0) {
+        ret = -1;
+    }
+    pthread_mutex_unlock(&fd->command_m);
+    if (ret < 0)
+        return ret;
+    *job = NULL;
+    return 0;
+}
+
+static int sam_flush_pending_bams(SAM_state *fd)
+{
+    sp_bams *gb = fd->curr_bam;
+    int ret = 0;
+
+    if (!gb || gb->nbams == 0)
+        return 0;
+    gb->serial = fd->serial++;
+    pthread_mutex_lock(&fd->command_m);
+    if (fd->errcode != 0) {
+        ret = -fd->errcode;
+    } else if (hts_tpool_dispatch3(fd->p, fd->q, sam_format_worker, gb,
+                                   cleanup_sp_bams,
+                                   cleanup_sp_lines, 0) < 0) {
+        ret = -1;
+    }
+    pthread_mutex_unlock(&fd->command_m);
+    if (ret < 0)
+        return ret;
+    fd->curr_bam = NULL;
+    return 0;
+}
+
+static int sam_bam_batch_write_sam_ranges_threaded(htsFile *fp,
+                                                   const sam_hdr_t *h,
+                                                   const bam_batch_t *batch,
+                                                   const int *ranges,
+                                                   int n_ranges)
+{
+    SAM_state *fd = (SAM_state *)fp->state;
+    sp_bam_views *gv = NULL;
+    int r, ret;
+
+    if ((ret = sam_start_threaded_output(fp, h)) < 0)
+        return ret;
+    if (sam_flush_pending_bams(fd) < 0)
+        return -1;
+
+    for (r = 0; r < n_ranges; r++) {
+        int beg = ranges[r * 2];
+        int end_i = ranges[r * 2 + 1];
+        int i;
+
+        for (i = beg; i < end_i; i++) {
+            bam_batch_record_t *rec = &batch->records[i];
+
+            if (!gv && !(gv = sam_bam_view_job_alloc(fd)))
+                return -1;
+            if (sam_bam_view_job_append(gv, rec) < 0)
+                goto err;
+            if (gv->n_records == SAM_NBAM ||
+                gv->data_len > SAM_NBYTES * 0.8) {
+                if (sam_bam_view_job_dispatch(fd, &gv) < 0)
+                    goto err;
+            }
+        }
+    }
+    if (sam_bam_view_job_dispatch(fd, &gv) < 0)
+        goto err;
+    return 1;
+
+ err:
+    sam_free_sp_bam_views(gv);
+    return -1;
+}
+
+static int sam_bam_batch_write_sam_ranges_threaded_steal(htsFile *fp,
+                                                         const sam_hdr_t *h,
+                                                         bam_batch_t *batch,
+                                                         const int *ranges,
+                                                         int n_ranges)
+{
+    SAM_state *fd = (SAM_state *)fp->state;
+    sp_bam_views *gv = NULL;
+    int ret;
+
+    if ((ret = sam_start_threaded_output(fp, h)) < 0)
+        return ret;
+    if (sam_flush_pending_bams(fd) < 0)
+        return -1;
+
+    gv = calloc(1, sizeof(*gv));
+    if (!gv) {
+        errno = ENOMEM;
+        return -1;
+    }
+    gv->ranges = malloc((size_t)n_ranges * 2 * sizeof(*gv->ranges));
+    if (!gv->ranges) {
+        errno = ENOMEM;
+        sam_free_sp_bam_views(gv);
+        return -1;
+    }
+    memcpy(gv->ranges, ranges, (size_t)n_ranges * 2 * sizeof(*gv->ranges));
+    gv->n_ranges = n_ranges;
+    gv->batch = *batch;
+    gv->owns_batch = 1;
+    gv->fd = fd;
+    memset(batch, 0, sizeof(*batch));
+
+    if (sam_bam_view_job_dispatch(fd, &gv) < 0)
+        goto err;
+    return 1;
+
+ err:
+    sam_free_sp_bam_views(gv);
+    return -1;
+}
+
+static int sam_bam_batch_write_sam_ranges_unthreaded(htsFile *fp,
+                                                     const sam_hdr_t *h,
+                                                     const bam_batch_t *batch,
+                                                     const int *ranges,
+                                                     int n_ranges)
+{
+    int r, wrote = 0;
+
+    for (r = 0; r < n_ranges; r++) {
+        int beg = ranges[r * 2];
+        int end_i = ranges[r * 2 + 1];
+        int i;
+
+        for (i = beg; i < end_i; i++) {
+            bam_batch_record_t *rec = &batch->records[i];
+
+            fp->line.l = 0;
+            if (sam_format_batch_record_append(h, rec, &fp->line) < 0)
+                return -1;
+            kputc('\n', &fp->line);
+            if (fp->is_bgzf) {
+                if (bgzf_flush_try(fp->fp.bgzf, fp->line.l) < 0)
+                    return -1;
+                if (bgzf_write(fp->fp.bgzf, fp->line.s, fp->line.l) !=
+                    fp->line.l)
+                    return -1;
+            } else {
+                if (hwrite(fp->fp.hfile, fp->line.s, fp->line.l) !=
+                    fp->line.l)
+                    return -1;
+            }
+            wrote = 1;
+        }
+    }
+    return wrote;
+}
+
+int sam_bam_batch_write_sam_ranges(htsFile *fp, const sam_hdr_t *h,
+                                   const bam_batch_t *batch,
+                                   const int *ranges, int n_ranges)
+{
+    if (!fp || !fp->is_write || !h)
+        return -2;
+    if (n_ranges == 0)
+        return 0;
+    if (fp->idx)
+        return -2;
+
+    switch (fp->format.format) {
+    case text_format:
+        fp->format.category = sequence_data;
+        fp->format.format = sam;
+        /* fall-through */
+    case sam:
+        break;
+    default:
+        return -2;
+    }
+
+    if (sam_bam_batch_sam_validate_ranges(batch, ranges, n_ranges) < 0)
+        return -2;
+    if (fp->state)
+        return sam_bam_batch_write_sam_ranges_threaded(fp, h, batch,
+                                                       ranges, n_ranges);
+    return sam_bam_batch_write_sam_ranges_unthreaded(fp, h, batch,
+                                                     ranges, n_ranges);
+}
+
+int sam_bam_batch_write_sam_ranges_steal(htsFile *fp, const sam_hdr_t *h,
+                                         bam_batch_t *batch,
+                                         const int *ranges, int n_ranges)
+{
+    if (!fp || !fp->is_write || !h || !batch)
+        return -2;
+    if (n_ranges == 0)
+        return 0;
+    if (fp->idx)
+        return -2;
+
+    switch (fp->format.format) {
+    case text_format:
+        fp->format.category = sequence_data;
+        fp->format.format = sam;
+        /* fall-through */
+    case sam:
+        break;
+    default:
+        return -2;
+    }
+
+    if (sam_bam_batch_sam_validate_ranges(batch, ranges, n_ranges) < 0)
+        return -2;
+    if (fp->state)
+        return sam_bam_batch_write_sam_ranges_threaded_steal(fp, h, batch,
+                                                             ranges,
+                                                             n_ranges);
+    return sam_bam_batch_write_sam_ranges_unthreaded(fp, h, batch,
+                                                     ranges, n_ranges);
+}
+
+int sam_bam_batch_write1(htsFile *fp, const sam_hdr_t *h,
+                         const bam_batch_t *batch)
+{
+    const bam_batch_record_t *first, *last;
+    const uint8_t *beg, *end, *expected;
+    int i, j;
+
+    (void)h;
+    if (!batch)
+        return -2;
+    if (batch->n_records == 0)
+        return 0;
+    if (fp->idx)
+        return sam_bam_batch_write1_range_indexed(fp, h, batch, 0,
+                                                  batch->n_records);
+    if (batch->n_segments > 0) {
+        int rec_i = 0;
+
+        if (!batch->segments || !batch->records) {
+            errno = EINVAL;
+            return -2;
+        }
+        for (i = 0; i < batch->n_segments; i++) {
+            const bam_batch_segment_t *seg = &batch->segments[i];
+            size_t off = 0;
+
+            if (!seg->data || seg->len == 0) {
+                errno = EINVAL;
+                return -2;
+            }
+            while (off < seg->len) {
+                bam_batch_record_t *rec;
+
+                if (rec_i >= batch->n_records) {
+                    errno = EINVAL;
+                    return -2;
+                }
+                rec = &batch->records[rec_i];
+                if (sam_bam_batch_record_raw_write_safe(rec) != 0 ||
+                    rec->frame != seg->data + off ||
+                    rec->frame_len > seg->len - off) {
+                    errno = EINVAL;
+                    return -2;
+                }
+                off += rec->frame_len;
+                rec_i++;
+            }
+        }
+        if (rec_i != batch->n_records) {
+            errno = EINVAL;
+            return -2;
+        }
+        for (i = 0; i < batch->n_segments; i++)
+            if (sam_bam_raw_write_frames(fp, batch->segments[i].data,
+                                         batch->segments[i].len) < 0)
+                return -1;
+        return 0;
+    }
+    if (!batch->data || !batch->records || batch->len == 0) {
+        errno = EINVAL;
+        return -2;
+    }
+
+    first = &batch->records[0];
+    last = &batch->records[batch->n_records - 1];
+    beg = first->frame;
+    end = last->frame + last->frame_len;
+    if (beg != batch->data || end != batch->data + batch->len || end < beg) {
+        errno = EINVAL;
+        return -2;
+    }
+    expected = batch->data;
+    for (j = 0; j < batch->n_records; j++) {
+        if (batch->records[j].frame != expected) {
+            errno = EINVAL;
+            return -2;
+        }
+        if (sam_bam_batch_record_raw_write_safe(&batch->records[j]) != 0)
+            return -2;
+        expected += batch->records[j].frame_len;
+    }
+    if (expected != batch->data + batch->len) {
+        errno = EINVAL;
+        return -2;
+    }
+
+    return sam_bam_raw_write_frames(fp, batch->data, batch->len);
+}
+
+int sam_bam_batch_write1_range(htsFile *fp, const sam_hdr_t *h,
+                               const bam_batch_t *batch, int beg, int end_i)
+{
+    const uint8_t *run_beg = NULL, *expected = NULL;
+    BGZF *bfp;
+    size_t run_len = 0;
+    int i;
+
+    (void)h;
+    if (!batch || beg < 0 || end_i < beg || end_i > batch->n_records ||
+        (end_i > beg && !batch->records)) {
+        errno = EINVAL;
+        return -2;
+    }
+    if (beg == end_i)
+        return 0;
+    if (fp->idx)
+        return sam_bam_batch_write1_range_indexed(fp, h, batch, beg, end_i);
+
+    for (i = beg; i < end_i; i++) {
+        bam_batch_record_t *rec = &batch->records[i];
+
+        if (sam_bam_batch_record_raw_write_safe(rec) != 0)
+            return -2;
+        if (rec->frame_len > SIZE_MAX - run_len) {
+            errno = EOVERFLOW;
+            return -2;
+        }
+        run_len += rec->frame_len;
+    }
+    run_len = 0;
+    if (sam_bam_raw_write_get_bgzf(fp, &bfp) < 0)
+        return -2;
+
+    for (i = beg; i < end_i; i++) {
+        bam_batch_record_t *rec = &batch->records[i];
+
+        if (!run_beg) {
+            run_beg = rec->frame;
+            run_len = rec->frame_len;
+        } else if (rec->frame == expected) {
+            if (rec->frame_len > SIZE_MAX - run_len) {
+                errno = EOVERFLOW;
+                return -2;
+            }
+            run_len += rec->frame_len;
+        } else {
+            if (sam_bam_raw_write_frames_bgzf(bfp, run_beg, run_len) < 0)
+                return -1;
+            run_beg = rec->frame;
+            run_len = rec->frame_len;
+        }
+        expected = rec->frame + rec->frame_len;
+    }
+
+    if (run_beg && sam_bam_raw_write_frames_bgzf(bfp, run_beg, run_len) < 0)
+        return -1;
+    return 0;
+}
+
+int sam_bam_batch_write1_ranges(htsFile *fp, const sam_hdr_t *h,
+                                const bam_batch_t *batch,
+                                const int *ranges, int n_ranges)
+{
+    const uint8_t *run_beg = NULL, *expected = NULL;
+    BGZF *bfp;
+    size_t run_len = 0, total_len = 0;
+    int ri, last_end = 0;
+
+    if (!batch || n_ranges < 0 || (n_ranges > 0 && !ranges) ||
+        n_ranges > INT_MAX / 2 ||
+        (batch->n_records > 0 && !batch->records)) {
+        errno = EINVAL;
+        return -2;
+    }
+    if (n_ranges == 0)
+        return 0;
+    if (fp->idx) {
+        for (ri = 0; ri < n_ranges; ri++) {
+            int beg = ranges[ri * 2], end_i = ranges[ri * 2 + 1];
+            int i;
+
+            if (beg < last_end || end_i <= beg || end_i > batch->n_records) {
+                errno = EINVAL;
+                return -2;
+            }
+            last_end = end_i;
+            for (i = beg; i < end_i; i++) {
+                bam_batch_record_t *rec = &batch->records[i];
+                hts_pos_t endpos;
+
+                if (sam_bam_batch_record_raw_write_safe(rec) != 0 ||
+                    sam_bam_batch_record_endpos(rec, NULL, &endpos) < 0)
+                    return -2;
+            }
+        }
+        for (ri = 0; ri < n_ranges; ri++) {
+            int beg = ranges[ri * 2], end_i = ranges[ri * 2 + 1];
+            int wr = sam_bam_batch_write1_range_indexed(fp, h, batch,
+                                                        beg, end_i);
+            if (wr < 0)
+                return wr;
+        }
+        return 0;
+    }
+
+    for (ri = 0; ri < n_ranges; ri++) {
+        int beg = ranges[ri * 2], end_i = ranges[ri * 2 + 1];
+        int i;
+
+        if (beg < last_end || end_i <= beg || end_i > batch->n_records) {
+            errno = EINVAL;
+            return -2;
+        }
+        last_end = end_i;
+        for (i = beg; i < end_i; i++) {
+            bam_batch_record_t *rec = &batch->records[i];
+
+            if (sam_bam_batch_record_raw_write_safe(rec) != 0)
+                return -2;
+            if (rec->frame_len > SIZE_MAX - total_len) {
+                errno = EOVERFLOW;
+                return -2;
+            }
+            total_len += rec->frame_len;
+        }
+    }
+    if (sam_bam_raw_write_get_bgzf(fp, &bfp) < 0)
+        return -2;
+    if (n_ranges > 1 && total_len > 0 &&
+        total_len <= BAM_BATCH_PACKED_WRITE_MAX &&
+        (!batch->len || total_len * 4 <= batch->len))
+        return sam_bam_batch_write1_ranges_packed(bfp, batch, ranges,
+                                                  n_ranges, total_len);
+
+    for (ri = 0; ri < n_ranges; ri++) {
+        int beg = ranges[ri * 2], end_i = ranges[ri * 2 + 1];
+        int i;
+
+        for (i = beg; i < end_i; i++) {
+            bam_batch_record_t *rec = &batch->records[i];
+
+            if (!run_beg) {
+                run_beg = rec->frame;
+                run_len = rec->frame_len;
+            } else if (rec->frame == expected) {
+                if (rec->frame_len > SIZE_MAX - run_len) {
+                errno = EOVERFLOW;
+                return -2;
+            }
+            run_len += rec->frame_len;
+        } else {
+            if (sam_bam_raw_write_frames_bgzf(bfp, run_beg, run_len) < 0)
+                return -1;
+            run_beg = rec->frame;
+            run_len = rec->frame_len;
+            }
+            expected = rec->frame + rec->frame_len;
+        }
+    }
+
+    if (run_beg && sam_bam_raw_write_frames_bgzf(bfp, run_beg, run_len) < 0)
+        return -1;
+    return 0;
+}
+
+int sam_bam_batch_write1_range_flags(htsFile *fp, const sam_hdr_t *h,
+                                     const bam_batch_t *batch, int beg,
+                                     int end_i, uint16_t set_flags,
+                                     uint16_t clear_flags)
+{
+    BGZF *bfp;
+    const uint8_t *run_beg = NULL, *expected = NULL;
+    size_t run_len = 0;
+    int i, ret = 0, all_mutable = 1;
+
+    (void)h;
+    if (!set_flags && !clear_flags)
+        return sam_bam_batch_write1_range(fp, h, batch, beg, end_i);
+    if (fp->idx)
+        return -2;
+    if (!batch || beg < 0 || end_i < beg || end_i > batch->n_records ||
+        (end_i > beg && !batch->records)) {
+        errno = EINVAL;
+        return -2;
+    }
+    if (beg == end_i)
+        return 0;
+
+    for (i = beg; i < end_i; i++) {
+        bam_batch_record_t *rec = &batch->records[i];
+
+        if (sam_bam_batch_record_raw_write_safe(rec) != 0)
+            return -2;
+        if (rec->frame_len > SIZE_MAX - run_len) {
+            errno = EOVERFLOW;
+            return -2;
+        }
+        run_len += rec->frame_len;
+        if (!(rec->flags & BAM_BATCH_RECORD_F_OWNED))
+            all_mutable = 0;
+    }
+    run_len = 0;
+    if (!all_mutable)
+        return sam_bam_batch_write1_range_flags_copy(
+            fp, batch, beg, end_i, set_flags, clear_flags);
+    if (sam_bam_raw_write_get_bgzf(fp, &bfp) < 0)
+        return -2;
+
+    for (i = beg; i < end_i; i++) {
+        const bam_batch_record_t *rec = &batch->records[i];
+        uint16_t flag = (uint16_t)((rec->core.flag | set_flags) & ~clear_flags);
+
+        sam_bam_raw_store_frame_flag((uint8_t *)rec->frame, flag);
+    }
+
+    for (i = beg; i < end_i; i++) {
+        const bam_batch_record_t *rec = &batch->records[i];
+
+        if (!run_beg) {
+            run_beg = rec->frame;
+            run_len = rec->frame_len;
+        } else if (rec->frame == expected) {
+            if (rec->frame_len > SIZE_MAX - run_len) {
+                errno = EOVERFLOW;
+                ret = -2;
+                break;
+            }
+            run_len += rec->frame_len;
+        } else {
+            if (sam_bam_raw_write_frames(fp, run_beg, run_len) < 0) {
+                ret = -1;
+                break;
+            }
+            run_beg = rec->frame;
+            run_len = rec->frame_len;
+        }
+        expected = rec->frame + rec->frame_len;
+    }
+
+    if (ret == 0 && run_beg &&
+        sam_bam_raw_write_frames(fp, run_beg, run_len) < 0)
+        ret = -1;
+
+    for (i = beg; i < end_i; i++)
+        sam_bam_raw_store_frame_flag((uint8_t *)batch->records[i].frame,
+                                     (uint16_t)batch->records[i].core.flag);
+    return ret;
+}
+
+int sam_bam_batch_record_query_len(const bam_batch_record_t *record,
+                                   bam1_t *scratch, int include_hard_clip,
+                                   hts_pos_t *query_len)
+{
+    const uint8_t *cigar;
+    hts_pos_t cigar_qlen = 0, filter_qlen = 0;
+    int is_cg, k, n_cigar;
+
+    if (!record)
+        return -1;
+
+    is_cg = sam_bam_batch_record_cg_candidate(record);
+    if (is_cg) {
+        if (!scratch || sam_bam_batch_record_to_bam1(record, scratch) < 0)
+            return -1;
+        cigar = (const uint8_t *)bam_get_cigar(scratch);
+        n_cigar = scratch->core.n_cigar;
+    } else {
+        cigar = sam_bam_batch_record_cigar(record);
+        n_cigar = record->core.n_cigar;
+    }
+
+    for (k = 0; k < n_cigar; k++) {
+        uint32_t c = is_cg ? bam_get_cigar(scratch)[k]
+                           : le_to_u32(cigar + ((size_t)k << 2));
+        int op = bam_cigar_op(c);
+
+        if (bam_cigar_type(op) & 1)
+            cigar_qlen += bam_cigar_oplen(c);
+        if (query_len && ((bam_cigar_type(op) & 1) ||
+                          (include_hard_clip && op == BAM_CHARD_CLIP)))
+            filter_qlen += bam_cigar_oplen(c);
+    }
+
+    if (record->core.n_cigar > 0 && record->core.l_qseq > 0 &&
+        !(record->core.flag & BAM_FUNMAP) &&
+        cigar_qlen != record->core.l_qseq) {
+        int qname_len = record->core.l_qname > 0 ? record->core.l_qname - 1 : 0;
+        hts_log_error("CIGAR and query sequence lengths differ for %.*s",
+                      qname_len, sam_bam_batch_record_qname(record));
+        return -1;
+    }
+    if (query_len)
+        *query_len = filter_qlen;
+    return 0;
+}
+
+int sam_bam_batch_record_endpos(const bam_batch_record_t *record,
+                                bam1_t *scratch, hts_pos_t *endpos)
+{
+    hts_pos_t rlen = 0;
+    hts_pos_t qlen = 0;
+    int k;
+
+    if (!record || !endpos)
+        return -1;
+    if (record->flags & BAM_BATCH_RECORD_F_ENDPOS_VALID) {
+        *endpos = record->endpos;
+        return 0;
+    }
+
+    if (record->core.flag & BAM_FUNMAP) {
+        *endpos = record->core.pos + 1;
+        return 0;
+    }
+
+    if (sam_bam_batch_record_cg_candidate(record) &&
+        !(record->flags & BAM_BATCH_RECORD_F_RAW_WRITE_SAFE)) {
+        if (!scratch || sam_bam_batch_record_to_bam1(record, scratch) < 0)
+            return -1;
+        rlen = bam_cigar2rlen(scratch->core.n_cigar, bam_get_cigar(scratch));
+    } else {
+        const uint8_t *cigar = sam_bam_batch_record_cigar(record);
+
+        for (k = 0; k < record->core.n_cigar; k++) {
+            uint32_t c = le_to_u32(cigar + ((size_t)k << 2));
+            int op = bam_cigar_op(c);
+            if (bam_cigar_type(op) & 2)
+                rlen += bam_cigar_oplen(c);
+            if (bam_cigar_type(op) & 1)
+                qlen += bam_cigar_oplen(c);
+        }
+        if (record->core.n_cigar > 0 && record->core.l_qseq > 0 &&
+            !(record->core.flag & BAM_FUNMAP) &&
+            qlen != record->core.l_qseq) {
+            int qname_len = record->core.l_qname > 0 ? record->core.l_qname - 1 : 0;
+            hts_log_error("CIGAR and query sequence lengths differ for %.*s",
+                          qname_len, sam_bam_batch_record_qname(record));
+            return -1;
+        }
+    }
+    if (rlen == 0)
+        rlen = 1;
+    *endpos = record->core.pos + rlen;
+    return 0;
+}
+
+static bam_stream_reader_t *bam_batch_reader_get(htsFile *fp, int direct)
+{
+    if (!fp || !fp->is_bgzf || !fp->fp.bgzf)
+        return NULL;
+
+    if (fp->state) {
+        uint32_t magic = *(uint32_t *)fp->state;
+
+        if (magic == BAM_STREAM_READER_MAGIC)
+            return (bam_stream_reader_t *)fp->state;
+        if (magic == BAM_BATCH_REQUEST_MAGIC) {
+            bam_batch_request_t *req = (bam_batch_request_t *)fp->state;
+            bam_stream_reader_t *reader;
+
+            fp->state = NULL;
+            free(req);
+            reader = bam_stream_reader_open(fp, NULL, 1);
+            if (reader) {
+                fp->state = reader;
+                return reader;
+            }
+            return NULL;
+        }
+        if (magic == BAM_DEFERRED_THREADS_MAGIC) {
+            bam_deferred_threads_t *cfg =
+                (bam_deferred_threads_t *)fp->state;
+            bam_stream_reader_t *reader = bam_stream_reader_open(fp, cfg, 1);
+
+            if (reader) {
+                fp->state = NULL;
+                bam_deferred_threads_destroy(cfg);
+                fp->state = reader;
+                return reader;
+            }
+            if (!bam_batch_env_strict())
+                (void)bam_deferred_threads_enable_bgzf(fp, cfg);
+            fp->state = NULL;
+            bam_deferred_threads_destroy(cfg);
+            return NULL;
+        }
+        return NULL;
+    }
+
+    if (direct || bam_batch_env_enabled()) {
+        bam_stream_reader_t *reader = bam_stream_reader_open(fp, NULL, 1);
+
+        if (reader) {
+            fp->state = reader;
+            return reader;
+        }
+    }
+    return NULL;
+}
+
+static int bam_batch_detach_ref_data(bam_stream_parse_job_t *job)
+{
+    const uint8_t *old_data = job->ref_data;
+    uint8_t *data;
+    int i;
+
+    if (job->data || job->owned_block_result)
+        return 0;
+    if (!old_data || !job->len)
+        return -2;
+
+    data = malloc(job->len);
+    if (!data) {
+        errno = ENOMEM;
+        return -2;
+    }
+    memcpy(data, old_data, job->len);
+
+    for (i = 0; i < job->n_records; i++) {
+        size_t frame_off = (size_t)(job->views[i].frame - old_data);
+        size_t body_off = (size_t)(job->views[i].body - old_data);
+
+        job->views[i].frame = data + frame_off;
+        job->views[i].body = data + body_off;
+        job->views[i].flags |= BAM_BATCH_RECORD_F_OWNED;
+    }
+
+    job->data = data;
+    job->cap = job->len;
+    job->ref_data = NULL;
+    return 0;
+}
+
+int sam_bam_prepare_batch_reader(htsFile *fp)
+{
+    bam_batch_request_t *req;
+
+    if (!fp || fp->format.format != bam || fp->is_write)
+        return -2;
+    if (fp->state) {
+        uint32_t magic = *(uint32_t *)fp->state;
+
+        return magic == BAM_BATCH_REQUEST_MAGIC ||
+               magic == BAM_DEFERRED_THREADS_MAGIC ||
+               magic == BAM_STREAM_READER_MAGIC ? 0 : -2;
+    }
+
+    req = calloc(1, sizeof(*req));
+    if (!req)
+        return -1;
+    req->magic = BAM_BATCH_REQUEST_MAGIC;
+    fp->state = req;
+    return 0;
+}
+
+static void sam_bam_batch_attach_job(bam_batch_t *batch,
+                                     bam_stream_parse_job_t *job)
+{
+    int i;
+
+    if (job->data || job->owned_block_result)
+        for (i = 0; i < job->n_records; i++)
+            job->views[i].flags |= BAM_BATCH_RECORD_F_OWNED;
+    batch->data = job->data ? job->data : job->ref_data;
+    batch->len = job->len;
+    batch->n_records = job->n_records;
+    batch->records = job->views;
+    batch->n_segments = job->n_segments;
+    batch->segments = job->segments;
+    batch->impl = job;
+}
+
+static int sam_bam_read_batch_upto(htsFile *fp, sam_hdr_t *h,
+                                   bam_batch_t *batch, uint64_t limit_voff,
+                                   int *hit_limit, int need_voff)
+{
+    bam_stream_reader_t *reader;
+    bam_stream_parse_job_t *job = NULL;
+    int ret;
+
+    if (!batch)
+        return -2;
+    sam_bam_batch_destroy(batch);
+
+    if (!fp || fp->format.format != bam || fp->is_write)
+        return -2;
+
+    reader = bam_batch_reader_get(fp, 1);
+    if (!reader)
+        return -2;
+
+    if (reader->fused_q) {
+        ret = bam_stream_reader_next_fused_job(reader, h, &job, limit_voff,
+                                               hit_limit, need_voff);
+        if (ret <= 0)
+            return ret == 0 ? -1 : ret;
+
+        sam_bam_batch_attach_job(batch, job);
+        return job->n_records;
+    }
+
+    if (reader->parse_q && reader->parse_views) {
+        ret = bam_stream_reader_next_view_job(reader, h, &job, limit_voff,
+                                              hit_limit, need_voff);
+        if (ret <= 0)
+            return ret == 0 ? -1 : ret;
+
+        sam_bam_batch_attach_job(batch, job);
+        return job->n_records;
+    }
+
+    if (reader->pending_frame_error) {
+        ret = reader->pending_frame_error;
+        reader->pending_frame_error = 0;
+        reader->parse_input_eof = 1;
+        if (ret == -3)
+            errno = ERANGE;
+        return ret;
+    }
+    if (reader->parse_input_error)
+        return reader->parse_input_error;
+    if (reader->parse_input_eof)
+        return -1;
+
+    ret = bam_stream_reader_build_parse_job(reader, &job, 1, h, limit_voff,
+                                            hit_limit, need_voff, 0);
+    if (ret <= 0) {
+        if (ret < 0) {
+            reader->parse_input_eof = 1;
+            if (ret == -3)
+                errno = ERANGE;
+        }
+        return ret == 0 ? -1 : ret;
+    }
+
+    if (!job->views) {
+        bam_stream_parse_job_free(job);
+        return -2;
+    }
+    if (bam_batch_detach_ref_data(job) < 0) {
+        bam_stream_parse_job_free(job);
+        return -2;
+    }
+
+    sam_bam_batch_attach_job(batch, job);
+    return job->n_records;
+}
+
+int sam_bam_read_batch(htsFile *fp, sam_hdr_t *h, bam_batch_t *batch)
+{
+    return sam_bam_read_batch_upto(fp, h, batch, UINT64_MAX, NULL, 0);
+}
+
+int sam_bam_read_batch_voff(htsFile *fp, sam_hdr_t *h, bam_batch_t *batch)
+{
+    return sam_bam_read_batch_upto(fp, h, batch, UINT64_MAX, NULL, 1);
+}
+
+static int bam_count_job_validate_decode(bam_stream_parse_job_t *job,
+                                         sam_hdr_t *h, int *n_valid)
+{
+    const uint8_t *data;
+    bam1_t *scratch = NULL;
+    size_t pos = 0;
+    int n = 0;
+    int ret = 0;
+
+    *n_valid = 0;
+    if (!job)
+        return -4;
+
+    if (job->views) {
+        for (n = 0; n < job->n_records; n++) {
+            int needs_materialize = 0;
+
+            if (!bam_batch_record_view_tid_valid(&job->views[n], h)) {
+                errno = ERANGE;
+                ret = -3;
+                goto cleanup;
+            }
+            if (sam_bam_batch_record_decode_status(&job->views[n],
+                                                   &needs_materialize) < 0) {
+                ret = -4;
+                goto cleanup;
+            }
+            if (needs_materialize) {
+                if (!scratch) {
+                    scratch = bam_init1();
+                    if (!scratch)
+                        return -2;
+                }
+                if (sam_bam_batch_record_materialize_validated(&job->views[n],
+                                                               scratch,
+                                                               NULL) < 0) {
+                    ret = -4;
+                    goto cleanup;
+                }
+            }
+            *n_valid = n + 1;
+        }
+        goto cleanup;
+    }
+
+    data = job->data ? job->data : job->ref_data;
+    if (!data && job->len)
+        return -4;
+
+    while (pos + 4 <= job->len) {
+        int32_t block_len = le_to_i32(data + pos);
+        size_t frame_len;
+        bam_batch_record_t view;
+        int needs_materialize = 0;
+
+        if (block_len < 32) {
+            ret = -4;
+            goto cleanup;
+        }
+        frame_len = 4 + (size_t)block_len;
+        if (frame_len > job->len - pos) {
+            ret = -4;
+            goto cleanup;
+        }
+        if (n >= job->n_records) {
+            ret = -4;
+            goto cleanup;
+        }
+
+        bam_batch_record_view_set(&view, data + pos, frame_len, 0, 0);
+        if (!bam_batch_record_view_tid_valid(&view, h)) {
+            errno = ERANGE;
+            ret = -3;
+            goto cleanup;
+        }
+        if (sam_bam_batch_record_decode_status(&view, &needs_materialize) < 0) {
+            ret = -4;
+            goto cleanup;
+        }
+        if (needs_materialize) {
+            if (!scratch) {
+                scratch = bam_init1();
+                if (!scratch)
+                    return -2;
+            }
+            if (sam_bam_batch_record_materialize_validated(&view, scratch,
+                                                           NULL) < 0) {
+                ret = -4;
+                goto cleanup;
+            }
+        }
+
+        n++;
+        *n_valid = n;
+        pos += frame_len;
+    }
+
+    if (pos != job->len || n != job->n_records)
+        ret = -4;
+
+cleanup:
+    bam_destroy1(scratch);
+    return ret;
+}
+
+int sam_bam_read_batch_count(htsFile *fp, sam_hdr_t *h, int *n_records)
+{
+    bam_stream_reader_t *reader;
+    bam_stream_parse_job_t *job = NULL;
+    int n_valid = 0, ret;
+
+    if (!n_records)
+        return -2;
+    *n_records = 0;
+
+    if (!fp || fp->format.format != bam || fp->is_write)
+        return -2;
+
+    reader = bam_batch_reader_get(fp, 1);
+    if (!reader)
+        return -2;
+
+    if (reader->fused_q) {
+        ret = bam_stream_reader_next_fused_job(reader, h, &job, UINT64_MAX,
+                                               NULL, 0);
+        if (ret <= 0)
+            return ret == 0 ? -1 : ret;
+        ret = bam_count_job_validate_decode(job, h, &n_valid);
+        if (ret < 0) {
+            bam_stream_parse_job_free(job);
+            if (n_valid > 0) {
+                reader->pending_frame_error = ret;
+                reader->input_eof = 1;
+                *n_records = n_valid;
+                return n_valid;
+            }
+            reader->input_eof = 1;
+            if (ret == -3)
+                errno = ERANGE;
+            return ret;
+        }
+        *n_records = job->n_records;
+        ret = job->n_records;
+        bam_stream_parse_job_free(job);
+        return ret;
+    }
+
+    if (reader->pending_frame_error) {
+        ret = reader->pending_frame_error;
+        reader->pending_frame_error = 0;
+        reader->parse_input_eof = 1;
+        if (ret == -3)
+            errno = ERANGE;
+        return ret;
+    }
+    if (reader->parse_input_error)
+        return reader->parse_input_error;
+    if (reader->parse_input_eof)
+        return -1;
+
+    ret = bam_stream_reader_build_parse_job(reader, &job, 0, h, UINT64_MAX,
+                                            NULL, 0, 0);
+    if (ret <= 0) {
+        if (ret < 0) {
+            reader->parse_input_eof = 1;
+            if (ret == -3)
+                errno = ERANGE;
+        }
+        return ret == 0 ? -1 : ret;
+    }
+
+    ret = bam_count_job_validate_decode(job, h, &n_valid);
+    if (ret < 0) {
+        bam_stream_parse_job_free(job);
+        if (n_valid > 0) {
+            reader->pending_frame_error = ret;
+            *n_records = n_valid;
+            return n_valid;
+        }
+        reader->parse_input_eof = 1;
+        if (ret == -3)
+            errno = ERANGE;
+        return ret;
+    }
+
+    *n_records = job->n_records;
+    ret = job->n_records;
+    bam_stream_parse_job_free(job);
+    return ret;
+}
+
+static int sam_bam_restore_deferred_threads(htsFile *fp,
+                                            const bam_deferred_threads_t *src)
+{
+    bam_deferred_threads_t *cfg;
+
+    if (!src || src->n_threads <= 1)
+        return 0;
+
+    cfg = calloc(1, sizeof(*cfg));
+    if (!cfg)
+        return -2;
+    *cfg = *src;
+    cfg->magic = BAM_DEFERRED_THREADS_MAGIC;
+    fp->state = cfg;
+    return 0;
+}
+
+int sam_bam_batch_seek(htsFile *fp, uint64_t voff)
+{
+    bam_deferred_threads_t cfg = {0};
+    int have_cfg = 0;
+
+    if (!fp || !fp->is_bgzf || !fp->fp.bgzf)
+        return -2;
+
+    if (fp->state) {
+        uint32_t magic = *(uint32_t *)fp->state;
+
+        if (magic == BAM_STREAM_READER_MAGIC) {
+            bam_stream_reader_t *reader = (bam_stream_reader_t *)fp->state;
+
+            if (reader->pool) {
+                cfg.magic = BAM_DEFERRED_THREADS_MAGIC;
+                cfg.n_threads = hts_tpool_size(reader->pool);
+                cfg.qsize = reader->qsize;
+                cfg.pool = reader->own_pool ? NULL : reader->pool;
+                cfg.use_pool = reader->own_pool ? 0 : 1;
+                have_cfg = cfg.n_threads > 1;
+            }
+            fp->state = NULL;
+            bam_stream_reader_destroy(reader);
+        } else if (magic == BAM_DEFERRED_THREADS_MAGIC) {
+            bam_deferred_threads_t *old =
+                (bam_deferred_threads_t *)fp->state;
+
+            cfg = *old;
+            have_cfg = cfg.n_threads > 1;
+            fp->state = NULL;
+            bam_deferred_threads_destroy(old);
+        } else if (magic == BAM_BATCH_REQUEST_MAGIC) {
+            bam_batch_request_destroy(fp);
+        } else {
+            return -2;
+        }
+    }
+
+    if (bgzf_seek(fp->fp.bgzf, (int64_t)voff, SEEK_SET) < 0)
+        return -2;
+    if (have_cfg && sam_bam_restore_deferred_threads(fp, &cfg) < 0)
+        return -2;
+    return 0;
+}
+
+static int bam_batch_compare_regions_by_tid(const void *av, const void *bv)
+{
+    const hts_reglist_t *a = (const hts_reglist_t *)av;
+    const hts_reglist_t *b = (const hts_reglist_t *)bv;
+
+    if (a->tid < 0 && b->tid >= 0)
+        return 1;
+    if (a->tid >= 0 && b->tid < 0)
+        return -1;
+    return (a->tid > b->tid) - (a->tid < b->tid);
+}
+
+static int sam_bam_itr_read_rest_batch(htsFile *fp, hts_itr_t *iter,
+                                       sam_hdr_t *h, bam_batch_t *batch)
+{
+    int ret;
+
+    if (iter->curr_off) {
+        if (sam_bam_batch_seek(fp, iter->curr_off) < 0)
+            return -2;
+        iter->curr_off = 0;
+    }
+
+    ret = sam_bam_read_batch_upto(fp, h, batch, UINT64_MAX, NULL, 1);
+    if (ret < 0) {
+        iter->finished = 1;
+        return ret;
+    }
+    if (batch->n_records > 0) {
+        const bam_batch_record_t *rec = &batch->records[batch->n_records - 1];
+        hts_pos_t endpos = 0;
+        bam1_t *scratch = bam_init1();
+
+        if (!scratch ||
+            sam_bam_batch_record_endpos(rec, scratch, &endpos) < 0) {
+            bam_destroy1(scratch);
+            sam_bam_batch_destroy(batch);
+            return -2;
+        }
+        bam_destroy1(scratch);
+        iter->curr_tid = rec->core.tid;
+        iter->curr_beg = rec->core.pos;
+        iter->curr_end = endpos;
+        iter->curr_off = rec->voff_end;
+    }
+    return ret;
+}
+
+static int sam_bam_itr_next_single_batch(htsFile *fp, hts_itr_t *iter,
+                                         sam_hdr_t *h, bam_batch_t *batch)
+{
+    bam1_t *scratch = NULL;
+    int ret = -1;
+
+    for (;;) {
+        bam_batch_t raw = {0};
+        bam_batch_record_t *views;
+        int hit_limit = 0, keep = 0, i;
+
+        if (iter->curr_off == 0 || iter->i < 0 ||
+            iter->curr_off >= iter->off[iter->i].v) {
+            if (iter->i == iter->n_off - 1) {
+                ret = -1;
+                break;
+            }
+            if (iter->i < 0 ||
+                iter->off[iter->i].v != iter->off[iter->i + 1].u) {
+                if (sam_bam_batch_seek(fp, iter->off[iter->i + 1].u) < 0) {
+                    bam_destroy1(scratch);
+                    return -2;
+                }
+                iter->curr_off = iter->off[iter->i + 1].u;
+            }
+            ++iter->i;
+        }
+
+        ret = sam_bam_read_batch_upto(fp, h, &raw, iter->off[iter->i].v,
+                                      &hit_limit, 1);
+        if (ret < 0) {
+            if (hit_limit) {
+                iter->curr_off = iter->off[iter->i].v;
+                continue;
+            }
+            break;
+        }
+
+        views = (bam_batch_record_t *)raw.records;
+        for (i = 0; i < raw.n_records; i++) {
+            const bam_batch_record_t *rec = &raw.records[i];
+            hts_pos_t endpos;
+
+            if (!scratch) {
+                scratch = bam_init1();
+                if (!scratch) {
+                    sam_bam_batch_destroy(&raw);
+                    return -2;
+                }
+            }
+            if (sam_bam_batch_record_endpos(rec, scratch, &endpos) < 0) {
+                sam_bam_batch_destroy(&raw);
+                bam_destroy1(scratch);
+                return -2;
+            }
+
+            iter->curr_off = rec->voff_end;
+            if (rec->core.tid != iter->tid || rec->core.pos >= iter->end) {
+                iter->finished = 1;
+                break;
+            }
+            if (endpos > iter->beg && iter->end > rec->core.pos) {
+                iter->curr_tid = rec->core.tid;
+                iter->curr_beg = rec->core.pos;
+                iter->curr_end = endpos;
+                views[keep++] = *rec;
+            }
+        }
+
+        if (hit_limit)
+            iter->curr_off = iter->off[iter->i].v;
+        if (keep > 0) {
+            raw.n_records = keep;
+            *batch = raw;
+            bam_destroy1(scratch);
+            return keep;
+        }
+        sam_bam_batch_destroy(&raw);
+        if (iter->finished) {
+            ret = -1;
+            break;
+        }
+    }
+
+    iter->finished = 1;
+    bam_destroy1(scratch);
+    return ret;
+}
+
+static int sam_bam_itr_multi_no_coord_batch(htsFile *fp, hts_itr_t *iter,
+                                            sam_hdr_t *h, bam_batch_t *batch)
+{
+    for (;;) {
+        bam_batch_t raw = {0};
+        bam_batch_record_t *views;
+        int i, keep = 0, ret;
+
+        ret = sam_bam_read_batch_upto(fp, h, &raw, UINT64_MAX, NULL, 1);
+        if (ret < 0) {
+            iter->finished = 1;
+            return ret;
+        }
+
+        views = (bam_batch_record_t *)raw.records;
+        for (i = 0; i < raw.n_records; i++) {
+            const bam_batch_record_t *rec = &raw.records[i];
+
+            if (rec->core.tid >= 0)
+                continue;
+            views[keep++] = *rec;
+        }
+
+        if (keep > 0) {
+            const bam_batch_record_t *rec = &views[keep - 1];
+
+            raw.n_records = keep;
+            iter->read_rest = 1;
+            iter->curr_off = 0;
+            iter->curr_tid = rec->core.tid;
+            iter->curr_beg = rec->core.pos;
+            iter->curr_end = rec->core.pos + 1;
+            *batch = raw;
+            return keep;
+        }
+        sam_bam_batch_destroy(&raw);
+    }
+}
+
+static int sam_bam_itr_next_multi_batch(htsFile *fp, hts_itr_t *iter,
+                                        sam_hdr_t *h, bam_batch_t *batch)
+{
+    bam1_t *scratch = NULL;
+    int ret = -1, next_range = 0;
+
+    for (;;) {
+        bam_batch_t raw = {0};
+        bam_batch_record_t *views;
+        int hit_limit = 0, keep = 0, i;
+
+        if (next_range || iter->curr_off == 0 || iter->i < 0 ||
+            iter->i >= iter->n_off ||
+            iter->curr_off >= iter->off[iter->i].v ||
+            (iter->off[iter->i].max >> 32 == (uint64_t)iter->curr_tid &&
+             (iter->off[iter->i].max & 0xffffffff) <
+             (uint32_t)iter->curr_intv)) {
+            do {
+                iter->i++;
+            } while (iter->i < iter->n_off &&
+                     (iter->curr_off >= iter->off[iter->i].v ||
+                      (iter->off[iter->i].max >> 32 ==
+                       (uint64_t)iter->curr_tid &&
+                       (iter->off[iter->i].max & 0xffffffff) <
+                       (uint32_t)iter->curr_intv)));
+
+            if (iter->i >= iter->n_off) {
+                if (iter->nocoor) {
+                    if (sam_bam_batch_seek(fp, iter->nocoor_off) < 0) {
+                        bam_destroy1(scratch);
+                        return -2;
+                    }
+                    iter->nocoor = 0;
+                    ret = sam_bam_itr_multi_no_coord_batch(fp, iter, h, batch);
+                    bam_destroy1(scratch);
+                    return ret;
+                }
+                ret = -1;
+                break;
+            }
+
+            if (iter->curr_off < iter->off[iter->i].u || next_range) {
+                iter->curr_off = iter->off[iter->i].u;
+                if (sam_bam_batch_seek(fp, iter->curr_off) < 0) {
+                    bam_destroy1(scratch);
+                    return -2;
+                }
+                next_range = 0;
+            }
+        }
+
+        ret = sam_bam_read_batch_upto(fp, h, &raw, iter->off[iter->i].v,
+                                      &hit_limit, 1);
+        if (ret < 0) {
+            if (hit_limit) {
+                iter->curr_off = iter->off[iter->i].v;
+                continue;
+            }
+            break;
+        }
+
+        views = (bam_batch_record_t *)raw.records;
+        for (i = 0; i < raw.n_records; i++) {
+            const bam_batch_record_t *rec = &raw.records[i];
+            hts_reglist_t key, *found_reg;
+            hts_pos_t endpos;
+            int cr, ci, j;
+
+            if (!scratch) {
+                scratch = bam_init1();
+                if (!scratch) {
+                    sam_bam_batch_destroy(&raw);
+                    return -2;
+                }
+            }
+            if (sam_bam_batch_record_endpos(rec, scratch, &endpos) < 0) {
+                sam_bam_batch_destroy(&raw);
+                bam_destroy1(scratch);
+                return -2;
+            }
+
+            iter->curr_off = rec->voff_end;
+            if (rec->core.tid != iter->curr_tid) {
+                key.tid = rec->core.tid;
+                found_reg = (hts_reglist_t *)bsearch(
+                        &key, iter->reg_list, iter->n_reg,
+                        sizeof(hts_reglist_t),
+                        bam_batch_compare_regions_by_tid);
+                if (!found_reg)
+                    continue;
+
+                iter->curr_reg = (int)(found_reg - iter->reg_list);
+                iter->curr_tid = rec->core.tid;
+                iter->curr_intv = 0;
+            }
+
+            cr = iter->curr_reg;
+            ci = iter->curr_intv;
+            for (j = ci; j < iter->reg_list[cr].count; j++) {
+                if (endpos > iter->reg_list[cr].intervals[j].beg &&
+                    iter->reg_list[cr].intervals[j].end > rec->core.pos) {
+                    iter->curr_beg = rec->core.pos;
+                    iter->curr_end = endpos;
+                    iter->curr_intv = j;
+                    views[keep++] = *rec;
+                    break;
+                }
+
+                if (rec->core.pos > iter->reg_list[cr].intervals[j].end)
+                    iter->curr_intv = j + 1;
+                if (endpos < iter->reg_list[cr].intervals[j].beg)
+                    break;
+            }
+        }
+
+        if (hit_limit)
+            iter->curr_off = iter->off[iter->i].v;
+        if (keep > 0) {
+            raw.n_records = keep;
+            *batch = raw;
+            bam_destroy1(scratch);
+            return keep;
+        }
+        sam_bam_batch_destroy(&raw);
+    }
+
+    iter->finished = 1;
+    bam_destroy1(scratch);
+    return ret;
+}
+
+int sam_bam_itr_next_batch(htsFile *fp, hts_itr_t *iter, sam_hdr_t *h,
+                           bam_batch_t *batch)
+{
+    if (!batch)
+        return -2;
+    sam_bam_batch_destroy(batch);
+
+    if (!fp || !iter || iter->finished)
+        return -1;
+    if (fp->format.format != bam || !fp->is_bgzf || !fp->fp.bgzf)
+        return -2;
+
+    if (iter->read_rest)
+        return sam_bam_itr_read_rest_batch(fp, iter, h, batch);
+
+    if (iter->multi)
+        return sam_bam_itr_next_multi_batch(fp, iter, h, batch);
+
+    if (!iter->off)
+        return -1;
+    return sam_bam_itr_next_single_batch(fp, iter, h, batch);
+}
+
 int sam_set_thread_pool(htsFile *fp, htsThreadPool *p) {
+    if (fp->format.format == bam) {
+        if (!fp->is_write &&
+            (bam_batch_state_is_request(fp) || bam_batch_env_enabled() ||
+             bam_batch_fused_env_enabled() || bam_stream_env_enabled() ||
+             bam_ordered_env_enabled()))
+        {
+            bam_batch_request_destroy(fp);
+            return bam_deferred_threads_set(fp, 0, p);
+        }
+        if (fp->format.compression == bgzf)
+            return bgzf_thread_pool(fp->fp.bgzf, p->pool, p->qsize);
+        return 0;
+    }
+
     if (fp->state)
         return -2;   //already exists!
 
@@ -3747,6 +10578,20 @@ int sam_set_threads(htsFile *fp, int nthreads) {
     if (nthreads <= 0)
         return 0;
 
+    if (fp->format.format == bam) {
+        if (!fp->is_write &&
+            (bam_batch_state_is_request(fp) || bam_batch_env_enabled() ||
+             bam_batch_fused_env_enabled() || bam_stream_env_enabled() ||
+             bam_ordered_env_enabled()))
+        {
+            bam_batch_request_destroy(fp);
+            return bam_deferred_threads_set(fp, nthreads, NULL);
+        }
+        if (fp->format.compression == bgzf)
+            return bgzf_mt(fp->fp.bgzf, nthreads, 256);
+        return 0;
+    }
+
     htsThreadPool p;
     p.pool = hts_tpool_init(nthreads);
     p.qsize = nthreads*2;
@@ -3762,6 +10607,750 @@ int sam_set_threads(htsFile *fp, int nthreads) {
     fd->own_pool = 1;
 
     return 0;
+}
+
+/*
+ * Experimental ordered BAM partition reader.
+ *
+ * This is deliberately internal and opt-in.  It uses index-derived virtual
+ * offsets to split a coordinate-sorted BAM into non-overlapping file spans,
+ * parses those spans on worker file handles, and drains completed spans in
+ * file-offset order so sam_read1() callers still see one ordered stream.
+ */
+#define BAM_ORDERED_READER_MAGIC 0x626f7264u
+#define BAM_ORDERED_READER_DEFAULT_THREADS 4
+#define BAM_ORDERED_READER_TARGET_JOBS_PER_THREAD 16
+#define BAM_ORDERED_READER_MAX_AHEAD_PER_THREAD 2
+
+typedef struct bam_ordered_job_t {
+    uint64_t beg;
+    uint64_t end;
+} bam_ordered_job_t;
+
+typedef struct bam_ordered_batch_t {
+    bam1_t *records;
+    int n_records;
+    int m_records;
+} bam_ordered_batch_t;
+
+typedef struct bam_ordered_result_t {
+    int ready;
+    int ret;
+    bam_ordered_batch_t batch;
+} bam_ordered_result_t;
+
+typedef struct bam_ordered_reader_t {
+    uint32_t magic;
+    char *fn;
+    bam_ordered_job_t *jobs;
+    int n_jobs;
+    int next_job;
+    int drain_job;
+    int max_inflight;
+
+    pthread_t *threads;
+    int n_threads;
+    int n_threads_started;
+    int active_workers;
+    int closing;
+    int error;
+
+    bam_ordered_result_t *results;
+    bam_ordered_batch_t curr;
+    int curr_job;
+    int curr_idx;
+
+    pthread_mutex_t mutex;
+    pthread_cond_t result_c;
+    pthread_cond_t space_c;
+} bam_ordered_reader_t;
+
+static int bam_ordered_env_enabled(void)
+{
+    const char *env = getenv("HTS_BAM_ORDERED_READER");
+    return env && *env && strcmp(env, "0") != 0;
+}
+
+static int bam_ordered_env_strict(void)
+{
+    const char *env = getenv("HTS_BAM_ORDERED_READER_REQUIRE");
+    return env && *env && strcmp(env, "0") != 0;
+}
+
+static int bam_ordered_env_threads(void)
+{
+    const char *env = getenv("HTS_BAM_ORDERED_READER_THREADS");
+    char *end = NULL;
+    long n;
+
+    if (!env || !*env)
+        return BAM_ORDERED_READER_DEFAULT_THREADS;
+
+    errno = 0;
+    n = strtol(env, &end, 10);
+    if (errno || end == env || *end || n < 1 || n > INT_MAX / 2)
+        return BAM_ORDERED_READER_DEFAULT_THREADS;
+    return (int)n;
+}
+
+static void bam_ordered_batch_init_record_slots(bam1_t *records, int beg,
+                                                int end)
+{
+    int i;
+
+    for (i = beg; i < end; i++)
+        bam_set_mempolicy(&records[i], BAM_USER_OWNS_STRUCT);
+}
+
+static void bam_ordered_batch_destroy(bam_ordered_batch_t *batch)
+{
+    int i;
+
+    if (!batch)
+        return;
+    if (batch->records) {
+        for (i = 0; i < batch->m_records; i++)
+            bam_destroy1(&batch->records[i]);
+    }
+    free(batch->records);
+    memset(batch, 0, sizeof(*batch));
+}
+
+static int bam_ordered_move1(bam1_t *dst, bam1_t *src)
+{
+    uint32_t dst_policy = bam_get_mempolicy(dst);
+
+    if ((dst_policy & BAM_USER_OWNS_DATA) == 0)
+        free(dst->data);
+
+    dst->core = src->core;
+    dst->id = src->id;
+    dst->data = src->data;
+    dst->l_data = src->l_data;
+    dst->m_data = src->m_data;
+    bam_set_mempolicy(dst, dst_policy & BAM_USER_OWNS_STRUCT);
+
+    src->data = NULL;
+    src->l_data = 0;
+    src->m_data = 0;
+    return 0;
+}
+
+static bam1_t *bam_ordered_batch_next_record(bam_ordered_batch_t *batch)
+{
+    if (batch->n_records == batch->m_records) {
+        int new_m;
+        bam1_t *new_records;
+
+        if (batch->m_records > INT_MAX / 2) {
+            errno = ENOMEM;
+            return NULL;
+        }
+        new_m = batch->m_records ? batch->m_records * 2 : 256;
+        if ((size_t)new_m > SIZE_MAX / sizeof(*new_records)) {
+            errno = ENOMEM;
+            return NULL;
+        }
+
+        new_records = realloc(batch->records,
+                              (size_t)new_m * sizeof(*new_records));
+        if (!new_records) {
+            errno = ENOMEM;
+            return NULL;
+        }
+        memset(new_records + batch->m_records, 0,
+               (size_t)(new_m - batch->m_records) * sizeof(*new_records));
+        bam_ordered_batch_init_record_slots(new_records, batch->m_records,
+                                            new_m);
+        batch->records = new_records;
+        batch->m_records = new_m;
+    }
+
+    return &batch->records[batch->n_records];
+}
+
+static int bam_ordered_uint64_cmp(const void *a, const void *b)
+{
+    uint64_t va = *(const uint64_t *)a;
+    uint64_t vb = *(const uint64_t *)b;
+
+    return va > vb ? 1 : va < vb ? -1 : 0;
+}
+
+static int bam_ordered_append_offset(uint64_t **offsets, int *n_offsets,
+                                     int *m_offsets, uint64_t offset)
+{
+    uint64_t *new_offsets;
+    int new_m;
+
+    if (*n_offsets == *m_offsets) {
+        new_m = *m_offsets ? (*m_offsets > INT_MAX / 2
+                              ? INT_MAX : *m_offsets * 2) : 1024;
+        if (new_m == *m_offsets ||
+            (size_t)new_m > SIZE_MAX / sizeof(*new_offsets)) {
+            errno = ENOMEM;
+            return -1;
+        }
+        new_offsets = realloc(*offsets,
+                              (size_t)new_m * sizeof(*new_offsets));
+        if (!new_offsets) {
+            errno = ENOMEM;
+            return -1;
+        }
+        *offsets = new_offsets;
+        *m_offsets = new_m;
+    }
+
+    (*offsets)[(*n_offsets)++] = offset;
+    return 0;
+}
+
+static uint64_t bam_ordered_voff_block_span(uint64_t beg, uint64_t end)
+{
+    uint64_t beg_block = beg >> 16;
+    uint64_t end_block = end >> 16;
+
+    return end_block > beg_block ? end_block - beg_block : 1;
+}
+
+static int bam_ordered_append_job(bam_ordered_job_t **jobs, int *n_jobs,
+                                  int *m_jobs, uint64_t beg, uint64_t end)
+{
+    bam_ordered_job_t *new_jobs;
+    int new_m;
+
+    if (end <= beg)
+        return 0;
+
+    if (*n_jobs == *m_jobs) {
+        new_m = *m_jobs ? (*m_jobs > INT_MAX / 2 ? INT_MAX : *m_jobs * 2)
+                        : 1024;
+        if (new_m == *m_jobs ||
+            (size_t)new_m > SIZE_MAX / sizeof(*new_jobs)) {
+            errno = ENOMEM;
+            return -1;
+        }
+        new_jobs = realloc(*jobs, (size_t)new_m * sizeof(*new_jobs));
+        if (!new_jobs) {
+            errno = ENOMEM;
+            return -1;
+        }
+        *jobs = new_jobs;
+        *m_jobs = new_m;
+    }
+
+    (*jobs)[*n_jobs].beg = beg;
+    (*jobs)[*n_jobs].end = end;
+    (*n_jobs)++;
+    return 0;
+}
+
+static int bam_ordered_build_offsets(sam_hdr_t *hdr, const hts_idx_t *idx,
+                                     uint64_t **offsets, int *n_offsets)
+{
+    uint64_t *out = NULL;
+    int n = 0, m = 0;
+    int tid, i, j;
+
+    *offsets = NULL;
+    *n_offsets = 0;
+
+    for (tid = 0; tid < sam_hdr_nref(hdr); tid++) {
+        uint64_t *ref_offsets = NULL;
+        int n_ref_offsets = 0;
+
+        if (!hts_idx_ref_has_data(idx, tid))
+            continue;
+        if (hts_idx_get_ref_file_offsets(idx, tid, &ref_offsets,
+                                         &n_ref_offsets) < 0)
+            goto fail;
+        for (i = 0; i < n_ref_offsets; i++) {
+            if (bam_ordered_append_offset(&out, &n, &m,
+                                          ref_offsets[i]) < 0) {
+                free(ref_offsets);
+                goto fail;
+            }
+        }
+        free(ref_offsets);
+    }
+
+    if (n < 2) {
+        free(out);
+        return 1;
+    }
+
+    qsort(out, (size_t)n, sizeof(*out), bam_ordered_uint64_cmp);
+    for (i = 1, j = 0; i < n; i++) {
+        if (out[i] != out[j])
+            out[++j] = out[i];
+    }
+    n = j + 1;
+    if (n < 2) {
+        free(out);
+        return 1;
+    }
+
+    *offsets = out;
+    *n_offsets = n;
+    return 0;
+
+fail:
+    free(out);
+    *offsets = NULL;
+    *n_offsets = 0;
+    return -1;
+}
+
+static int bam_ordered_build_jobs(sam_hdr_t *hdr, const hts_idx_t *idx,
+                                  int n_threads,
+                                  bam_ordered_job_t **jobs, int *n_jobs)
+{
+    uint64_t *offsets = NULL;
+    uint64_t total_span = 0, span_per_job, span;
+    int n_offsets = 0, m_jobs = 0;
+    int64_t target_jobs;
+    int i, ret;
+
+    *jobs = NULL;
+    *n_jobs = 0;
+
+    ret = bam_ordered_build_offsets(hdr, idx, &offsets, &n_offsets);
+    if (ret != 0)
+        return ret;
+
+    for (i = 1; i < n_offsets; i++) {
+        span = bam_ordered_voff_block_span(offsets[i - 1], offsets[i]);
+        if (UINT64_MAX - total_span < span)
+            total_span = UINT64_MAX;
+        else
+            total_span += span;
+    }
+
+    target_jobs = (int64_t)n_threads * BAM_ORDERED_READER_TARGET_JOBS_PER_THREAD;
+    if (target_jobs < 1)
+        target_jobs = 1;
+    span_per_job = total_span / (uint64_t)target_jobs +
+        (total_span % (uint64_t)target_jobs != 0);
+    if (span_per_job < 1)
+        span_per_job = 1;
+
+    for (i = 0; i + 1 < n_offsets;) {
+        int end_i = i + 1;
+        uint64_t start = offsets[i];
+
+        while (end_i + 1 < n_offsets &&
+               bam_ordered_voff_block_span(start, offsets[end_i]) <
+                   span_per_job)
+            end_i++;
+
+        if (bam_ordered_append_job(jobs, n_jobs, &m_jobs, start,
+                                   offsets[end_i]) < 0)
+            goto fail;
+        i = end_i;
+    }
+
+    if (bam_ordered_append_job(jobs, n_jobs, &m_jobs,
+                               offsets[n_offsets - 1], UINT64_MAX) < 0)
+        goto fail;
+
+    free(offsets);
+    return *n_jobs > 0 ? 0 : 1;
+
+fail:
+    free(offsets);
+    free(*jobs);
+    *jobs = NULL;
+    *n_jobs = 0;
+    return -1;
+}
+
+static int bam_ordered_claim_job(bam_ordered_reader_t *reader)
+{
+    int job = -1;
+
+    pthread_mutex_lock(&reader->mutex);
+    while (!reader->closing && !reader->error &&
+           reader->next_job < reader->n_jobs &&
+           reader->next_job >= reader->drain_job + reader->max_inflight)
+        pthread_cond_wait(&reader->space_c, &reader->mutex);
+
+    if (!reader->closing && !reader->error && reader->next_job < reader->n_jobs)
+        job = reader->next_job++;
+    pthread_mutex_unlock(&reader->mutex);
+
+    return job;
+}
+
+static void bam_ordered_set_error(bam_ordered_reader_t *reader)
+{
+    pthread_mutex_lock(&reader->mutex);
+    reader->error = 1;
+    pthread_cond_broadcast(&reader->result_c);
+    pthread_cond_broadcast(&reader->space_c);
+    pthread_mutex_unlock(&reader->mutex);
+}
+
+static int bam_ordered_is_closing(bam_ordered_reader_t *reader)
+{
+    int closing;
+
+    pthread_mutex_lock(&reader->mutex);
+    closing = reader->closing;
+    pthread_mutex_unlock(&reader->mutex);
+    return closing;
+}
+
+static int bam_ordered_complete_job(bam_ordered_reader_t *reader, int job_id,
+                                    bam_ordered_batch_t *batch, int ret)
+{
+    pthread_mutex_lock(&reader->mutex);
+    if (reader->closing) {
+        pthread_mutex_unlock(&reader->mutex);
+        bam_ordered_batch_destroy(batch);
+        return -1;
+    }
+
+    reader->results[job_id].batch = *batch;
+    reader->results[job_id].ret = ret;
+    reader->results[job_id].ready = 1;
+    memset(batch, 0, sizeof(*batch));
+    pthread_cond_broadcast(&reader->result_c);
+    pthread_mutex_unlock(&reader->mutex);
+    return 0;
+}
+
+static void bam_ordered_worker_done(bam_ordered_reader_t *reader)
+{
+    pthread_mutex_lock(&reader->mutex);
+    reader->active_workers--;
+    pthread_cond_broadcast(&reader->result_c);
+    pthread_mutex_unlock(&reader->mutex);
+}
+
+static int bam_ordered_process_job(bam_ordered_reader_t *reader, htsFile *fp,
+                                   sam_hdr_t *hdr,
+                                   const bam_ordered_job_t *job,
+                                   bam_ordered_batch_t *batch)
+{
+    int ret, records_since_close_check = 0;
+
+    if (!fp->is_bgzf || !fp->fp.bgzf) {
+        errno = EINVAL;
+        return -2;
+    }
+    if (bgzf_seek(fp->fp.bgzf, (int64_t)job->beg, SEEK_SET) < 0)
+        return -2;
+
+    while (job->end == UINT64_MAX ||
+           (uint64_t)bgzf_tell(fp->fp.bgzf) < job->end) {
+        bam1_t *rec;
+
+        if (records_since_close_check >= 1024) {
+            records_since_close_check = 0;
+            if (bam_ordered_is_closing(reader))
+                break;
+        }
+
+        rec = bam_ordered_batch_next_record(batch);
+        if (!rec)
+            return -2;
+
+        ret = bam_read1(fp->fp.bgzf, rec);
+        if (ret < 0)
+            return ret == -1 ? 0 : -2;
+
+        if (hdr && (rec->core.tid >= hdr->n_targets || rec->core.tid < -1 ||
+                    rec->core.mtid >= hdr->n_targets || rec->core.mtid < -1)) {
+            errno = ERANGE;
+            return -3;
+        }
+        batch->n_records++;
+        records_since_close_check++;
+    }
+
+    return 0;
+}
+
+static void *bam_ordered_worker_main(void *arg)
+{
+    bam_ordered_reader_t *reader = (bam_ordered_reader_t *)arg;
+    htsFile *fp = NULL;
+    sam_hdr_t *hdr = NULL;
+    int job_id;
+
+    fp = sam_open(reader->fn, "rb");
+    if (!fp)
+        goto fail;
+    hdr = sam_hdr_read(fp);
+    if (!hdr)
+        goto fail;
+
+    while ((job_id = bam_ordered_claim_job(reader)) >= 0) {
+        bam_ordered_batch_t batch = {0};
+        int ret = bam_ordered_process_job(reader, fp, hdr,
+                                          &reader->jobs[job_id], &batch);
+        if (ret < 0) {
+            bam_ordered_batch_destroy(&batch);
+            goto fail;
+        }
+        if (bam_ordered_complete_job(reader, job_id, &batch, ret) < 0)
+            goto done;
+    }
+
+done:
+    sam_hdr_destroy(hdr);
+    if (fp)
+        sam_close(fp);
+    bam_ordered_worker_done(reader);
+    return NULL;
+
+fail:
+    sam_hdr_destroy(hdr);
+    if (fp)
+        sam_close(fp);
+    bam_ordered_set_error(reader);
+    bam_ordered_worker_done(reader);
+    return NULL;
+}
+
+static void bam_ordered_reader_destroy(bam_ordered_reader_t *reader)
+{
+    int i;
+
+    if (!reader)
+        return;
+
+    pthread_mutex_lock(&reader->mutex);
+    reader->closing = 1;
+    pthread_cond_broadcast(&reader->result_c);
+    pthread_cond_broadcast(&reader->space_c);
+    pthread_mutex_unlock(&reader->mutex);
+
+    for (i = 0; i < reader->n_threads_started; i++)
+        pthread_join(reader->threads[i], NULL);
+
+    for (i = 0; i < reader->n_jobs; i++)
+        bam_ordered_batch_destroy(&reader->results[i].batch);
+    bam_ordered_batch_destroy(&reader->curr);
+
+    pthread_cond_destroy(&reader->space_c);
+    pthread_cond_destroy(&reader->result_c);
+    pthread_mutex_destroy(&reader->mutex);
+    free(reader->results);
+    free(reader->threads);
+    free(reader->jobs);
+    free(reader->fn);
+    free(reader);
+}
+
+int sam_bam_state_destroy(htsFile *fp)
+{
+    uint32_t magic;
+
+    if (!fp || !fp->state)
+        return 0;
+
+    magic = *(uint32_t *)fp->state;
+    if (magic == BAM_ORDERED_READER_MAGIC) {
+        bam_ordered_reader_t *reader = (bam_ordered_reader_t *)fp->state;
+
+        fp->state = NULL;
+        bam_ordered_reader_destroy(reader);
+        return 0;
+    }
+    if (magic == BAM_STREAM_READER_MAGIC) {
+        bam_stream_reader_t *reader = (bam_stream_reader_t *)fp->state;
+
+        fp->state = NULL;
+        bam_stream_reader_destroy(reader);
+        return 0;
+    }
+    if (magic == BAM_BATCH_REQUEST_MAGIC) {
+        bam_batch_request_t *req = (bam_batch_request_t *)fp->state;
+
+        fp->state = NULL;
+        free(req);
+        return 0;
+    }
+    if (magic == BAM_DEFERRED_THREADS_MAGIC) {
+        bam_deferred_threads_t *cfg = (bam_deferred_threads_t *)fp->state;
+
+        fp->state = NULL;
+        bam_deferred_threads_destroy(cfg);
+        return 0;
+    }
+    return 0;
+}
+
+static bam_ordered_reader_t *bam_ordered_reader_open(htsFile *fp,
+                                                     sam_hdr_t *hdr,
+                                                     int n_threads)
+{
+    bam_ordered_reader_t *reader = NULL;
+    hts_idx_t *idx = NULL;
+    char *fnidx = NULL;
+    int64_t cur;
+    int i;
+    int mutex_init = 0, result_c_init = 0, space_c_init = 0;
+
+    if (!fp || !hdr || !fp->fn || hisremote(fp->fn) || !fp->is_bgzf ||
+        !fp->fp.bgzf || fp->fp.bgzf->is_gzip)
+        return NULL;
+
+    if (n_threads <= 0 || n_threads > INT_MAX / 2)
+        n_threads = bam_ordered_env_threads();
+    if (!hts_idx_check_local(fp->fn, HTS_FMT_BAI, &fnidx))
+        return NULL;
+    idx = sam_index_load2(fp, fp->fn, fnidx);
+    free(fnidx);
+    fnidx = NULL;
+    if (!idx)
+        return NULL;
+
+    reader = calloc(1, sizeof(*reader));
+    if (!reader)
+        goto fail;
+    reader->magic = BAM_ORDERED_READER_MAGIC;
+    reader->curr_job = -1;
+    reader->n_threads = n_threads;
+    reader->max_inflight = n_threads * BAM_ORDERED_READER_MAX_AHEAD_PER_THREAD;
+    if (reader->max_inflight < 1)
+        reader->max_inflight = 1;
+    reader->fn = strdup(fp->fn);
+    if (!reader->fn)
+        goto fail;
+
+    if (bam_ordered_build_jobs(hdr, idx, n_threads, &reader->jobs,
+                               &reader->n_jobs) != 0)
+        goto fail;
+    hts_idx_destroy(idx);
+    idx = NULL;
+
+    if (reader->n_jobs < n_threads) {
+        errno = 0;
+        goto fail;
+    }
+
+    cur = bgzf_tell(fp->fp.bgzf);
+    if (cur < 0 || (uint64_t)cur > reader->jobs[0].beg) {
+        errno = 0;
+        goto fail;
+    }
+
+    reader->results = calloc((size_t)reader->n_jobs,
+                             sizeof(*reader->results));
+    reader->threads = calloc((size_t)n_threads, sizeof(*reader->threads));
+    if (!reader->results || !reader->threads)
+        goto fail;
+
+    if (pthread_mutex_init(&reader->mutex, NULL) != 0)
+        goto fail;
+    mutex_init = 1;
+    if (pthread_cond_init(&reader->result_c, NULL) != 0)
+        goto fail;
+    result_c_init = 1;
+    if (pthread_cond_init(&reader->space_c, NULL) != 0)
+        goto fail;
+    space_c_init = 1;
+
+    for (i = 0; i < n_threads; i++) {
+        pthread_mutex_lock(&reader->mutex);
+        reader->active_workers++;
+        pthread_mutex_unlock(&reader->mutex);
+        if (pthread_create(&reader->threads[i], NULL,
+                           bam_ordered_worker_main, reader) != 0) {
+            pthread_mutex_lock(&reader->mutex);
+            reader->active_workers--;
+            pthread_mutex_unlock(&reader->mutex);
+            goto fail;
+        }
+        reader->n_threads_started++;
+    }
+
+    return reader;
+
+fail:
+    free(fnidx);
+    hts_idx_destroy(idx);
+    if (reader) {
+        if (mutex_init) {
+            pthread_mutex_lock(&reader->mutex);
+            reader->closing = 1;
+            reader->error = 1;
+            if (result_c_init)
+                pthread_cond_broadcast(&reader->result_c);
+            if (space_c_init)
+                pthread_cond_broadcast(&reader->space_c);
+            pthread_mutex_unlock(&reader->mutex);
+        }
+        for (i = 0; i < reader->n_threads_started; i++)
+            pthread_join(reader->threads[i], NULL);
+        if (space_c_init)
+            pthread_cond_destroy(&reader->space_c);
+        if (result_c_init)
+            pthread_cond_destroy(&reader->result_c);
+        if (mutex_init)
+            pthread_mutex_destroy(&reader->mutex);
+        if (reader->results) {
+            int j;
+            for (j = 0; j < reader->n_jobs; j++)
+                bam_ordered_batch_destroy(&reader->results[j].batch);
+        }
+        free(reader->results);
+        free(reader->threads);
+        free(reader->jobs);
+        free(reader->fn);
+        free(reader);
+    }
+    return NULL;
+}
+
+static int bam_ordered_reader_next(bam_ordered_reader_t *reader, bam1_t *b)
+{
+    for (;;) {
+        bam_ordered_result_t *res;
+
+        if (reader->curr_job >= 0 &&
+            reader->curr_idx < reader->curr.n_records) {
+            bam_ordered_move1(b, &reader->curr.records[reader->curr_idx++]);
+            return 0;
+        }
+
+        if (reader->curr_job >= 0) {
+            bam_ordered_batch_destroy(&reader->curr);
+            reader->curr_job = -1;
+            reader->curr_idx = 0;
+            pthread_mutex_lock(&reader->mutex);
+            reader->drain_job++;
+            pthread_cond_broadcast(&reader->space_c);
+            pthread_mutex_unlock(&reader->mutex);
+        }
+
+        pthread_mutex_lock(&reader->mutex);
+        while (!reader->error && reader->drain_job < reader->n_jobs &&
+               !reader->results[reader->drain_job].ready)
+            pthread_cond_wait(&reader->result_c, &reader->mutex);
+
+        if (reader->error) {
+            pthread_mutex_unlock(&reader->mutex);
+            return -2;
+        }
+        if (reader->drain_job >= reader->n_jobs) {
+            pthread_mutex_unlock(&reader->mutex);
+            return -1;
+        }
+
+        res = &reader->results[reader->drain_job];
+        reader->curr = res->batch;
+        reader->curr_job = reader->drain_job;
+        reader->curr_idx = 0;
+        memset(&res->batch, 0, sizeof(res->batch));
+        res->ready = 0;
+        pthread_mutex_unlock(&reader->mutex);
+
+        if (res->ret < 0)
+            return res->ret;
+    }
 }
 
 #define UMI_TAGS 5
@@ -4128,9 +11717,8 @@ static int fastq_parse1(htsFile *fp, bam1_t *b) {
     return ret;
 }
 
-// Internal component of sam_read1 below
-static inline int sam_read1_bam(htsFile *fp, sam_hdr_t *h, bam1_t *b) {
-    int ret = bam_read1(fp->fp.bgzf, b);
+static inline int sam_read1_bam_check_header(sam_hdr_t *h, bam1_t *b, int ret)
+{
     if (h && ret >= 0) {
         if (b->core.tid  >= h->n_targets || b->core.tid  < -1 ||
             b->core.mtid >= h->n_targets || b->core.mtid < -1) {
@@ -4139,6 +11727,80 @@ static inline int sam_read1_bam(htsFile *fp, sam_hdr_t *h, bam1_t *b) {
         }
     }
     return ret;
+}
+
+// Internal component of sam_read1 below
+static inline int sam_read1_bam(htsFile *fp, sam_hdr_t *h, bam1_t *b) {
+    if (fp->state) {
+        uint32_t magic = *(uint32_t *)fp->state;
+        if (magic == BAM_ORDERED_READER_MAGIC) {
+            bam_ordered_reader_t *reader = (bam_ordered_reader_t *)fp->state;
+            return sam_read1_bam_check_header(h, b,
+                                              bam_ordered_reader_next(reader, b));
+        }
+        if (magic == BAM_STREAM_READER_MAGIC) {
+            bam_stream_reader_t *reader = (bam_stream_reader_t *)fp->state;
+            return sam_read1_bam_check_header(h, b,
+                                              bam_stream_reader_next(reader, b));
+        }
+        if (magic == BAM_DEFERRED_THREADS_MAGIC) {
+            bam_deferred_threads_t *cfg =
+                (bam_deferred_threads_t *)fp->state;
+
+            if (bam_stream_env_enabled()) {
+                bam_stream_reader_t *reader = bam_stream_reader_open(fp, cfg, 0);
+                if (reader) {
+                    fp->state = NULL;
+                    bam_deferred_threads_destroy(cfg);
+                    fp->state = reader;
+                    return sam_read1_bam_check_header(h, b,
+                                                      bam_stream_reader_next(reader, b));
+                }
+                if (bam_stream_env_strict())
+                    return -2;
+            }
+
+            if (bam_ordered_env_enabled()) {
+                bam_ordered_reader_t *reader =
+                    bam_ordered_reader_open(fp, h, cfg->n_threads);
+                if (reader) {
+                    fp->state = NULL;
+                    bam_deferred_threads_destroy(cfg);
+                    fp->state = reader;
+                    return sam_read1_bam_check_header(h, b,
+                                                      bam_ordered_reader_next(reader, b));
+                }
+                if (bam_ordered_env_strict())
+                    return -2;
+            }
+
+            int ret = bam_deferred_threads_enable_bgzf(fp, cfg);
+            fp->state = NULL;
+            bam_deferred_threads_destroy(cfg);
+            if (ret < 0)
+                return -2;
+        }
+    } else if (bam_stream_env_enabled()) {
+        bam_stream_reader_t *reader = bam_stream_reader_open(fp, NULL, 0);
+        if (reader) {
+            fp->state = reader;
+            return sam_read1_bam_check_header(h, b,
+                                              bam_stream_reader_next(reader, b));
+        }
+        if (bam_stream_env_strict())
+            return -2;
+    } else if (bam_ordered_env_enabled()) {
+        bam_ordered_reader_t *reader = bam_ordered_reader_open(fp, h, 0);
+        if (reader) {
+            fp->state = reader;
+            return sam_read1_bam_check_header(h, b,
+                                              bam_ordered_reader_next(reader, b));
+        }
+        if (bam_ordered_env_strict())
+            return -2;
+    }
+
+    return sam_read1_bam_check_header(h, b, bam_read1(fp->fp.bgzf, b));
 }
 
 // Internal component of sam_read1 below
@@ -4321,15 +11983,59 @@ add33(uint8_t *a, const uint8_t * b, int32_t len) {
         a[i] = b[i]+33;
 }
 
-static int sam_format1_append(const bam_hdr_t *h, const bam1_t *b, kstring_t *str)
+static const uint8_t *sam_format_aux1_append(const uint8_t *key,
+                                             const uint8_t type,
+                                             const uint8_t *tag,
+                                             const uint8_t *end,
+                                             kstring_t *ks)
+{
+    if (type == 'Z' || type == 'H') {
+        const uint8_t *nul = memchr(tag, '\0', end - tag);
+        size_t len;
+        int r = 0;
+
+        if (!nul)
+            return NULL;
+        len = (size_t)(nul - tag);
+        if (ks_resize(ks, ks->l + 5 + len + 1) < 0)
+            return NULL;
+        r |= kputsn_((const char *)key, 2, ks);
+        r |= kputc_(':', ks);
+        r |= kputc_(type, ks);
+        r |= kputc_(':', ks);
+        r |= kputsn_((const char *)tag, len, ks);
+        r |= kputsn("", 0, ks);
+        return r < 0 ? NULL : nul + 1;
+    }
+    return sam_format_aux1(key, type, tag, end, ks);
+}
+
+static inline uint32_t sam_record_view_cigar_word(
+        const sam_bam_record_view_t *view, int idx)
+{
+    const uint8_t *cigar = sam_bam_record_view_cigar(view);
+
+    if (view->batch_record)
+        return le_to_u32(cigar + ((size_t)idx << 2));
+    return ((const uint32_t *)cigar)[idx];
+}
+
+static int sam_format_record_view_append(const bam_hdr_t *h,
+                                         const sam_bam_record_view_t *view,
+                                         kstring_t *str)
 {
     int i, r = 0;
-    uint8_t *s, *end;
-    const bam1_core_t *c = &b->core;
+    const uint8_t *s, *end;
+    const bam1_core_t *c = view->core;
+    const uint8_t *qname = sam_bam_record_view_qname(view);
+    int qname_len;
 
     if (c->l_qname == 0)
         return -1;
-    r |= kputsn_(bam_get_qname(b), c->l_qname-1-c->l_extranul, str);
+    qname_len = c->l_qname - 1 - (view->batch_record ? 0 : c->l_extranul);
+    if (qname_len < 0)
+        return -1;
+    r |= kputsn_((const char *)qname, qname_len, str);
     r |= kputc_('\t', str); // query name
     r |= kputw(c->flag, str); r |= kputc_('\t', str); // flag
     if (c->tid >= 0) { // chr
@@ -4339,10 +12045,11 @@ static int sam_format1_append(const bam_hdr_t *h, const bam1_t *b, kstring_t *st
     r |= kputll(c->pos + 1, str); r |= kputc_('\t', str); // pos
     r |= kputw(c->qual, str); r |= kputc_('\t', str); // qual
     if (c->n_cigar) { // cigar
-        uint32_t *cigar = bam_get_cigar(b);
         for (i = 0; i < c->n_cigar; ++i) {
-            r |= kputw(bam_cigar_oplen(cigar[i]), str);
-            r |= kputc_(bam_cigar_opchr(cigar[i]), str);
+            uint32_t cigar = sam_record_view_cigar_word(view, i);
+
+            r |= kputw(bam_cigar_oplen(cigar), str);
+            r |= kputc_(bam_cigar_opchr(cigar), str);
         }
     } else r |= kputc_('*', str);
     r |= kputc_('\t', str);
@@ -4355,22 +12062,23 @@ static int sam_format1_append(const bam_hdr_t *h, const bam1_t *b, kstring_t *st
     r |= kputll(c->mpos + 1, str); r |= kputc_('\t', str); // mate pos
     r |= kputll(c->isize, str); r |= kputc_('\t', str); // template len
     if (c->l_qseq) { // seq and qual
-        uint8_t *s = bam_get_seq(b);
+        const uint8_t *seq = sam_bam_record_view_seq(view);
+        const uint8_t *qual;
         if (ks_resize(str, str->l+2+2*c->l_qseq) < 0) goto mem_err;
         char *cp = str->s + str->l;
 
         // Sequence, 2 bases at a time
-        nibble2base(s, cp, c->l_qseq);
+        nibble2base((uint8_t *)seq, cp, c->l_qseq);
         cp[c->l_qseq] = '\t';
         cp += c->l_qseq+1;
 
         // Quality
-        s = bam_get_qual(b);
+        qual = sam_bam_record_view_qual(view);
         i = 0;
-        if (s[0] == 0xff) {
+        if (qual[0] == 0xff) {
             cp[i++] = '*';
         } else {
-            add33((uint8_t *)cp, s, c->l_qseq); // cp[i] = s[i]+33;
+            add33((uint8_t *)cp, qual, c->l_qseq); // cp[i] = s[i]+33;
             i = c->l_qseq;
         }
         cp[i] = 0;
@@ -4378,12 +12086,12 @@ static int sam_format1_append(const bam_hdr_t *h, const bam1_t *b, kstring_t *st
         str->l = cp - str->s;
     } else r |= kputsn_("*\t*", 3, str);
 
-    s = bam_get_aux(b); // aux
-    end = b->data + b->l_data;
+    s = sam_bam_record_view_aux(view); // aux
+    end = view->body + view->l_data;
 
     while (end - s >= 4) {
         r |= kputc_('\t', str);
-        if ((s = (uint8_t *)sam_format_aux1(s, s[2], s+3, end, str)) == NULL)
+        if ((s = sam_format_aux1_append(s, s[2], s+3, end, str)) == NULL)
             goto bad_aux;
     }
     r |= kputsn("", 0, str); // nul terminate
@@ -4393,7 +12101,7 @@ static int sam_format1_append(const bam_hdr_t *h, const bam1_t *b, kstring_t *st
 
  bad_aux:
     hts_log_error("Corrupted aux data for read %.*s flag %d",
-                  b->core.l_qname, bam_get_qname(b), b->core.flag);
+                  c->l_qname, qname, c->flag);
     errno = EINVAL;
     return -1;
 
@@ -4401,6 +12109,26 @@ static int sam_format1_append(const bam_hdr_t *h, const bam1_t *b, kstring_t *st
     hts_log_error("Out of memory");
     errno = ENOMEM;
     return -1;
+}
+
+static int sam_format1_append(const bam_hdr_t *h, const bam1_t *b, kstring_t *str)
+{
+    sam_bam_record_view_t view;
+
+    sam_bam_record_view_from_bam(&view, b);
+    return sam_format_record_view_append(h, &view, str);
+}
+
+static int sam_format_batch_record_append(const bam_hdr_t *h,
+                                          const bam_batch_record_t *record,
+                                          kstring_t *str)
+{
+    sam_bam_record_view_t view;
+
+    if (sam_bam_batch_record_validate_sam_cigar(record) < 0)
+        return -1;
+    sam_bam_record_view_from_batch(&view, record);
+    return sam_format_record_view_append(h, &view, str);
 }
 
 int sam_format1(const bam_hdr_t *h, const bam1_t *b, kstring_t *str)
@@ -4572,28 +12300,8 @@ int sam_write1(htsFile *fp, const sam_hdr_t *h, const bam1_t *b)
             SAM_state *fd = (SAM_state *)fp->state;
 
             // Threaded output
-            if (!fd->h) {
-                // NB: discard const.  We don't actually modify sam_hdr_t here,
-                // just data pointed to by it (which is a bit weasely still),
-                // but out cached pointer must be non-const as we want to
-                // destroy it later on and sam_hdr_destroy takes non-const.
-                //
-                // We do this because some tools do sam_hdr_destroy; sam_close
-                // while others do sam_close; sam_hdr_destroy.  The former is
-                // an issue as we need the header still when flushing.
-                fd->h = (sam_hdr_t *)h;
-                fd->h->ref_count++;
-
-                if (pthread_create(&fd->dispatcher, NULL, sam_dispatcher_write,
-                                   fp) != 0)
-                    return -2;
-                fd->dispatcher_set = 1;
-            }
-
-            if (fd->h != h) {
-                hts_log_error("SAM multi-threaded decoding does not support changing header");
+            if (sam_start_threaded_output(fp, h) < 0)
                 return -2;
-            }
 
             // Find a suitable BAM array to copy to
             sp_bams *gb = fd->curr_bam;

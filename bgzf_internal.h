@@ -23,6 +23,22 @@ DEALINGS IN THE SOFTWARE.  */
 #include <assert.h>
 #include "htslib/bgzf.h"
 
+typedef struct bgzf_block_data_t {
+    int64_t block_address;
+    int comp_len;
+    int uncomp_len;
+    int hit_eof;
+    int errcode;
+    uint8_t comp_data[BGZF_MAX_BLOCK_SIZE];
+    uint8_t uncomp_data[BGZF_MAX_BLOCK_SIZE];
+} bgzf_block_data_t;
+
+int bgzf_read_block_data(BGZF *fp, bgzf_block_data_t *block);
+int bgzf_read_block_compressed(BGZF *fp, bgzf_block_data_t *block);
+int bgzf_decode_block_data(BGZF *fp, bgzf_block_data_t *block);
+int bgzf_block_data_update_index(BGZF *fp, bgzf_block_data_t *block);
+int bgzf_raw_write_full_block(BGZF *fp, const void *data, size_t length);
+
 /*
  * BGZF private data interface
  * This exists so that we can pass BCF headers into interfaces that have
