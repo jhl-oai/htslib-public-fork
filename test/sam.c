@@ -45,6 +45,7 @@ DEALINGS IN THE SOFTWARE.  */
 #include "../htslib/hts_endian.h"
 #include "../htslib/faidx.h"
 #include "../htslib/khash.h"
+#include "../htslib/hts_expr.h"
 #include "../htslib/hts_log.h"
 #include "../htslib/thread_pool.h"
 #include "../sam_internal.h"
@@ -2413,6 +2414,7 @@ static void batch_reader_env(int enable, int strict)
     } else {
         unsetenv("HTS_BAM_BATCH_READER");
         unsetenv("HTS_BAM_BATCH_READER_REQUIRE");
+        unsetenv("HTS_BAM_BATCH_FUSED");
     }
 }
 
@@ -2528,6 +2530,17 @@ static void read_bam_batch_hash(const char *path, int hts_threads,
     htsThreadPool p = {NULL, 0};
     bam_batch_t batch = {0};
     bam1_t *materialized = NULL;
+    hts_filter_t *filter_mapq = NULL;
+    hts_filter_t *filter_aux = NULL;
+    hts_filter_t *filter_library = NULL;
+    hts_filter_t *filter_planned = NULL;
+    hts_filter_t *filter_planned_aux = NULL;
+    hts_filter_t *filter_planned_lazy = NULL;
+    sam_bam_filter_plan_t plan_expr = {0};
+    sam_bam_filter_plan_t plan_aux = {0};
+    sam_bam_filter_plan_t plan_library = {0};
+    sam_bam_filter_plan_t plan_lazy = {0};
+    sam_bam_filter_plan_t plan_unsupported = {0};
     uint64_t materialized_hash = 1469598103934665603ULL;
     int materialized_count = 0;
     int ret, batch_count = 0;
@@ -2555,6 +2568,46 @@ static void read_bam_batch_hash(const char *path, int hts_threads,
     VERIFY(hdr != NULL, "failed to read BAM header");
     materialized = bam_init1();
     VERIFY(materialized != NULL, "failed to initialize materialized BAM record");
+    filter_mapq = hts_filter_init("mapq >= 50");
+    filter_aux = hts_filter_init("[BC] == \"ACGT\" || [BC] == \"AATTCCGG\"");
+    filter_library = hts_filter_init("library == \"Library 2\"");
+    filter_planned = hts_filter_init("(mapq >= 50 && !(flag & 4))");
+    filter_planned_aux = hts_filter_init("[BC] == \"ACGT\"");
+    filter_planned_lazy = hts_filter_init("qlen >= 0 && rlen >= 0");
+    VERIFY(filter_mapq != NULL && filter_aux != NULL &&
+           filter_library != NULL && filter_planned != NULL &&
+           filter_planned_aux != NULL && filter_planned_lazy != NULL,
+           "failed to initialize BAM batch filter expressions");
+    VERIFY(sam_bam_filter_plan_init(&plan_expr,
+                                    "(mapq >= 50 && !(flag & 4))") == 0 &&
+           sam_bam_filter_plan_is_usable(&plan_expr) &&
+           sam_bam_filter_plan_class(&plan_expr) ==
+               SAM_BAM_FILTER_PLAN_RAW_VIEW_SAFE,
+           "failed to initialize raw-safe BAM batch filter plan");
+    VERIFY(sam_bam_filter_plan_init(&plan_aux, "[BC] == \"ACGT\"") == 0 &&
+           sam_bam_filter_plan_is_usable(&plan_aux) &&
+           sam_bam_filter_plan_class(&plan_aux) ==
+               SAM_BAM_FILTER_PLAN_LAZY_RAW_VIEW_SAFE,
+           "failed to initialize aux BAM batch filter plan");
+    VERIFY(sam_bam_filter_plan_init(&plan_library,
+                                    "library == \"Library 2\"") == 0 &&
+           sam_bam_filter_plan_is_usable(&plan_library) &&
+           sam_bam_filter_plan_class(&plan_library) ==
+               SAM_BAM_FILTER_PLAN_LAZY_RAW_VIEW_SAFE,
+           "failed to initialize library BAM batch filter plan");
+    VERIFY(sam_bam_filter_plan_init(&plan_lazy,
+                                    "qlen >= 0 && rlen >= 0") == 0 &&
+           sam_bam_filter_plan_is_usable(&plan_lazy) &&
+           sam_bam_filter_plan_class(&plan_lazy) ==
+               SAM_BAM_FILTER_PLAN_LAZY_RAW_VIEW_SAFE,
+           "failed to initialize lazy BAM batch filter plan");
+    VERIFY(sam_bam_filter_plan_init(&plan_unsupported,
+                                    "[BC] == \"ACGT\" || [BC] == \"AATTCCGG\"")
+           == 0 &&
+           !sam_bam_filter_plan_is_usable(&plan_unsupported) &&
+           sam_bam_filter_plan_class(&plan_unsupported) ==
+               SAM_BAM_FILTER_PLAN_MATERIALIZE_REQUIRED,
+           "unsupported BAM batch filter plan was not classified for fallback");
     out = sam_open(tmp, "wb");
     VERIFY(out != NULL, "failed to open temporary batch BAM");
     VERIFY(sam_hdr_write(out, hdr) >= 0,
@@ -2562,12 +2615,43 @@ static void read_bam_batch_hash(const char *path, int hts_threads,
 
     while ((ret = sam_bam_read_batch(fp, hdr, &batch)) >= 0) {
         size_t view_len = 0;
+        size_t storage_len = 0;
         int i;
 
         VERIFY(ret == batch.n_records, "BAM batch returned bad count");
         VERIFY(batch.records != NULL, "BAM batch did not return record views");
+        if (batch.n_segments > 0) {
+            int rec_i = 0;
+
+            VERIFY(batch.segments != NULL,
+                   "BAM segmented batch did not return segments");
+            for (i = 0; i < batch.n_segments; i++) {
+                const bam_batch_segment_t *seg = &batch.segments[i];
+                size_t off = 0;
+
+                VERIFY(seg->data != NULL && seg->len > 0,
+                       "BAM segmented batch returned an empty segment");
+                storage_len += seg->len;
+                while (off < seg->len) {
+                    const bam_batch_record_t *rec;
+
+                    VERIFY(rec_i < batch.n_records,
+                           "BAM segmented batch has extra record bytes");
+                    rec = &batch.records[rec_i];
+                    VERIFY(rec->frame == seg->data + off &&
+                           rec->frame_len <= seg->len - off,
+                           "BAM segmented batch record view points outside segment");
+                    off += rec->frame_len;
+                    rec_i++;
+                }
+            }
+            VERIFY(rec_i == batch.n_records,
+                   "BAM segmented batch did not cover all record views");
+        } else {
+            storage_len = batch.len;
+        }
         for (i = 0; i < batch.n_records; i++) {
-            const bam_batch_record_t *rec = &batch.records[i];
+            bam_batch_record_t *rec = &batch.records[i];
             const uint8_t *qname = sam_bam_batch_record_qname(rec);
             const uint8_t *cigar = sam_bam_batch_record_cigar(rec);
             const uint8_t *seq = sam_bam_batch_record_seq(rec);
@@ -2577,9 +2661,10 @@ static void read_bam_batch_hash(const char *path, int hts_threads,
             hts_pos_t batch_qlen = 0, materialized_qlen = 0;
             int k;
 
-            VERIFY(rec->frame >= batch.data &&
-                   rec->frame + rec->frame_len <= batch.data + batch.len,
-                   "BAM batch record view points outside batch");
+            if (batch.n_segments == 0)
+                VERIFY(rec->frame >= batch.data &&
+                       rec->frame + rec->frame_len <= batch.data + batch.len,
+                       "BAM batch record view points outside batch");
             VERIFY(rec->body == rec->frame + 4 + 32,
                    "BAM batch record view body pointer is wrong");
             VERIFY(qname == rec->body, "BAM batch qname accessor is wrong");
@@ -2595,6 +2680,66 @@ static void read_bam_batch_hash(const char *path, int hts_threads,
                    "BAM batch aux length is wrong");
             VERIFY(sam_bam_batch_record_to_bam1(rec, materialized) >= 0,
                    "failed to materialize BAM batch record");
+            {
+                struct {
+                    hts_filter_t *filter;
+                    const char *name;
+                } filters[] = {
+                    {filter_mapq, "mapq"},
+                    {filter_aux, "aux"},
+                    {filter_library, "library"}
+                };
+                int f;
+
+                for (f = 0; f < (int)(sizeof(filters) / sizeof(filters[0]));
+                     f++) {
+                    int view_materialized = 0;
+                    int view_pass = sam_bam_batch_record_passes_filter(
+                        hdr, rec, materialized, filters[f].filter,
+                        &view_materialized);
+                    int bam_pass = sam_passes_filter(hdr, materialized,
+                                                     filters[f].filter);
+
+                    VERIFY(view_pass >= 0,
+                           "BAM batch record-view filter evaluation failed");
+                    VERIFY(view_pass == bam_pass,
+                           "BAM batch record-view filter differs from bam1_t");
+                    (void)filters[f].name;
+                }
+            }
+            {
+                struct {
+                    hts_filter_t *filter;
+                    sam_bam_filter_plan_t *plan;
+                    const char *name;
+                } filters[] = {
+                    {filter_planned, &plan_expr, "planned"},
+                    {filter_planned_aux, &plan_aux, "planned_aux"},
+                    {filter_library, &plan_library, "planned_library"},
+                    {filter_planned_lazy, &plan_lazy, "planned_lazy"}
+                };
+                int f, unsupported_materialized = 0;
+
+                VERIFY(sam_bam_batch_record_passes_filter_plan(
+                           hdr, rec, materialized, &plan_unsupported,
+                           &unsupported_materialized) == -2,
+                       "unsupported BAM batch filter plan did not request fallback");
+                for (f = 0; f < (int)(sizeof(filters) / sizeof(filters[0]));
+                     f++) {
+                    int plan_materialized = 0;
+                    int plan_pass = sam_bam_batch_record_passes_filter_plan(
+                        hdr, rec, materialized, filters[f].plan,
+                        &plan_materialized);
+                    int bam_pass = sam_passes_filter(hdr, materialized,
+                                                     filters[f].filter);
+
+                    VERIFY(plan_pass >= 0,
+                           "BAM batch planned filter evaluation failed");
+                    VERIFY(plan_pass == bam_pass,
+                           "BAM batch planned filter differs from bam1_t");
+                    (void)filters[f].name;
+                }
+            }
             VERIFY(strcmp((const char *)qname, bam_get_qname(materialized)) == 0,
                    "BAM batch qname differs after materialization");
             if ((size_t)materialized->l_data == rec->raw_l_data &&
@@ -2633,9 +2778,10 @@ static void read_bam_batch_hash(const char *path, int hts_threads,
             materialized_count++;
             view_len += rec->frame_len;
         }
-        VERIFY(view_len == batch.len, "BAM batch record views length mismatch");
-        VERIFY(bgzf_write(out->fp.bgzf, batch.data, batch.len) ==
-               (ssize_t)batch.len, "failed to write temporary batch records");
+        VERIFY(view_len == storage_len,
+               "BAM batch record views length mismatch");
+        VERIFY(sam_bam_batch_write1(out, hdr, &batch) >= 0,
+               "failed to write temporary batch records");
         batch_count += batch.n_records;
         sam_bam_batch_destroy(&batch);
     }
@@ -2650,6 +2796,17 @@ static void read_bam_batch_hash(const char *path, int hts_threads,
            "BAM batch materialized records differ from rewritten records");
 
 cleanup:
+    hts_filter_free(filter_mapq);
+    hts_filter_free(filter_aux);
+    hts_filter_free(filter_library);
+    hts_filter_free(filter_planned);
+    hts_filter_free(filter_planned_aux);
+    hts_filter_free(filter_planned_lazy);
+    sam_bam_filter_plan_destroy(&plan_expr);
+    sam_bam_filter_plan_destroy(&plan_aux);
+    sam_bam_filter_plan_destroy(&plan_library);
+    sam_bam_filter_plan_destroy(&plan_lazy);
+    sam_bam_filter_plan_destroy(&plan_unsupported);
     bam_destroy1(materialized);
     sam_bam_batch_destroy(&batch);
     sam_hdr_destroy(hdr);
@@ -2758,14 +2915,661 @@ cleanup:
     batch_reader_env(0, 0);
 }
 
+static void write_bam_batch_range_selected(const char *src, const char *dst)
+{
+    samFile *in = NULL, *out = NULL;
+    sam_hdr_t *hdr = NULL;
+    bam_batch_t batch = {0};
+    int ret, global_i = 0;
+
+    batch_reader_env(1, 1);
+    in = sam_open(src, "rb");
+    VERIFY(in != NULL, "failed to open range-writer source BAM");
+    hdr = sam_hdr_read(in);
+    VERIFY(hdr != NULL, "failed to read range-writer source header");
+    out = sam_open(dst, "wb");
+    VERIFY(out != NULL, "failed to open range-writer output BAM");
+    VERIFY(sam_hdr_write(out, hdr) == 0,
+           "failed to write range-writer output header");
+
+    while ((ret = sam_bam_read_batch(in, hdr, &batch)) >= 0) {
+        int i, run_start = -1;
+
+        for (i = 0; i < batch.n_records; i++, global_i++) {
+            if (global_i % 3 != 2) {
+                if (run_start < 0)
+                    run_start = i;
+                continue;
+            }
+            if (run_start >= 0) {
+                VERIFY(sam_bam_batch_write1_range(out, hdr, &batch,
+                                                  run_start, i) >= 0,
+                       "failed to write selected BAM batch range");
+                run_start = -1;
+            }
+        }
+        if (run_start >= 0)
+            VERIFY(sam_bam_batch_write1_range(out, hdr, &batch,
+                                              run_start, batch.n_records) >= 0,
+                   "failed to write final selected BAM batch range");
+        sam_bam_batch_destroy(&batch);
+    }
+    VERIFY(ret == -1, "failed to read all range-writer source batches");
+    VERIFY(sam_close(out) == 0, "failed to close range-writer output BAM");
+    out = NULL;
+
+cleanup:
+    sam_bam_batch_destroy(&batch);
+    sam_hdr_destroy(hdr);
+    if (out)
+        sam_close(out);
+    if (in)
+        sam_close(in);
+    batch_reader_env(0, 0);
+}
+
+static void check_bam_batch_range_selected(const char *src, const char *dst)
+{
+    samFile *expected_fp = NULL, *actual_fp = NULL;
+    sam_hdr_t *expected_hdr = NULL, *actual_hdr = NULL;
+    bam1_t *expected = NULL, *actual = NULL;
+    int ret, global_i = 0, kept = 0;
+
+    expected_fp = sam_open(src, "rb");
+    actual_fp = sam_open(dst, "rb");
+    VERIFY(expected_fp != NULL && actual_fp != NULL,
+           "failed to open range-writer compare BAMs");
+    expected_hdr = sam_hdr_read(expected_fp);
+    actual_hdr = sam_hdr_read(actual_fp);
+    VERIFY(expected_hdr != NULL && actual_hdr != NULL,
+           "failed to read range-writer compare headers");
+    expected = bam_init1();
+    actual = bam_init1();
+    VERIFY(expected != NULL && actual != NULL,
+           "failed to allocate range-writer compare records");
+
+    while ((ret = sam_read1(expected_fp, expected_hdr, expected)) >= 0) {
+        if (global_i % 3 != 2) {
+            VERIFY(sam_read1(actual_fp, actual_hdr, actual) >= 0,
+                   "range-writer output ended early");
+            VERIFY(bam1_exact_match(expected, actual),
+                   "range-writer output record differs from source");
+            kept++;
+        }
+        global_i++;
+    }
+    VERIFY(ret == -1, "failed to read range-writer source records");
+    VERIFY(sam_read1(actual_fp, actual_hdr, actual) == -1,
+           "range-writer output has extra records");
+    VERIFY(kept > 0, "range-writer test kept no records");
+
+cleanup:
+    bam_destroy1(actual);
+    bam_destroy1(expected);
+    sam_hdr_destroy(actual_hdr);
+    sam_hdr_destroy(expected_hdr);
+    if (actual_fp)
+        sam_close(actual_fp);
+    if (expected_fp)
+        sam_close(expected_fp);
+}
+
+static void test_bam_batch_range_writer(void)
+{
+    const char *src = "test/range.bam";
+    const char *dst = "test/test_bam_batch_range_writer.tmp.bam";
+
+    unlink(dst);
+    write_bam_batch_range_selected(src, dst);
+    check_bam_batch_range_selected(src, dst);
+    unlink(dst);
+}
+
+static void write_bam_batch_range_flags(const char *src, const char *dst,
+                                        uint16_t set_flags,
+                                        uint16_t clear_flags)
+{
+    samFile *in = NULL, *out = NULL;
+    sam_hdr_t *hdr = NULL;
+    bam_batch_t batch = {0};
+    int ret;
+
+    batch_reader_env(1, 1);
+    in = sam_open(src, "rb");
+    VERIFY(in != NULL, "failed to open flag range-writer source BAM");
+    hdr = sam_hdr_read(in);
+    VERIFY(hdr != NULL, "failed to read flag range-writer source header");
+    out = sam_open(dst, "wb");
+    VERIFY(out != NULL, "failed to open flag range-writer output BAM");
+    VERIFY(sam_hdr_write(out, hdr) == 0,
+           "failed to write flag range-writer output header");
+
+    while ((ret = sam_bam_read_batch(in, hdr, &batch)) >= 0) {
+        VERIFY(sam_bam_batch_write1_range_flags(out, hdr, &batch, 0,
+                                                batch.n_records, set_flags,
+                                                clear_flags) >= 0,
+               "failed to write flag-patched BAM batch range");
+        sam_bam_batch_destroy(&batch);
+    }
+    VERIFY(ret == -1, "failed to read all flag range-writer source batches");
+    VERIFY(sam_close(out) == 0,
+           "failed to close flag range-writer output BAM");
+    out = NULL;
+
+cleanup:
+    sam_bam_batch_destroy(&batch);
+    sam_hdr_destroy(hdr);
+    if (out)
+        sam_close(out);
+    if (in)
+        sam_close(in);
+    batch_reader_env(0, 0);
+}
+
+static void check_bam_batch_range_flags(const char *src, const char *dst,
+                                        uint16_t set_flags,
+                                        uint16_t clear_flags)
+{
+    samFile *expected_fp = NULL, *actual_fp = NULL;
+    sam_hdr_t *expected_hdr = NULL, *actual_hdr = NULL;
+    bam1_t *expected = NULL, *actual = NULL;
+    int ret, count = 0, cleared = 0;
+
+    expected_fp = sam_open(src, "rb");
+    actual_fp = sam_open(dst, "rb");
+    VERIFY(expected_fp != NULL && actual_fp != NULL,
+           "failed to open flag range-writer compare BAMs");
+    expected_hdr = sam_hdr_read(expected_fp);
+    actual_hdr = sam_hdr_read(actual_fp);
+    VERIFY(expected_hdr != NULL && actual_hdr != NULL,
+           "failed to read flag range-writer compare headers");
+    expected = bam_init1();
+    actual = bam_init1();
+    VERIFY(expected != NULL && actual != NULL,
+           "failed to allocate flag range-writer compare records");
+
+    while ((ret = sam_read1(expected_fp, expected_hdr, expected)) >= 0) {
+        uint16_t old_flag = expected->core.flag;
+
+        VERIFY(sam_read1(actual_fp, actual_hdr, actual) >= 0,
+               "flag range-writer output ended early");
+        expected->core.flag = (uint16_t)((old_flag | set_flags) & ~clear_flags);
+        if ((old_flag & clear_flags) && !(expected->core.flag & clear_flags))
+            cleared++;
+        VERIFY(bam1_exact_match(expected, actual),
+               "flag range-writer output record differs from expected flags");
+        count++;
+    }
+    VERIFY(ret == -1, "failed to read flag range-writer source records");
+    VERIFY(sam_read1(actual_fp, actual_hdr, actual) == -1,
+           "flag range-writer output has extra records");
+    VERIFY(count > 0, "flag range-writer test saw no records");
+    VERIFY(cleared > 0, "flag range-writer test did not exercise flag clearing");
+
+cleanup:
+    bam_destroy1(actual);
+    bam_destroy1(expected);
+    sam_hdr_destroy(actual_hdr);
+    sam_hdr_destroy(expected_hdr);
+    if (actual_fp)
+        sam_close(actual_fp);
+    if (expected_fp)
+        sam_close(expected_fp);
+}
+
+static void test_bam_batch_range_flag_writer(void)
+{
+    const char *src = "test/range.bam";
+    const char *dst = "test/test_bam_batch_range_flag_writer.tmp.bam";
+
+    unlink(dst);
+    write_bam_batch_range_flags(src, dst, BAM_FQCFAIL, BAM_FPROPER_PAIR);
+    check_bam_batch_range_flags(src, dst, BAM_FQCFAIL, BAM_FPROPER_PAIR);
+    unlink(dst);
+}
+
+static size_t make_batch_validate_record(uint8_t *frame,
+                                         bam_batch_record_t *rec,
+                                         int missing_qname_nul,
+                                         int bad_bin,
+                                         int bad_cigar_qlen);
+
+static void test_bam_batch_range_writer_no_partial_fallback(void)
+{
+    const char *dst =
+        "test/test_bam_batch_range_writer_no_partial.tmp.bam";
+    uint8_t frame0[4 + 32 + 64], frame1[4 + 32 + 64], frame2[4 + 32 + 64];
+    bam_batch_record_t records[3];
+    bam_batch_t batch = {0};
+    samFile *out = NULL, *in = NULL;
+    sam_hdr_t *hdr = NULL, *read_hdr = NULL;
+    bam1_t *b = NULL;
+    int ret, count = 0;
+
+    unlink(dst);
+    make_batch_validate_record(frame0, &records[0], 0, 0, 0);
+    make_batch_validate_record(frame1, &records[1], 0, 0, 0);
+    make_batch_validate_record(frame2, &records[2], 0, 1, 0);
+    batch.n_records = 3;
+    batch.records = records;
+
+    out = sam_open(dst, "wb");
+    VERIFY(out != NULL, "failed to open no-partial range-writer output");
+    hdr = bam_hdr_init();
+    VERIFY(hdr != NULL, "failed to create no-partial range-writer header");
+    VERIFY(sam_hdr_add_line(hdr, "SQ", "SN", "t1", "LN", "100000",
+                            NULL) == 0,
+           "failed to add no-partial range-writer SQ header");
+    VERIFY(sam_hdr_write(out, hdr) == 0,
+           "failed to write no-partial range-writer header");
+    VERIFY(sam_bam_batch_write1_range(out, hdr, &batch, 0, 3) == -2,
+           "range writer accepted a range needing materialization");
+    VERIFY(sam_close(out) == 0,
+           "failed to close no-partial range-writer output");
+    out = NULL;
+
+    in = sam_open(dst, "rb");
+    VERIFY(in != NULL, "failed to reopen no-partial range-writer output");
+    read_hdr = sam_hdr_read(in);
+    VERIFY(read_hdr != NULL,
+           "failed to read no-partial range-writer output header");
+    b = bam_init1();
+    VERIFY(b != NULL, "failed to allocate no-partial range-writer record");
+    while ((ret = sam_read1(in, read_hdr, b)) >= 0)
+        count++;
+    VERIFY(ret == -1, "failed to read no-partial range-writer output");
+    VERIFY(count == 0, "range writer emitted a partial raw prefix before -2");
+
+cleanup:
+    bam_destroy1(b);
+    sam_hdr_destroy(read_hdr);
+    sam_hdr_destroy(hdr);
+    if (in)
+        sam_close(in);
+    if (out)
+        sam_close(out);
+    unlink(dst);
+}
+
+static void test_bam_batch_range_flag_writer_no_partial_fallback(void)
+{
+    const char *dst =
+        "test/test_bam_batch_range_flag_writer_no_partial.tmp.bam";
+    uint8_t frame0[4 + 32 + 64], frame1[4 + 32 + 64], frame2[4 + 32 + 64];
+    bam_batch_record_t records[3];
+    bam_batch_t batch = {0};
+    samFile *out = NULL, *in = NULL;
+    sam_hdr_t *hdr = NULL, *read_hdr = NULL;
+    bam1_t *b = NULL;
+    int ret, count = 0;
+
+    unlink(dst);
+    make_batch_validate_record(frame0, &records[0], 0, 0, 0);
+    make_batch_validate_record(frame1, &records[1], 0, 0, 0);
+    make_batch_validate_record(frame2, &records[2], 0, 1, 0);
+    batch.n_records = 3;
+    batch.records = records;
+
+    out = sam_open(dst, "wb");
+    VERIFY(out != NULL, "failed to open no-partial flag range-writer output");
+    hdr = bam_hdr_init();
+    VERIFY(hdr != NULL, "failed to create no-partial flag range-writer header");
+    VERIFY(sam_hdr_add_line(hdr, "SQ", "SN", "t1", "LN", "100000",
+                            NULL) == 0,
+           "failed to add no-partial flag range-writer SQ header");
+    VERIFY(sam_hdr_write(out, hdr) == 0,
+           "failed to write no-partial flag range-writer header");
+    VERIFY(sam_bam_batch_write1_range_flags(out, hdr, &batch, 0, 3,
+                                            BAM_FQCFAIL,
+                                            BAM_FPROPER_PAIR) == -2,
+           "flag range writer accepted a range needing materialization");
+    VERIFY(sam_close(out) == 0,
+           "failed to close no-partial flag range-writer output");
+    out = NULL;
+
+    in = sam_open(dst, "rb");
+    VERIFY(in != NULL,
+           "failed to reopen no-partial flag range-writer output");
+    read_hdr = sam_hdr_read(in);
+    VERIFY(read_hdr != NULL,
+           "failed to read no-partial flag range-writer output header");
+    b = bam_init1();
+    VERIFY(b != NULL,
+           "failed to allocate no-partial flag range-writer record");
+    while ((ret = sam_read1(in, read_hdr, b)) >= 0)
+        count++;
+    VERIFY(ret == -1, "failed to read no-partial flag range-writer output");
+    VERIFY(count == 0,
+           "flag range writer emitted a partial raw prefix before -2");
+
+cleanup:
+    bam_destroy1(b);
+    sam_hdr_destroy(read_hdr);
+    sam_hdr_destroy(hdr);
+    if (in)
+        sam_close(in);
+    if (out)
+        sam_close(out);
+    unlink(dst);
+}
+
+static void test_bam_batch_range_writer_rejects_bad_layout(void)
+{
+    const char *dst =
+        "test/test_bam_batch_range_writer_bad_layout.tmp.bam";
+    uint8_t frame[4 + 32 + 64];
+    bam_batch_record_t record;
+    bam_batch_t batch = {0};
+    samFile *out = NULL, *in = NULL;
+    sam_hdr_t *hdr = NULL, *read_hdr = NULL;
+    bam1_t *b = NULL;
+    int ret, count = 0;
+
+    unlink(dst);
+    make_batch_validate_record(frame, &record, 0, 0, 0);
+    record.body = frame + 35;
+    batch.n_records = 1;
+    batch.records = &record;
+
+    out = sam_open(dst, "wb");
+    VERIFY(out != NULL, "failed to open bad-layout range-writer output");
+    hdr = bam_hdr_init();
+    VERIFY(hdr != NULL, "failed to create bad-layout range-writer header");
+    VERIFY(sam_hdr_add_line(hdr, "SQ", "SN", "t1", "LN", "100000",
+                            NULL) == 0,
+           "failed to add bad-layout range-writer SQ header");
+    VERIFY(sam_hdr_write(out, hdr) == 0,
+           "failed to write bad-layout range-writer header");
+    VERIFY(sam_bam_batch_write1_range(out, hdr, &batch, 0, 1) == -2,
+           "range writer accepted a bad record layout");
+    VERIFY(sam_bam_batch_write1_range_flags(out, hdr, &batch, 0, 1,
+                                            BAM_FQCFAIL, 0) == -2,
+           "flag range writer accepted a bad record layout");
+    VERIFY(sam_close(out) == 0,
+           "failed to close bad-layout range-writer output");
+    out = NULL;
+
+    in = sam_open(dst, "rb");
+    VERIFY(in != NULL, "failed to reopen bad-layout range-writer output");
+    read_hdr = sam_hdr_read(in);
+    VERIFY(read_hdr != NULL,
+           "failed to read bad-layout range-writer output header");
+    b = bam_init1();
+    VERIFY(b != NULL, "failed to allocate bad-layout range-writer record");
+    while ((ret = sam_read1(in, read_hdr, b)) >= 0)
+        count++;
+    VERIFY(ret == -1, "failed to read bad-layout range-writer output");
+    VERIFY(count == 0, "bad-layout range writer emitted a raw record");
+
+cleanup:
+    bam_destroy1(b);
+    sam_hdr_destroy(read_hdr);
+    sam_hdr_destroy(hdr);
+    if (in)
+        sam_close(in);
+    if (out)
+        sam_close(out);
+    unlink(dst);
+}
+
+static int test_batch_aux_keep_filter(const char tag[2],
+                                      const uint8_t *value,
+                                      void *data)
+{
+    (void)value;
+    (void)data;
+    return (tag[0] == 'A' && tag[1] == 'A') ||
+           (tag[0] == 'C' && tag[1] == 'C');
+}
+
+static int test_batch_aux_remove_filter(const char tag[2],
+                                        const uint8_t *value,
+                                        void *data)
+{
+    (void)value;
+    (void)data;
+    return !(tag[0] == 'B' && tag[1] == 'B');
+}
+
+static void write_batch_aux_filter_input(const char *path)
+{
+    const char *seq = "ACGTACGTAC";
+    const char *qual = "abcdefghij";
+    const uint32_t cigar = 10 << BAM_CIGAR_SHIFT | BAM_CMATCH;
+    const char bb[] = "drop-me";
+    int32_t aa = 7, cc = 11;
+    samFile *fp = NULL;
+    sam_hdr_t *hdr = NULL;
+    bam1_t *b = NULL;
+    int i;
+
+    fp = sam_open(path, "wb");
+    VERIFY(fp != NULL, "failed to open aux-filter input BAM");
+    hdr = bam_hdr_init();
+    VERIFY(hdr != NULL, "failed to create aux-filter header");
+    VERIFY(sam_hdr_add_line(hdr, "SQ", "SN", "t1", "LN", "5000",
+                            NULL) == 0,
+           "failed to add aux-filter SQ header");
+    VERIFY(sam_hdr_write(fp, hdr) == 0,
+           "failed to write aux-filter input header");
+
+    b = bam_init1();
+    VERIFY(b != NULL, "failed to create aux-filter input record");
+    for (i = 0; i < 2; i++) {
+        char qname[3] = { 'r', (char)('1' + i), '\0' };
+
+        VERIFY(bam_set1(b, strlen(qname), qname, 0, 0, 100 + i, 60,
+                        1, &cigar, -1, -1, 0, strlen(seq), seq, qual,
+                        0) >= 0,
+               "failed to populate aux-filter input record");
+        VERIFY(bam_aux_append(b, "AA", 'i', sizeof(aa),
+                              (uint8_t *)&aa) == 0,
+               "failed to append AA aux tag");
+        VERIFY(bam_aux_append(b, "BB", 'Z', sizeof(bb),
+                              (const uint8_t *)bb) == 0,
+               "failed to append BB aux tag");
+        VERIFY(bam_aux_append(b, "CC", 'i', sizeof(cc),
+                              (uint8_t *)&cc) == 0,
+               "failed to append CC aux tag");
+        VERIFY(sam_write1(fp, hdr, b) >= 0,
+               "failed to write aux-filter input record");
+    }
+
+cleanup:
+    bam_destroy1(b);
+    sam_hdr_destroy(hdr);
+    if (fp)
+        sam_close(fp);
+}
+
+static void write_batch_aux_filtered_output(
+        const char *src, const char *dst, sam_bam_aux_filter_f filter)
+{
+    samFile *in = NULL, *out = NULL;
+    sam_hdr_t *hdr = NULL;
+    bam_batch_t batch = {0};
+    int ret;
+
+    batch_reader_env(1, 1);
+    in = sam_open(src, "rb");
+    VERIFY(in != NULL, "failed to open aux-filter source BAM");
+    hdr = sam_hdr_read(in);
+    VERIFY(hdr != NULL, "failed to read aux-filter source header");
+    out = sam_open(dst, "wb");
+    VERIFY(out != NULL, "failed to open aux-filter output BAM");
+    VERIFY(sam_hdr_write(out, hdr) == 0,
+           "failed to write aux-filter output header");
+
+    while ((ret = sam_bam_read_batch(in, hdr, &batch)) >= 0) {
+        int i;
+
+        for (i = 0; i < batch.n_records; i++)
+            VERIFY(sam_bam_batch_record_write1_aux_filtered(
+                       out, hdr, &batch.records[i], filter, NULL) >= 0,
+                   "failed to write aux-filtered batch record");
+        sam_bam_batch_destroy(&batch);
+    }
+    VERIFY(ret == -1, "failed to read all aux-filter source batches");
+    VERIFY(sam_close(out) == 0, "failed to close aux-filter output BAM");
+    out = NULL;
+
+cleanup:
+    sam_bam_batch_destroy(&batch);
+    sam_hdr_destroy(hdr);
+    if (out)
+        sam_close(out);
+    if (in)
+        sam_close(in);
+    batch_reader_env(0, 0);
+}
+
+static void check_batch_aux_filtered_output(const char *path)
+{
+    samFile *fp = NULL;
+    sam_hdr_t *hdr = NULL;
+    bam1_t *b = NULL;
+    int ret, count = 0;
+
+    fp = sam_open(path, "rb");
+    VERIFY(fp != NULL, "failed to open aux-filtered BAM");
+    hdr = sam_hdr_read(fp);
+    VERIFY(hdr != NULL, "failed to read aux-filtered header");
+    b = bam_init1();
+    VERIFY(b != NULL, "failed to create aux-filter read record");
+
+    while ((ret = sam_read1(fp, hdr, b)) >= 0) {
+        uint8_t *aa = bam_aux_get(b, "AA");
+        uint8_t *bb = bam_aux_get(b, "BB");
+        uint8_t *cc = bam_aux_get(b, "CC");
+
+        VERIFY(aa != NULL && *aa == 'i' && bam_aux2i(aa) == 7,
+               "AA aux tag was not preserved");
+        VERIFY(bb == NULL, "BB aux tag was not removed");
+        VERIFY(cc != NULL && *cc == 'i' && bam_aux2i(cc) == 11,
+               "CC aux tag was not preserved");
+        check_aux_count(b, 2, "Aux-filtered batch record");
+        count++;
+    }
+    VERIFY(ret == -1, "failed to read all aux-filtered records");
+    VERIFY(count == 2, "aux-filtered BAM has wrong record count");
+
+cleanup:
+    bam_destroy1(b);
+    sam_hdr_destroy(hdr);
+    if (fp)
+        sam_close(fp);
+}
+
+static void test_bam_batch_aux_filtered_writer(void)
+{
+    const char *src = "test/test_bam_batch_aux_filter.in.tmp.bam";
+    const char *keep = "test/test_bam_batch_aux_filter.keep.tmp.bam";
+    const char *remove = "test/test_bam_batch_aux_filter.remove.tmp.bam";
+
+    unlink(src);
+    unlink(keep);
+    unlink(remove);
+
+    write_batch_aux_filter_input(src);
+    write_batch_aux_filtered_output(src, keep, test_batch_aux_keep_filter);
+    check_batch_aux_filtered_output(keep);
+    write_batch_aux_filtered_output(src, remove, test_batch_aux_remove_filter);
+    check_batch_aux_filtered_output(remove);
+
+    unlink(src);
+    unlink(keep);
+    unlink(remove);
+}
+
+static void test_bam_batch_materialized_aux_edit(void)
+{
+    samFile *fp = NULL;
+    sam_hdr_t *hdr = NULL;
+    bam_batch_t batch = {0};
+    bam1_t *b = NULL;
+    uint8_t *zz, *yi;
+    int32_t ival = 42;
+    int ret;
+
+    batch_reader_env(1, 1);
+    fp = sam_open("test/range.bam", "rb");
+    VERIFY(fp != NULL, "failed to open aux-edit source BAM");
+    hdr = sam_hdr_read(fp);
+    VERIFY(hdr != NULL, "failed to read aux-edit source header");
+    b = bam_init1();
+    VERIFY(b != NULL, "failed to allocate aux-edit materialized record");
+    ret = sam_bam_read_batch(fp, hdr, &batch);
+    VERIFY(ret > 0 && batch.n_records > 0,
+           "failed to read aux-edit source batch");
+    VERIFY(sam_bam_batch_record_to_bam1(&batch.records[0], b) >= 0,
+           "failed to materialize aux-edit batch record");
+
+    VERIFY(bam_aux_update_str(b, "ZZ", 5, "edit") == 0,
+           "failed to update materialized aux string");
+    VERIFY(bam_aux_append(b, "YI", 'i', sizeof(ival),
+                          (uint8_t *)&ival) == 0,
+           "failed to append materialized aux integer");
+    zz = bam_aux_get(b, "ZZ");
+    yi = bam_aux_get(b, "YI");
+    VERIFY(zz != NULL && *zz == 'Z' && strcmp((char *)zz + 1, "edit") == 0,
+           "materialized aux string update is wrong");
+    VERIFY(yi != NULL && *yi == 'i' && bam_aux2i(yi) == 42,
+           "materialized aux integer append is wrong");
+
+cleanup:
+    bam_destroy1(b);
+    sam_bam_batch_destroy(&batch);
+    sam_hdr_destroy(hdr);
+    if (fp)
+        sam_close(fp);
+    batch_reader_env(0, 0);
+}
+
+static void test_bam_batch_aux_skip_malformed(void)
+{
+    const uint8_t unterminated_z[] = { 'Z', 'n', 'o' };
+    const uint8_t unterminated_h[] = { 'H', 'D', 'E', 'A', 'D' };
+    const uint8_t overflow_b[] = {
+        'B', 'd', 0xff, 0xff, 0xff, 0xff
+    };
+
+    VERIFY(sam_bam_record_view_aux_skip(
+               unterminated_z,
+               unterminated_z + sizeof(unterminated_z)) == NULL,
+           "unterminated Z aux tag was accepted");
+    VERIFY(sam_bam_record_view_aux_skip(
+               unterminated_h,
+               unterminated_h + sizeof(unterminated_h)) == NULL,
+           "unterminated H aux tag was accepted");
+    VERIFY(sam_bam_record_view_aux_skip(
+               overflow_b, overflow_b + sizeof(overflow_b)) == NULL,
+           "overflowing B aux tag was accepted");
+
+cleanup:
+    return;
+}
+
 static uint64_t batch_reader_bytes_hash(const bam_batch_t *batch)
 {
     uint64_t h = 1469598103934665603ULL;
-    size_t i;
+    int j;
 
-    for (i = 0; i < batch->len; i++) {
-        h ^= batch->data[i];
-        h *= 1099511628211ULL;
+    if (batch->n_segments > 0) {
+        for (j = 0; j < batch->n_segments; j++) {
+            size_t i;
+
+            for (i = 0; i < batch->segments[j].len; i++) {
+                h ^= batch->segments[j].data[i];
+                h *= 1099511628211ULL;
+            }
+        }
+    } else {
+        size_t i;
+
+        for (i = 0; i < batch->len; i++) {
+            h ^= batch->data[i];
+            h *= 1099511628211ULL;
+        }
     }
     h ^= (uint64_t)batch->n_records;
     h *= 1099511628211ULL;
@@ -2886,6 +3690,225 @@ cleanup:
     return ret;
 }
 
+static int files_equal_plain(const char *a, const char *b)
+{
+    FILE *fa = NULL, *fb = NULL;
+    unsigned char ba[8192], bb[8192];
+    size_t na, nb;
+    int ret = 0;
+
+    fa = fopen(a, "rb");
+    fb = fopen(b, "rb");
+    if (!fa || !fb)
+        goto cleanup;
+    do {
+        na = fread(ba, 1, sizeof(ba), fa);
+        nb = fread(bb, 1, sizeof(bb), fb);
+        if (na != nb || (na && memcmp(ba, bb, na) != 0))
+            goto cleanup;
+    } while (na > 0);
+    if (ferror(fa) || ferror(fb))
+        goto cleanup;
+    ret = 1;
+
+cleanup:
+    if (fb)
+        fclose(fb);
+    if (fa)
+        fclose(fa);
+    return ret;
+}
+
+static void write_materialized_sam_selected(const char *src, const char *dst)
+{
+    samFile *in = NULL, *out = NULL;
+    sam_hdr_t *hdr = NULL;
+    bam1_t *b = NULL;
+    int ret, global_i = 0;
+
+    in = sam_open(src, "rb");
+    out = sam_open(dst, "w");
+    VERIFY(in != NULL && out != NULL,
+           "failed to open materialized SAM selected files");
+    hdr = sam_hdr_read(in);
+    VERIFY(hdr != NULL, "failed to read materialized SAM selected header");
+    VERIFY(sam_hdr_write(out, hdr) >= 0,
+           "failed to write materialized SAM selected header");
+    b = bam_init1();
+    VERIFY(b != NULL, "failed to allocate materialized SAM selected record");
+
+    while ((ret = sam_read1(in, hdr, b)) >= 0) {
+        if (global_i % 3 != 2)
+            VERIFY(sam_write1(out, hdr, b) >= 0,
+                   "failed to write materialized SAM selected record");
+        global_i++;
+    }
+    VERIFY(ret == -1, "failed to read materialized SAM selected source");
+    VERIFY(sam_close(out) == 0, "failed to close materialized SAM selected output");
+    out = NULL;
+
+cleanup:
+    bam_destroy1(b);
+    sam_hdr_destroy(hdr);
+    if (out)
+        sam_close(out);
+    if (in)
+        sam_close(in);
+}
+
+static void write_batch_sam_selected(const char *src, const char *dst,
+                                     int hts_threads)
+{
+    samFile *in = NULL, *out = NULL;
+    sam_hdr_t *hdr = NULL;
+    bam_batch_t batch = {0};
+    int ret, global_i = 0;
+
+    batch_reader_env(1, 1);
+    in = sam_open(src, "rb");
+    out = sam_open(dst, "w");
+    VERIFY(in != NULL && out != NULL,
+           "failed to open batch SAM selected files");
+    if (hts_threads > 0)
+        VERIFY(hts_set_threads(out, hts_threads) == 0,
+               "failed to set batch SAM selected output threads");
+    hdr = sam_hdr_read(in);
+    VERIFY(hdr != NULL, "failed to read batch SAM selected header");
+    VERIFY(sam_hdr_write(out, hdr) >= 0,
+           "failed to write batch SAM selected header");
+
+    while ((ret = sam_bam_read_batch(in, hdr, &batch)) >= 0) {
+        int i, run_start = -1;
+
+        for (i = 0; i < batch.n_records; i++, global_i++) {
+            if (global_i % 3 != 2) {
+                if (run_start < 0)
+                    run_start = i;
+                continue;
+            }
+            if (run_start >= 0) {
+                int range[2] = { run_start, i };
+                VERIFY(sam_bam_batch_write_sam_ranges(out, hdr, &batch,
+                                                      range, 1) >= 0,
+                       "failed to write batch SAM selected range");
+                run_start = -1;
+            }
+        }
+        if (run_start >= 0) {
+            int range[2] = { run_start, batch.n_records };
+            VERIFY(sam_bam_batch_write_sam_ranges(out, hdr, &batch,
+                                                  range, 1) >= 0,
+                   "failed to write final batch SAM selected range");
+        }
+        sam_bam_batch_destroy(&batch);
+    }
+    VERIFY(ret == -1, "failed to read all batch SAM selected records");
+    VERIFY(sam_close(out) == 0, "failed to close batch SAM selected output");
+    out = NULL;
+
+cleanup:
+    sam_bam_batch_destroy(&batch);
+    sam_hdr_destroy(hdr);
+    if (out)
+        sam_close(out);
+    if (in)
+        sam_close(in);
+    batch_reader_env(0, 0);
+}
+
+static void write_batch_sam_selected_steal(const char *src, const char *dst,
+                                           int hts_threads)
+{
+    samFile *in = NULL, *out = NULL;
+    sam_hdr_t *hdr = NULL;
+    bam_batch_t batch = {0};
+    int ret, global_i = 0;
+
+    batch_reader_env(1, 1);
+    in = sam_open(src, "rb");
+    out = sam_open(dst, "w");
+    VERIFY(in != NULL && out != NULL,
+           "failed to open stealing batch SAM selected files");
+    if (hts_threads > 0)
+        VERIFY(hts_set_threads(out, hts_threads) == 0,
+               "failed to set stealing batch SAM output threads");
+    hdr = sam_hdr_read(in);
+    VERIFY(hdr != NULL, "failed to read stealing batch SAM header");
+    VERIFY(sam_hdr_write(out, hdr) >= 0,
+           "failed to write stealing batch SAM header");
+
+    while ((ret = sam_bam_read_batch(in, hdr, &batch)) >= 0) {
+        int *ranges = NULL;
+        int i, run_start = -1, n_ranges = 0;
+
+        ranges = calloc((size_t)batch.n_records * 2, sizeof(*ranges));
+        VERIFY(ranges != NULL, "failed to allocate stealing batch SAM ranges");
+        for (i = 0; i < batch.n_records; i++, global_i++) {
+            if (global_i % 3 != 2) {
+                if (run_start < 0)
+                    run_start = i;
+                continue;
+            }
+            if (run_start >= 0) {
+                ranges[n_ranges * 2] = run_start;
+                ranges[n_ranges * 2 + 1] = i;
+                n_ranges++;
+                run_start = -1;
+            }
+        }
+        if (run_start >= 0) {
+            ranges[n_ranges * 2] = run_start;
+            ranges[n_ranges * 2 + 1] = batch.n_records;
+            n_ranges++;
+        }
+        VERIFY(sam_bam_batch_write_sam_ranges_steal(out, hdr, &batch,
+                                                    ranges, n_ranges) >= 0,
+               "failed to write stealing batch SAM selected ranges");
+        free(ranges);
+        sam_bam_batch_destroy(&batch);
+    }
+    VERIFY(ret == -1, "failed to read all stealing batch SAM records");
+    VERIFY(sam_close(out) == 0, "failed to close stealing batch SAM output");
+    out = NULL;
+
+cleanup:
+    sam_bam_batch_destroy(&batch);
+    sam_hdr_destroy(hdr);
+    if (out)
+        sam_close(out);
+    if (in)
+        sam_close(in);
+    batch_reader_env(0, 0);
+}
+
+static void test_bam_batch_sam_writer(void)
+{
+    const char *expected = "test/test_bam_batch_sam_writer.expected.tmp.sam";
+    const char *actual = "test/test_bam_batch_sam_writer.actual.tmp.sam";
+
+    unlink(expected);
+    unlink(actual);
+    write_materialized_sam_selected("test/range.bam", expected);
+
+    write_batch_sam_selected("test/range.bam", actual, 0);
+    VERIFY(files_equal_plain(expected, actual),
+           "unthreaded batch SAM writer differs from materialized SAM writer");
+    unlink(actual);
+
+    write_batch_sam_selected("test/range.bam", actual, 2);
+    VERIFY(files_equal_plain(expected, actual),
+           "threaded batch SAM writer differs from materialized SAM writer");
+    unlink(actual);
+
+    write_batch_sam_selected_steal("test/range.bam", actual, 2);
+    VERIFY(files_equal_plain(expected, actual),
+           "stealing batch SAM writer differs from materialized SAM writer");
+
+cleanup:
+    unlink(actual);
+    unlink(expected);
+}
+
 static int copy_file_with_trailing_junk(const char *src, const char *dst)
 {
     int ret = copy_file_plain(src, dst);
@@ -2958,6 +3981,777 @@ static void test_put_le32(uint8_t *buf, uint32_t val)
     buf[1] = (val >> 8) & 0xff;
     buf[2] = (val >> 16) & 0xff;
     buf[3] = (val >> 24) & 0xff;
+}
+
+static size_t make_batch_validate_record(uint8_t *frame,
+                                         bam_batch_record_t *rec,
+                                         int missing_qname_nul,
+                                         int bad_bin,
+                                         int bad_cigar_qlen)
+{
+    const int32_t pos = 100;
+    const int l_qname = 2;
+    const int l_qseq = 5;
+    const int cigar_len = bad_cigar_qlen ? 4 : 5;
+    const size_t seq_len = ((size_t)l_qseq + 1) >> 1;
+    const size_t raw_l_data = (size_t)l_qname + 4 + seq_len + l_qseq;
+    const size_t block_len = 32 + raw_l_data;
+    uint32_t bin = bad_bin ? 0 : hts_reg2bin(pos, pos + cigar_len, 14, 5);
+    uint8_t *body = frame + 4;
+    uint8_t *data = body + 32;
+
+    memset(frame, 0, 4 + block_len);
+    test_put_le32(frame, (uint32_t)block_len);
+    test_put_le32(body, 0);                       // tid
+    test_put_le32(body + 4, (uint32_t)pos);
+    test_put_le32(body + 8, (bin << 16) | (60u << 8) | l_qname);
+    test_put_le32(body + 12, 1);                  // flag, n_cigar
+    test_put_le32(body + 16, l_qseq);
+    test_put_le32(body + 20, 0xffffffffu);        // mtid
+    test_put_le32(body + 24, 0xffffffffu);        // mpos
+    test_put_le32(body + 28, 0);                  // isize
+    data[0] = 'r';
+    data[1] = missing_qname_nul ? 'x' : '\0';
+    test_put_le32(data + l_qname, (uint32_t)cigar_len << BAM_CIGAR_SHIFT);
+    memset(data + l_qname + 4, 0x11, seq_len);
+    memset(data + l_qname + 4 + seq_len, 30, l_qseq);
+
+    memset(rec, 0, sizeof(*rec));
+    rec->frame = frame;
+    rec->frame_len = 4 + block_len;
+    rec->body = data;
+    rec->raw_l_data = (uint32_t)raw_l_data;
+    rec->core.tid = 0;
+    rec->core.pos = pos;
+    rec->core.bin = bin;
+    rec->core.qual = 60;
+    rec->core.l_qname = l_qname;
+    rec->core.l_extranul = (-l_qname) & 3;
+    rec->core.flag = 0;
+    rec->core.n_cigar = 1;
+    rec->core.l_qseq = l_qseq;
+    rec->core.mtid = -1;
+    rec->core.mpos = -1;
+    rec->core.isize = 0;
+    return rec->frame_len;
+}
+
+static size_t make_batch_validate_cg_candidate(uint8_t *frame,
+                                               bam_batch_record_t *rec,
+                                               int with_cg,
+                                               int bad_cg_qlen)
+{
+    const int32_t pos = 100;
+    const int l_qname = 2;
+    const int l_qseq = 5;
+    const int n_cigar = 2;
+    const int fake_rlen = 10;
+    const size_t seq_len = ((size_t)l_qseq + 1) >> 1;
+    const size_t aux_len = with_cg ? 16 : 0;
+    const size_t raw_l_data = (size_t)l_qname + n_cigar * 4 +
+                              seq_len + l_qseq + aux_len;
+    const size_t block_len = 32 + raw_l_data;
+    const uint32_t bin = hts_reg2bin(pos, pos + fake_rlen, 14, 5);
+    uint8_t *body = frame + 4;
+    uint8_t *data = body + 32;
+    uint8_t *seq = data + l_qname + n_cigar * 4;
+    uint8_t *qual = seq + seq_len;
+    uint8_t *aux = qual + l_qseq;
+
+    memset(frame, 0, 4 + block_len);
+    test_put_le32(frame, (uint32_t)block_len);
+    test_put_le32(body, 0);                       // tid
+    test_put_le32(body + 4, (uint32_t)pos);
+    test_put_le32(body + 8, (bin << 16) | (60u << 8) | l_qname);
+    test_put_le32(body + 12, n_cigar);            // flag, n_cigar
+    test_put_le32(body + 16, l_qseq);
+    test_put_le32(body + 20, 0xffffffffu);        // mtid
+    test_put_le32(body + 24, 0xffffffffu);        // mpos
+    test_put_le32(body + 28, 0);                  // isize
+    data[0] = 'r';
+    data[1] = '\0';
+    test_put_le32(data + l_qname,
+                  ((uint32_t)l_qseq << BAM_CIGAR_SHIFT) | BAM_CSOFT_CLIP);
+    test_put_le32(data + l_qname + 4,
+                  ((uint32_t)fake_rlen << BAM_CIGAR_SHIFT) | BAM_CREF_SKIP);
+    memset(seq, 0x11, seq_len);
+    memset(qual, 30, l_qseq);
+    if (with_cg) {
+        aux[0] = 'C';
+        aux[1] = 'G';
+        aux[2] = 'B';
+        aux[3] = 'I';
+        test_put_le32(aux + 4, 2);
+        test_put_le32(aux + 8, (2u << BAM_CIGAR_SHIFT) | BAM_CMATCH);
+        test_put_le32(aux + 12,
+                      ((bad_cg_qlen ? 2u : 3u) << BAM_CIGAR_SHIFT) |
+                      BAM_CMATCH);
+    }
+
+    memset(rec, 0, sizeof(*rec));
+    rec->frame = frame;
+    rec->frame_len = 4 + block_len;
+    rec->body = data;
+    rec->raw_l_data = (uint32_t)raw_l_data;
+    rec->core.tid = 0;
+    rec->core.pos = pos;
+    rec->core.bin = bin;
+    rec->core.qual = 60;
+    rec->core.l_qname = l_qname;
+    rec->core.l_extranul = (-l_qname) & 3;
+    rec->core.flag = 0;
+    rec->core.n_cigar = n_cigar;
+    rec->core.l_qseq = l_qseq;
+    rec->core.mtid = -1;
+    rec->core.mpos = -1;
+    rec->core.isize = 0;
+    return rec->frame_len;
+}
+
+static int write_batch_validate_frame_bam(const char *path,
+                                          const uint8_t *frame,
+                                          size_t frame_len)
+{
+    BGZF *fp = NULL;
+    uint8_t buf[4];
+    int ret = -1;
+
+    fp = bgzf_open(path, "wb");
+    if (!fp)
+        return -1;
+
+    if (bgzf_write(fp, "BAM\1", 4) != 4)
+        goto cleanup;
+    memset(buf, 0, sizeof(buf));
+    if (bgzf_write(fp, buf, 4) != 4) // l_text
+        goto cleanup;
+    test_put_le32(buf, 1);
+    if (bgzf_write(fp, buf, 4) != 4) // n_ref
+        goto cleanup;
+    test_put_le32(buf, 3);
+    if (bgzf_write(fp, buf, 4) != 4) // l_name
+        goto cleanup;
+    if (bgzf_write(fp, "t1\0", 3) != 3)
+        goto cleanup;
+    test_put_le32(buf, 100000);
+    if (bgzf_write(fp, buf, 4) != 4) // l_ref
+        goto cleanup;
+    if (bgzf_write(fp, frame, frame_len) != (ssize_t)frame_len)
+        goto cleanup;
+    ret = 0;
+
+cleanup:
+    if (bgzf_close(fp) != 0)
+        ret = -1;
+    return ret;
+}
+
+static size_t make_batch_validate_bad_nocoor_endpos(uint8_t *frame)
+{
+    bam_batch_record_t rec;
+    size_t frame_len;
+    uint8_t *body = frame + 4;
+
+    frame_len = make_batch_validate_record(frame, &rec, 0, 0, 1);
+    test_put_le32(body, 0xffffffffu);       // tid
+    test_put_le32(body + 4, 0xffffffffu);   // pos
+    test_put_le32(body + 20, 0xffffffffu);  // mtid
+    test_put_le32(body + 24, 0xffffffffu);  // mpos
+    return frame_len;
+}
+
+static size_t make_batch_validate_valid_nocoor(uint8_t *frame)
+{
+    uint8_t *body = frame + 4;
+
+    memset(frame, 0, 37);
+    test_put_le32(frame, 33);
+    test_put_le32(body, 0xffffffffu);      // tid
+    test_put_le32(body + 4, 0xffffffffu);  // pos
+    test_put_le32(body + 8, 1);            // l_qname
+    test_put_le32(body + 12, BAM_FUNMAP << 16);
+    test_put_le32(body + 16, 0);           // l_qseq
+    test_put_le32(body + 20, 0xffffffffu); // mtid
+    test_put_le32(body + 24, 0xffffffffu); // mpos
+    test_put_le32(body + 28, 0);           // isize
+    frame[36] = '\0';
+    return 37;
+}
+
+static int write_batch_itr_nocoor_fixture_bam(const char *path,
+                                              int bad_endpos)
+{
+    BGZF *fp = NULL;
+    hts_idx_t *idx = NULL;
+    uint8_t buf[4];
+    uint8_t mapped[4 + 32 + 64], nocoor[4 + 32 + 64];
+    bam_batch_record_t rec;
+    size_t mapped_len, nocoor_len;
+    uint64_t mapped_beg, mapped_end, final_voff;
+    int ret = -1;
+
+    mapped_len = make_batch_validate_record(mapped, &rec, 0, 0, 0);
+    nocoor_len = bad_endpos
+        ? make_batch_validate_bad_nocoor_endpos(nocoor)
+        : make_batch_validate_valid_nocoor(nocoor);
+
+    fp = bgzf_open(path, "wb");
+    if (!fp)
+        return -1;
+
+    if (bgzf_write(fp, "BAM\1", 4) != 4)
+        goto cleanup;
+    memset(buf, 0, sizeof(buf));
+    if (bgzf_write(fp, buf, 4) != 4) // l_text
+        goto cleanup;
+    test_put_le32(buf, 1);
+    if (bgzf_write(fp, buf, 4) != 4) // n_ref
+        goto cleanup;
+    test_put_le32(buf, 3);
+    if (bgzf_write(fp, buf, 4) != 4) // l_name
+        goto cleanup;
+    if (bgzf_write(fp, "t1\0", 3) != 3)
+        goto cleanup;
+    test_put_le32(buf, 100000);
+    if (bgzf_write(fp, buf, 4) != 4) // l_ref
+        goto cleanup;
+
+    mapped_beg = bgzf_tell(fp);
+    if (bgzf_write(fp, mapped, mapped_len) != (ssize_t)mapped_len)
+        goto cleanup;
+    mapped_end = bgzf_tell(fp);
+    if (bgzf_write(fp, nocoor, nocoor_len) != (ssize_t)nocoor_len)
+        goto cleanup;
+    final_voff = bgzf_tell(fp);
+    if (bgzf_close(fp) != 0) {
+        fp = NULL;
+        goto cleanup;
+    }
+    fp = NULL;
+
+    idx = hts_idx_init(1, HTS_FMT_BAI, mapped_beg, 14, 5);
+    if (!idx)
+        goto cleanup;
+    if (hts_idx_push(idx, 0, 100, 105, mapped_end, 1) < 0)
+        goto cleanup;
+    if (hts_idx_push(idx, -1, -1, 0, final_voff, 0) < 0)
+        goto cleanup;
+    if (hts_idx_finish(idx, final_voff) < 0)
+        goto cleanup;
+    if (hts_idx_save_as(idx, path, NULL, HTS_FMT_BAI) < 0)
+        goto cleanup;
+    ret = 0;
+
+cleanup:
+    hts_idx_destroy(idx);
+    if (fp && bgzf_close(fp) != 0)
+        ret = -1;
+    return ret;
+}
+
+static int write_batch_itr_read_rest_bad_endpos_bam(const char *path)
+{
+    return write_batch_itr_nocoor_fixture_bam(path, 1);
+}
+
+static int write_batch_itr_valid_nocoor_bam(const char *path)
+{
+    return write_batch_itr_nocoor_fixture_bam(path, 0);
+}
+
+static void test_bam_batch_itr_read_rest_bad_endpos(void)
+{
+    const char *path =
+        "test/test_bam_batch_itr_read_rest_bad_endpos.tmp.bam";
+    const char *idx_path =
+        "test/test_bam_batch_itr_read_rest_bad_endpos.tmp.bam.bai";
+    samFile *fp = NULL;
+    sam_hdr_t *hdr = NULL;
+    hts_idx_t *idx = NULL;
+    hts_itr_t *iter = NULL;
+    bam_batch_t batch = {0};
+    int ret;
+
+    unlink(path);
+    unlink(idx_path);
+    VERIFY(write_batch_itr_read_rest_bad_endpos_bam(path) == 0,
+           "failed to create BAM read_rest bad-endpos fixture");
+
+    batch_reader_env(1, 1);
+    fp = sam_open(path, "rb");
+    VERIFY(fp != NULL, "failed to open BAM read_rest bad-endpos fixture");
+    hdr = sam_hdr_read(fp);
+    VERIFY(hdr != NULL, "failed to read BAM read_rest bad-endpos header");
+    idx = sam_index_load(fp, path);
+    VERIFY(idx != NULL, "failed to load BAM read_rest bad-endpos index");
+    iter = sam_itr_queryi(idx, HTS_IDX_NOCOOR, 0, 0);
+    VERIFY(iter != NULL, "failed to create BAM no-coordinate iterator");
+    VERIFY(sam_bam_prepare_batch_reader(fp) == 0,
+           "failed to prepare BAM batch iterator reader");
+
+    ret = sam_bam_itr_next_batch(fp, iter, hdr, &batch);
+    VERIFY(ret == -2,
+           "BAM batch no-coordinate read_rest accepted invalid endpos");
+    VERIFY(batch.n_records == 0 && batch.records == NULL,
+           "BAM batch read_rest failure left records populated");
+
+cleanup:
+    sam_bam_batch_destroy(&batch);
+    hts_itr_destroy(iter);
+    hts_idx_destroy(idx);
+    sam_hdr_destroy(hdr);
+    if (fp)
+        sam_close(fp);
+    batch_reader_env(0, 0);
+    unlink(path);
+    unlink(idx_path);
+}
+
+static void hash_bam_iterator_records(const char *path,
+                                      const char *region,
+                                      char **regions, int n_regions,
+                                      int no_coor, int use_batch,
+                                      int hts_threads,
+                                      uint64_t *hash, int *count)
+{
+    samFile *fp = NULL;
+    sam_hdr_t *hdr = NULL;
+    hts_idx_t *idx = NULL;
+    hts_itr_t *iter = NULL;
+    bam1_t *b = NULL;
+    bam_batch_t batch = {0};
+    int ret;
+
+    if (use_batch)
+        batch_reader_env(1, 1);
+
+    *hash = 1469598103934665603ULL;
+    *count = 0;
+    fp = sam_open(path, "rb");
+    VERIFY(fp != NULL, "failed to open BAM iterator input");
+    hdr = sam_hdr_read(fp);
+    VERIFY(hdr != NULL, "failed to read BAM iterator header");
+    if (use_batch) {
+        VERIFY(sam_bam_prepare_batch_reader(fp) == 0,
+               "failed to prepare BAM batch iterator reader");
+        if (hts_threads > 0)
+            VERIFY(hts_set_threads(fp, hts_threads) == 0,
+                   "failed to set BAM batch iterator threads");
+    }
+    idx = sam_index_load(fp, path);
+    VERIFY(idx != NULL, "failed to load BAM iterator index");
+    if (no_coor)
+        iter = sam_itr_queryi(idx, HTS_IDX_NOCOOR, 0, 0);
+    else if (regions)
+        iter = sam_itr_regarray(idx, hdr, regions, (unsigned int)n_regions);
+    else
+        iter = sam_itr_querys(idx, hdr, region);
+    VERIFY(iter != NULL, "failed to create BAM iterator");
+
+    b = bam_init1();
+    VERIFY(b != NULL, "failed to allocate BAM iterator record");
+    if (use_batch) {
+        while ((ret = sam_bam_itr_next_batch(fp, iter, hdr, &batch)) >= 0) {
+            int i;
+
+            for (i = 0; i < batch.n_records; i++) {
+                VERIFY(sam_bam_batch_record_to_bam1(&batch.records[i], b) >= 0,
+                       "failed to materialize BAM batch iterator record");
+                *hash = ordered_reader_record_hash(*hash, b);
+                (*count)++;
+            }
+            sam_bam_batch_destroy(&batch);
+        }
+        VERIFY(ret == -1, "BAM batch iterator ended with an error");
+    } else {
+        while ((ret = sam_itr_next(fp, iter, b)) >= 0) {
+            *hash = ordered_reader_record_hash(*hash, b);
+            (*count)++;
+        }
+        VERIFY(ret == -1, "BAM serial iterator ended with an error");
+    }
+
+cleanup:
+    sam_bam_batch_destroy(&batch);
+    bam_destroy1(b);
+    hts_itr_destroy(iter);
+    hts_idx_destroy(idx);
+    sam_hdr_destroy(hdr);
+    if (fp)
+        sam_close(fp);
+    if (use_batch)
+        batch_reader_env(0, 0);
+}
+
+typedef struct test_overlap_filter_t {
+    int tid;
+    hts_pos_t beg, end;
+} test_overlap_filter_t;
+
+static int test_overlap_filter(void *data, sam_hdr_t *h, int tid,
+                               hts_pos_t beg, hts_pos_t end)
+{
+    test_overlap_filter_t *filter = (test_overlap_filter_t *)data;
+
+    (void)h;
+    return filter && tid == filter->tid &&
+           end > filter->beg && filter->end > beg;
+}
+
+static void hash_bam_filtered_iterator_records(const char *path,
+                                               int use_batch,
+                                               int hts_threads,
+                                               uint64_t *hash, int *count)
+{
+    samFile *fp = NULL;
+    sam_hdr_t *hdr = NULL;
+    hts_idx_t *idx = NULL;
+    hts_itr_t *iter = NULL;
+    bam1_t *b = NULL;
+    bam_batch_t batch = {0};
+    test_overlap_filter_t filter = {-1, 899, 1500};
+    int ret;
+
+    if (use_batch)
+        batch_reader_env(1, 1);
+
+    *hash = 1469598103934665603ULL;
+    *count = 0;
+    fp = sam_open(path, "rb");
+    VERIFY(fp != NULL, "failed to open filtered iterator input");
+    hdr = sam_hdr_read(fp);
+    VERIFY(hdr != NULL, "failed to read filtered iterator header");
+    filter.tid = sam_hdr_name2tid(hdr, "CHROMOSOME_I");
+    VERIFY(filter.tid >= 0, "failed to resolve filtered iterator target");
+    if (use_batch) {
+        VERIFY(sam_bam_prepare_batch_reader(fp) == 0,
+               "failed to prepare filtered BAM batch iterator reader");
+        if (hts_threads > 0)
+            VERIFY(hts_set_threads(fp, hts_threads) == 0,
+                   "failed to set filtered BAM batch iterator threads");
+    }
+    idx = sam_index_load(fp, path);
+    VERIFY(idx != NULL, "failed to load filtered iterator index");
+    iter = sam_itr_querys(idx, hdr, "CHROMOSOME_I:1-2000");
+    VERIFY(iter != NULL, "failed to create filtered iterator");
+    b = bam_init1();
+    VERIFY(b != NULL, "failed to allocate filtered iterator record");
+
+    if (use_batch) {
+        while ((ret = sam_bam_itr_next_batch_filtered(
+                    fp, iter, hdr, &batch, test_overlap_filter, &filter,
+                    b)) >= 0) {
+            int i;
+
+            VERIFY(batch.data == NULL && batch.len == 0 &&
+                   batch.n_segments == 0 && batch.segments == NULL,
+                   "filtered batch iterator exposed full-batch storage metadata");
+            for (i = 0; i < batch.n_records; i++) {
+                VERIFY(sam_bam_batch_record_to_bam1(&batch.records[i], b) >= 0,
+                       "failed to materialize filtered batch iterator record");
+                *hash = ordered_reader_record_hash(*hash, b);
+                (*count)++;
+            }
+            sam_bam_batch_destroy(&batch);
+        }
+        VERIFY(ret == -1, "filtered BAM batch iterator ended with an error");
+    } else {
+        while ((ret = sam_itr_next_filtered(
+                    fp, iter, hdr, b, test_overlap_filter, &filter)) >= 0) {
+            *hash = ordered_reader_record_hash(*hash, b);
+            (*count)++;
+        }
+        VERIFY(ret == -1, "filtered BAM iterator ended with an error");
+    }
+
+cleanup:
+    sam_bam_batch_destroy(&batch);
+    bam_destroy1(b);
+    hts_itr_destroy(iter);
+    hts_idx_destroy(idx);
+    sam_hdr_destroy(hdr);
+    if (fp)
+        sam_close(fp);
+    if (use_batch)
+        batch_reader_env(0, 0);
+}
+
+static void test_sam_region_helpers(void)
+{
+    hts_pair_pos_t ref1_intervals[] = {
+        {30, 40}, {10, 20}, {20, 25}, {15, 18}
+    };
+    hts_pair_pos_t ref2_intervals[] = {
+        {5, 10}, {10, 11}, {9, 15}
+    };
+    hts_reglist_t input[] = {
+        {"ref1", ref1_intervals, 0, 4, 0, 0},
+        {"ref2", ref2_intervals, 1, 3, 0, 0}
+    };
+    hts_reglist_t *merged = NULL;
+    uint64_t expected_hash = 0, filtered_hash = 0;
+    int expected_count = 0, filtered_count = 0;
+    int merged_count = 0;
+
+    merged = sam_reglist_dup_merged(input, 2, &merged_count);
+    VERIFY(merged != NULL, "failed to build merged region list");
+    VERIFY(merged_count == 2, "merged region list changed target count");
+    VERIFY(merged[0].reg == input[0].reg && merged[0].tid == input[0].tid,
+           "merged region list did not preserve first target identity");
+    VERIFY(merged[0].count == 2 &&
+           merged[0].intervals[0].beg == 10 &&
+           merged[0].intervals[0].end == 25 &&
+           merged[0].intervals[1].beg == 30 &&
+           merged[0].intervals[1].end == 40,
+           "merged region list did not coalesce first target intervals");
+    VERIFY(merged[1].reg == input[1].reg && merged[1].tid == input[1].tid,
+           "merged region list did not preserve second target identity");
+    VERIFY(merged[1].count == 1 &&
+           merged[1].intervals[0].beg == 5 &&
+           merged[1].intervals[0].end == 15,
+           "merged region list did not coalesce adjacent intervals");
+
+    hash_bam_iterator_records("test/range.bam", "CHROMOSOME_I:900-1500",
+                              NULL, 0, 0, 0, 0, &expected_hash,
+                              &expected_count);
+    hash_bam_filtered_iterator_records("test/range.bam", 0, 0,
+                                       &filtered_hash, &filtered_count);
+    VERIFY(filtered_count == expected_count,
+           "filtered serial iterator returned the wrong record count");
+    VERIFY(filtered_hash == expected_hash,
+           "filtered serial iterator changed record order or contents");
+
+    filtered_hash = 0;
+    filtered_count = 0;
+    hash_bam_filtered_iterator_records("test/range.bam", 1, 2,
+                                       &filtered_hash, &filtered_count);
+    VERIFY(filtered_count == expected_count,
+           "filtered batch iterator returned the wrong record count");
+    VERIFY(filtered_hash == expected_hash,
+           "filtered batch iterator changed record order or contents");
+
+cleanup:
+    hts_reglist_free(merged, merged_count);
+    batch_reader_env(0, 0);
+}
+
+static void check_bam_batch_iterator_equivalence(const char *path,
+                                                const char *region,
+                                                char **regions,
+                                                int n_regions,
+                                                int no_coor)
+{
+    uint64_t serial_hash = 0, batch_hash = 0;
+    int serial_count = 0, batch_count = 0;
+
+    hash_bam_iterator_records(path, region, regions, n_regions, no_coor,
+                              0, 0, &serial_hash, &serial_count);
+    hash_bam_iterator_records(path, region, regions, n_regions, no_coor,
+                              1, 0, &batch_hash, &batch_count);
+    VERIFY(batch_count == serial_count,
+           "BAM batch iterator returned the wrong record count");
+    VERIFY(batch_hash == serial_hash,
+           "BAM batch iterator changed record order or contents");
+
+    batch_hash = 0;
+    batch_count = 0;
+    hash_bam_iterator_records(path, region, regions, n_regions, no_coor,
+                              1, 2, &batch_hash, &batch_count);
+    VERIFY(batch_count == serial_count,
+           "threaded BAM batch iterator returned the wrong record count");
+    VERIFY(batch_hash == serial_hash,
+           "threaded BAM batch iterator changed record order or contents");
+
+cleanup:
+    return;
+}
+
+static void test_bam_batch_iterator_equivalence(void)
+{
+    const char *nocoor =
+        "test/test_bam_batch_iterator_equivalence.nocoor.tmp.bam";
+    const char *nocoor_idx =
+        "test/test_bam_batch_iterator_equivalence.nocoor.tmp.bam.bai";
+    char *multi_regions[] = {
+        "CHROMOSOME_I:900-1500",
+        "CHROMOSOME_II:1-5000"
+    };
+
+    check_bam_batch_iterator_equivalence("test/range.bam",
+                                         "CHROMOSOME_I:900-1500",
+                                         NULL, 0, 0);
+    check_bam_batch_iterator_equivalence("test/range.bam", NULL,
+                                         multi_regions, 2, 0);
+
+    unlink(nocoor);
+    unlink(nocoor_idx);
+    VERIFY(write_batch_itr_valid_nocoor_bam(nocoor) == 0,
+           "failed to create BAM no-coordinate iterator fixture");
+    check_bam_batch_iterator_equivalence(nocoor, NULL, NULL, 0, 1);
+
+cleanup:
+    unlink(nocoor);
+    unlink(nocoor_idx);
+    batch_reader_env(0, 0);
+}
+
+static int read_bam_batch_count_ret(const char *path, int hts_threads,
+                                    int fused, int validate_header, int *count)
+{
+    samFile *fp = NULL;
+    sam_hdr_t *hdr = NULL;
+    int ret = -999;
+
+    *count = -1;
+    batch_reader_env(1, 1);
+    if (fused)
+        setenv("HTS_BAM_BATCH_FUSED", "1", 1);
+
+    fp = sam_open(path, "rb");
+    if (!fp)
+        goto cleanup;
+    if (hts_threads > 0 && hts_set_threads(fp, hts_threads) < 0)
+        goto cleanup;
+    hdr = sam_hdr_read(fp);
+    if (!hdr)
+        goto cleanup;
+    ret = sam_bam_read_batch_count(fp, validate_header ? hdr : NULL, count);
+
+cleanup:
+    sam_hdr_destroy(hdr);
+    if (fp)
+        sam_close(fp);
+    batch_reader_env(0, 0);
+    return ret;
+}
+
+static void test_bam_batch_validate_decode(void)
+{
+    uint8_t frame[4 + 32 + 64];
+    bam_batch_record_t rec;
+    bam1_t *scratch = NULL;
+    int materialized = -1;
+
+    scratch = bam_init1();
+    VERIFY(scratch != NULL, "failed to create decode-validation scratch record");
+
+    make_batch_validate_record(frame, &rec, 0, 0, 0);
+    VERIFY(sam_bam_batch_record_validate_decode(&rec, scratch,
+                                                &materialized) == 0,
+           "decode validation rejected a valid batch record");
+    VERIFY(materialized == 0,
+           "decode validation materialized a raw-safe batch record");
+
+    make_batch_validate_record(frame, &rec, 1, 0, 0);
+    VERIFY(sam_bam_batch_record_validate_decode(&rec, scratch,
+                                                &materialized) == 0,
+           "decode validation rejected a repairable qname");
+    VERIFY(materialized == 1 && strcmp(bam_get_qname(scratch), "rx") == 0,
+           "decode validation did not materialize the repaired qname");
+
+    make_batch_validate_record(frame, &rec, 0, 1, 0);
+    VERIFY(sam_bam_batch_record_validate_decode(&rec, scratch,
+                                                &materialized) == 0,
+           "decode validation rejected a repairable bin");
+    VERIFY(materialized == 1 &&
+           scratch->core.bin == hts_reg2bin(100, 105, 14, 5),
+           "decode validation did not materialize the recomputed bin");
+
+    make_batch_validate_record(frame, &rec, 0, 0, 1);
+    VERIFY(sam_bam_batch_record_validate_decode(&rec, scratch,
+                                                &materialized) < 0,
+           "decode validation accepted a CIGAR/query length mismatch");
+
+    make_batch_validate_cg_candidate(frame, &rec, 0, 0);
+    VERIFY(sam_bam_batch_record_validate_decode(&rec, scratch,
+                                                &materialized) == 0,
+           "decode validation rejected a raw-safe CG-shaped record");
+    VERIFY(materialized == 0,
+           "decode validation materialized a CG-shaped record without CG tag");
+
+    make_batch_validate_cg_candidate(frame, &rec, 1, 0);
+    VERIFY(sam_bam_batch_record_validate_decode(&rec, scratch,
+                                                &materialized) == 0,
+           "decode validation rejected a record with CG fixup");
+    VERIFY(materialized == 1 && scratch->core.n_cigar == 2,
+           "decode validation did not materialize the CG fixup");
+    VERIFY(bam_get_cigar(scratch)[0] ==
+           ((2u << BAM_CIGAR_SHIFT) | BAM_CMATCH),
+           "decode validation materialized the wrong first CG CIGAR op");
+    VERIFY(bam_get_cigar(scratch)[1] ==
+           ((3u << BAM_CIGAR_SHIFT) | BAM_CMATCH),
+           "decode validation materialized the wrong second CG CIGAR op");
+    VERIFY(scratch->core.bin == hts_reg2bin(100, 105, 14, 5),
+           "decode validation did not recompute bin from the CG CIGAR");
+
+cleanup:
+    bam_destroy1(scratch);
+}
+
+static void check_bam_batch_count_decode_case(const char *path,
+                                              const uint8_t *frame,
+                                              size_t frame_len,
+                                              int expected_ret)
+{
+    int count = -1;
+
+    VERIFY(write_batch_validate_frame_bam(path, frame, frame_len) == 0,
+           "failed to write BAM batch count validation input");
+
+    VERIFY(read_bam_batch_count_ret(path, 0, 0, 1, &count) == expected_ret,
+           "BAM batch count decode validation returned the wrong status");
+    VERIFY((expected_ret < 0 && count == 0) ||
+           (expected_ret >= 0 && count == expected_ret),
+           "BAM batch count decode validation returned the wrong count");
+
+    count = -1;
+    VERIFY(read_bam_batch_count_ret(path, 2, 0, 1, &count) == expected_ret,
+           "threaded BAM batch count decode validation returned the wrong status");
+    VERIFY((expected_ret < 0 && count == 0) ||
+           (expected_ret >= 0 && count == expected_ret),
+           "threaded BAM batch count decode validation returned the wrong count");
+
+    count = -1;
+    VERIFY(read_bam_batch_count_ret(path, 2, 1, 1, &count) == expected_ret,
+           "fused BAM batch count decode validation returned the wrong status");
+    VERIFY((expected_ret < 0 && count == 0) ||
+           (expected_ret >= 0 && count == expected_ret),
+           "fused BAM batch count decode validation returned the wrong count");
+
+cleanup:
+    return;
+}
+
+static void test_bam_batch_count_validate_decode(void)
+{
+    const char *path =
+        "test/test_bam_batch_count_validate_decode.tmp.bam";
+    uint8_t frame[4 + 32 + 64];
+    bam_batch_record_t rec;
+    size_t frame_len;
+
+    unlink(path);
+
+    frame_len = make_batch_validate_record(frame, &rec, 0, 0, 0);
+    check_bam_batch_count_decode_case(path, frame, frame_len, 1);
+
+    frame_len = make_batch_validate_record(frame, &rec, 1, 0, 0);
+    check_bam_batch_count_decode_case(path, frame, frame_len, 1);
+
+    frame_len = make_batch_validate_record(frame, &rec, 0, 1, 0);
+    check_bam_batch_count_decode_case(path, frame, frame_len, 1);
+
+    frame_len = make_batch_validate_cg_candidate(frame, &rec, 1, 0);
+    check_bam_batch_count_decode_case(path, frame, frame_len, 1);
+
+    frame_len = make_batch_validate_cg_candidate(frame, &rec, 1, 1);
+    check_bam_batch_count_decode_case(path, frame, frame_len, -4);
+
+    frame_len = make_batch_validate_record(frame, &rec, 0, 0, 1);
+    check_bam_batch_count_decode_case(path, frame, frame_len, -4);
+
+    unlink(path);
+    batch_reader_env(0, 0);
 }
 
 static int write_partial_bam_record(const char *path, int mode)
@@ -3443,6 +5237,11 @@ static void test_bam_raw_block_copy(void)
 {
     const char *src = "test/range.bam";
     const char *dst = "test/test_bam_raw_block_copy.tmp.bam";
+    const char *dst_seek = "test/test_bam_raw_block_copy.tmp.seek.bam";
+    const char *span_dst = "test/test_bam_raw_block_copy.tmp.span.bam";
+    const char *span_expected =
+        "test/test_bam_raw_block_copy.tmp.span_expected.bam";
+    const char *range_dst = "test/test_bam_raw_block_copy.tmp.ranges.bam";
     const char *dst_uncomp = "test/test_bam_raw_block_copy.tmp.uncomp.bam";
     const char *dst_level = "test/test_bam_raw_block_copy.tmp.level.bam";
     const char *dst_indexed = "test/test_bam_raw_block_copy.tmp.indexed.bam";
@@ -3455,8 +5254,14 @@ static void test_bam_raw_block_copy(void)
     const char *no_eof_dst = "test/test_bam_raw_block_copy.tmp.no_eof_out.bam";
     samFile *in = NULL, *out = NULL;
     sam_hdr_t *hdr = NULL;
+    sam_bam_voff_span_t *spans = NULL;
+    sam_bam_voff_span_stats_t span_stats;
+    bam_batch_t batch = {0};
+    bam1_t *b = NULL;
     uint64_t src_hash = 0, dst_hash = 0;
-    int src_count = 0, dst_count = 0;
+    int src_count = 0, dst_count = 0, n_spans = 0, m_spans = 0;
+    int rec_i = 0, tested_bad_ranges = 0, r;
+    int64_t start_voff;
 
     in = sam_open(src, "rb");
     VERIFY(in != NULL, "failed to open raw block copy input");
@@ -3478,6 +5283,217 @@ static void test_bam_raw_block_copy(void)
     read_bam_order_hash(dst, 0, 0, 0, 0, NULL, &dst_hash, &dst_count);
     VERIFY(dst_count == src_count, "raw block copy changed record count");
     VERIFY(dst_hash == src_hash, "raw block copy changed record contents or order");
+
+    in = sam_open(src, "rb");
+    VERIFY(in != NULL, "failed to open seeked raw block copy input");
+    out = sam_open(dst_seek, "wb");
+    VERIFY(out != NULL, "failed to open seeked raw block copy output");
+    hdr = sam_hdr_read(in);
+    VERIFY(hdr != NULL, "failed to read seeked raw block copy header");
+    VERIFY(sam_hdr_write(out, hdr) == 0,
+           "failed to write seeked raw block copy header");
+    VERIFY(sam_bam_prepare_batch_reader(in) == 0,
+           "failed to prepare seeked raw block copy batch reader");
+    r = sam_bam_read_batch_voff(in, hdr, &batch);
+    VERIFY(r >= 0 && batch.n_records > 0 && batch.records != NULL,
+           "failed to find first record virtual offset");
+    start_voff = (int64_t)batch.records[0].voff_beg;
+    VERIFY(start_voff > 0, "first record virtual offset was not set");
+    sam_bam_batch_destroy(&batch);
+    VERIFY(sam_bam_batch_seek(in, (uint64_t)start_voff) == 0,
+           "failed to seek raw block copy input to first record");
+    VERIFY(sam_bam_raw_copy_blocks(in, out) == 0,
+           "failed to raw-copy BAM BGZF blocks after virtual seek");
+
+    sam_hdr_destroy(hdr);
+    hdr = NULL;
+    VERIFY(sam_close(out) == 0, "failed to close seeked raw block copy output");
+    out = NULL;
+    VERIFY(sam_close(in) == 0, "failed to close seeked raw block copy input");
+    in = NULL;
+
+    read_bam_order_hash(dst_seek, 0, 0, 0, 0, NULL, &dst_hash, &dst_count);
+    VERIFY(dst_count == src_count,
+           "seeked raw block copy changed record count");
+    VERIFY(dst_hash == src_hash,
+           "seeked raw block copy changed record contents or order");
+
+    in = sam_open(src, "rb");
+    VERIFY(in != NULL, "failed to open raw span copy input");
+    out = sam_open(span_expected, "wb");
+    VERIFY(out != NULL, "failed to open raw span copy expected output");
+    hdr = sam_hdr_read(in);
+    VERIFY(hdr != NULL, "failed to read raw span copy expected header");
+    VERIFY(sam_hdr_write(out, hdr) == 0,
+           "failed to write raw span copy expected header");
+    b = bam_init1();
+    VERIFY(b != NULL, "failed to allocate raw span copy expected record");
+    while ((r = sam_read1(in, hdr, b)) >= 0) {
+        if (rec_i++ % 3 != 1)
+            VERIFY(sam_write1(out, hdr, b) >= 0,
+                   "failed to write raw span copy expected record");
+    }
+    VERIFY(r == -1, "failed to read raw span copy expected input");
+    bam_destroy1(b);
+    b = NULL;
+    sam_hdr_destroy(hdr);
+    hdr = NULL;
+    VERIFY(sam_close(out) == 0, "failed to close raw span copy expected output");
+    out = NULL;
+    VERIFY(sam_close(in) == 0, "failed to close raw span copy expected input");
+    in = NULL;
+
+    in = sam_open(src, "rb");
+    VERIFY(in != NULL, "failed to open raw span copy input");
+    out = sam_open(span_dst, "wb");
+    VERIFY(out != NULL, "failed to open raw span copy output");
+    hdr = sam_hdr_read(in);
+    VERIFY(hdr != NULL, "failed to read raw span copy header");
+    VERIFY(sam_hdr_write(out, hdr) == 0, "failed to write raw span copy header");
+    start_voff = bgzf_tell(in->fp.bgzf);
+    VERIFY(start_voff >= 0, "failed to tell raw span copy input offset");
+    VERIFY(sam_bam_prepare_batch_reader(in) == 0,
+           "failed to prepare raw span copy batch reader");
+    rec_i = 0;
+    while ((r = sam_bam_read_batch_voff(in, hdr, &batch)) >= 0) {
+        int i;
+
+        for (i = 0; i < batch.n_records; i++, rec_i++) {
+            bam_batch_record_t *rec = &batch.records[i];
+
+            VERIFY(sam_bam_batch_record_raw_write_status(rec) == 0,
+                   "raw span copy test record is not raw-write safe");
+            if (rec_i % 3 == 1)
+                continue;
+            if (n_spans > 0 && spans[n_spans - 1].end == rec->voff_beg) {
+                spans[n_spans - 1].end = rec->voff_end;
+                continue;
+            }
+            if (n_spans == m_spans) {
+                int new_m = m_spans ? m_spans * 2 : 16;
+                sam_bam_voff_span_t *new_spans =
+                    realloc(spans, (size_t)new_m * sizeof(*spans));
+                VERIFY(new_spans != NULL,
+                       "failed to grow raw span copy span list");
+                spans = new_spans;
+                m_spans = new_m;
+            }
+            spans[n_spans].beg = rec->voff_beg;
+            spans[n_spans].end = rec->voff_end;
+            n_spans++;
+        }
+        sam_bam_batch_destroy(&batch);
+    }
+    VERIFY(r == -1, "failed to scan raw span copy input");
+    VERIFY(n_spans > 0, "raw span copy test collected no spans");
+    VERIFY(sam_bam_batch_seek(in, (uint64_t)start_voff) == 0,
+           "failed to seek raw span copy input for stats");
+    VERIFY(sam_bam_raw_copy_voff_spans_stats(in, spans, n_spans,
+                                             &span_stats) == 0,
+           "failed to preflight raw span copy spans");
+    VERIFY(span_stats.selected_uncomp > 0,
+           "raw span copy stats counted no selected bytes");
+    VERIFY(sam_bam_batch_seek(in, (uint64_t)start_voff) == 0,
+           "failed to seek raw span copy input");
+    VERIFY(sam_bam_raw_copy_voff_spans(in, out, spans, n_spans) == 0,
+           "failed to raw-copy BAM virtual-offset spans");
+    sam_bam_batch_destroy(&batch);
+    sam_hdr_destroy(hdr);
+    hdr = NULL;
+    VERIFY(sam_close(out) == 0, "failed to close raw span copy output");
+    out = NULL;
+    VERIFY(sam_close(in) == 0, "failed to close raw span copy input");
+    in = NULL;
+
+    read_bam_order_hash(span_expected, 0, 0, 0, 0, NULL,
+                        &src_hash, &src_count);
+    read_bam_order_hash(span_dst, 0, 0, 0, 0, NULL,
+                        &dst_hash, &dst_count);
+    VERIFY(dst_count == src_count, "raw span copy changed record count");
+    VERIFY(dst_hash == src_hash,
+           "raw span copy changed record contents or order");
+
+    in = sam_open(src, "rb");
+    VERIFY(in != NULL, "failed to open raw span copy input for level reject test");
+    out = sam_open(dst_level, "wb0");
+    VERIFY(out != NULL, "failed to open non-default raw span copy output");
+    hdr = sam_hdr_read(in);
+    VERIFY(hdr != NULL, "failed to read raw span copy level reject-test header");
+    VERIFY(sam_hdr_write(out, hdr) == 0,
+           "failed to write raw span copy level reject-test header");
+    VERIFY(sam_bam_raw_copy_voff_spans(in, out, spans, n_spans) < 0,
+           "raw span copy accepted non-default compression output");
+    sam_hdr_destroy(hdr);
+    hdr = NULL;
+    sam_close(out);
+    out = NULL;
+    sam_close(in);
+    in = NULL;
+
+    in = sam_open(src, "rb");
+    VERIFY(in != NULL, "failed to open raw range copy input");
+    out = sam_open(range_dst, "wb");
+    VERIFY(out != NULL, "failed to open raw range copy output");
+    hdr = sam_hdr_read(in);
+    VERIFY(hdr != NULL, "failed to read raw range copy header");
+    VERIFY(sam_hdr_write(out, hdr) == 0, "failed to write raw range copy header");
+    VERIFY(sam_bam_prepare_batch_reader(in) == 0,
+           "failed to prepare raw range copy batch reader");
+    rec_i = 0;
+    while ((r = sam_bam_read_batch(in, hdr, &batch)) >= 0) {
+        int *ranges = malloc((size_t)batch.n_records * 2 * sizeof(*ranges));
+        int i, run_start = -1, n_ranges = 0;
+
+        VERIFY(ranges != NULL || batch.n_records == 0,
+               "failed to allocate raw range copy run list");
+        if (!tested_bad_ranges && batch.n_records >= 2) {
+            int unsorted_ranges[] = { 1, 2, 0, 1 };
+            int out_of_bounds_ranges[] = { 0, batch.n_records + 1 };
+
+            VERIFY(sam_bam_batch_write1_ranges(out, hdr, &batch,
+                                               unsorted_ranges, 2) < 0,
+                   "raw range copy accepted unsorted ranges");
+            VERIFY(sam_bam_batch_write1_ranges(out, hdr, &batch,
+                                               out_of_bounds_ranges, 1) < 0,
+                   "raw range copy accepted out-of-bounds range");
+            tested_bad_ranges = 1;
+        }
+        for (i = 0; i < batch.n_records; i++, rec_i++) {
+            if (rec_i % 3 != 1) {
+                if (run_start < 0)
+                    run_start = i;
+            } else if (run_start >= 0) {
+                ranges[n_ranges * 2] = run_start;
+                ranges[n_ranges * 2 + 1] = i;
+                n_ranges++;
+                run_start = -1;
+            }
+        }
+        if (run_start >= 0) {
+            ranges[n_ranges * 2] = run_start;
+            ranges[n_ranges * 2 + 1] = batch.n_records;
+            n_ranges++;
+        }
+        VERIFY(sam_bam_batch_write1_ranges(out, hdr, &batch, ranges,
+                                           n_ranges) == 0,
+               "failed to raw-copy BAM selected ranges");
+        free(ranges);
+        sam_bam_batch_destroy(&batch);
+    }
+    VERIFY(r == -1, "failed to scan raw range copy input");
+    sam_bam_batch_destroy(&batch);
+    sam_hdr_destroy(hdr);
+    hdr = NULL;
+    VERIFY(sam_close(out) == 0, "failed to close raw range copy output");
+    out = NULL;
+    VERIFY(sam_close(in) == 0, "failed to close raw range copy input");
+    in = NULL;
+
+    read_bam_order_hash(range_dst, 0, 0, 0, 0, NULL,
+                        &dst_hash, &dst_count);
+    VERIFY(dst_count == src_count, "raw range copy changed record count");
+    VERIFY(dst_hash == src_hash,
+           "raw range copy changed record contents or order");
 
     in = sam_open(src, "rb");
     VERIFY(in != NULL, "failed to open raw block copy input for reject test");
@@ -3557,8 +5573,8 @@ static void test_bam_raw_block_copy(void)
     hdr = sam_hdr_read(in);
     VERIFY(hdr != NULL, "failed to read raw block copy missing-EOF header");
     VERIFY(sam_hdr_write(out, hdr) == 0, "failed to write raw block copy missing-EOF header");
-    VERIFY(sam_bam_raw_copy_blocks(in, out) < 0,
-           "raw block copy accepted missing BGZF EOF marker");
+    VERIFY(sam_bam_raw_copy_blocks(in, out) == 0,
+           "raw block copy rejected BAM without BGZF EOF marker");
 
     sam_hdr_destroy(hdr);
     hdr = NULL;
@@ -3566,6 +5582,13 @@ static void test_bam_raw_block_copy(void)
     out = NULL;
     sam_close(in);
     in = NULL;
+
+    read_bam_order_hash(src, 0, 0, 0, 0, NULL, &src_hash, &src_count);
+    read_bam_order_hash(no_eof_dst, 0, 0, 0, 0, NULL, &dst_hash, &dst_count);
+    VERIFY(dst_count == src_count,
+           "raw block copy changed missing-EOF record count");
+    VERIFY(dst_hash == src_hash,
+           "raw block copy changed missing-EOF record contents or order");
 
     VERIFY(copy_file_with_malformed_eof(src, bad_eof_src) == 0,
            "failed to create BAM with malformed BGZF EOF marker");
@@ -3580,12 +5603,18 @@ static void test_bam_raw_block_copy(void)
            "raw block copy accepted malformed BGZF EOF marker");
 
 cleanup:
+    sam_bam_batch_destroy(&batch);
+    bam_destroy1(b);
+    free(spans);
     sam_hdr_destroy(hdr);
     if (out)
         sam_close(out);
     if (in)
         sam_close(in);
     unlink(dst);
+    unlink(span_dst);
+    unlink(span_expected);
+    unlink(range_dst);
     unlink(dst_uncomp);
     unlink(dst_level);
     unlink(dst_indexed);
@@ -3689,9 +5718,33 @@ static void test_bam_batch_reader(void)
            "thread-pool controlled BAM batch reader returned the wrong record count");
     VERIFY(batch_hash == serial_hash,
            "thread-pool controlled BAM batch reader changed record order or contents");
+
+    setenv("HTS_BAM_BATCH_FUSED", "1", 1);
+    batch_hash = 0;
+    batch_count = 0;
+    read_bam_batch_hash("test/range.bam", 2, 0, &batch_hash, &batch_count);
+    VERIFY(batch_count == serial_count,
+           "fused BAM batch reader returned the wrong record count");
+    VERIFY(batch_hash == serial_hash,
+           "fused BAM batch reader changed record order or contents");
+    unsetenv("HTS_BAM_BATCH_FUSED");
+
     check_bam_batch_materialized_exact("test/range.bam", 0, 0);
     check_bam_batch_materialized_exact("test/range.bam", 2, 0);
     check_bam_batch_materialized_exact("test/range.bam", 2, 1);
+    test_bam_batch_range_writer();
+    test_bam_batch_range_flag_writer();
+    test_bam_batch_range_writer_no_partial_fallback();
+    test_bam_batch_range_flag_writer_no_partial_fallback();
+    test_bam_batch_range_writer_rejects_bad_layout();
+    test_bam_batch_aux_filtered_writer();
+    test_bam_batch_sam_writer();
+    test_bam_batch_materialized_aux_edit();
+    test_bam_batch_aux_skip_malformed();
+    test_bam_batch_validate_decode();
+    test_bam_batch_count_validate_decode();
+    test_bam_batch_itr_read_rest_bad_endpos();
+    test_bam_batch_iterator_equivalence();
 
     VERIFY(write_split_bam_record(split_body, 36) == 0,
            "failed to create split-body BAM");
@@ -3700,6 +5753,11 @@ static void test_bam_batch_reader(void)
     read_bam_batch_hash(split_body, 0, 0, &batch_hash, &batch_count);
     VERIFY(batch_count == serial_count && batch_hash == serial_hash,
            "BAM batch reader changed split body record");
+    setenv("HTS_BAM_BATCH_FUSED", "1", 1);
+    read_bam_batch_hash(split_body, 2, 0, &batch_hash, &batch_count);
+    VERIFY(batch_count == serial_count && batch_hash == serial_hash,
+           "fused BAM batch reader changed split body record");
+    unsetenv("HTS_BAM_BATCH_FUSED");
     check_bam_batch_materialized_exact(split_body, 0, 0);
     check_bam_batch_materialized_exact(split_body, 2, 0);
 
@@ -3719,6 +5777,36 @@ static void test_bam_batch_reader(void)
            "BAM batch reader accepted invalid header TID");
     VERIFY(read_one_bam_batch_ret(invalid_tid, 2) == -3,
            "threaded BAM batch reader accepted invalid header TID");
+    batch_count = -1;
+    VERIFY(read_bam_batch_count_ret(invalid_tid, 0, 0, 1,
+                                    &batch_count) == -3 &&
+           batch_count == 0,
+           "BAM batch count with header accepted invalid header TID");
+    batch_count = -1;
+    VERIFY(read_bam_batch_count_ret(invalid_tid, 2, 0, 1,
+                                    &batch_count) == -3 &&
+           batch_count == 0,
+           "threaded BAM batch count with header accepted invalid header TID");
+    batch_count = -1;
+    VERIFY(read_bam_batch_count_ret(invalid_tid, 2, 1, 1,
+                                    &batch_count) == -3 &&
+           batch_count == 0,
+           "fused BAM batch count with header accepted invalid header TID");
+    batch_count = -1;
+    VERIFY(read_bam_batch_count_ret(invalid_tid, 0, 0, 0,
+                                    &batch_count) == 1 &&
+           batch_count == 1,
+           "BAM batch count without header rejected decodable invalid TID");
+    batch_count = -1;
+    VERIFY(read_bam_batch_count_ret(invalid_tid, 2, 0, 0,
+                                    &batch_count) == 1 &&
+           batch_count == 1,
+           "threaded BAM batch count without header rejected decodable invalid TID");
+    batch_count = -1;
+    VERIFY(read_bam_batch_count_ret(invalid_tid, 2, 1, 0,
+                                    &batch_count) == 1 &&
+           batch_count == 1,
+           "fused BAM batch count without header rejected decodable invalid TID");
 
     VERIFY(write_valid_then_invalid_tid_bam_record(valid_then_invalid_tid) == 0,
            "failed to create valid-prefix invalid-TID BAM");
@@ -3932,6 +6020,7 @@ int main(int argc, char **argv)
     test_bam_set1_write_and_read_back();
     test_bam_raw_block_copy();
     test_bam_ordered_reader();
+    test_sam_region_helpers();
     test_bam_batch_reader();
     test_bam_stream_reader();
     test_cigar_api();

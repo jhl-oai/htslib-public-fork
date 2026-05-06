@@ -37,6 +37,7 @@ int bgzf_read_block_data(BGZF *fp, bgzf_block_data_t *block);
 int bgzf_read_block_compressed(BGZF *fp, bgzf_block_data_t *block);
 int bgzf_decode_block_data(BGZF *fp, bgzf_block_data_t *block);
 int bgzf_block_data_update_index(BGZF *fp, bgzf_block_data_t *block);
+int bgzf_raw_write_full_block(BGZF *fp, const void *data, size_t length);
 
 /*
  * BGZF private data interface

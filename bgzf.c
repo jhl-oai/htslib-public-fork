@@ -2352,6 +2352,44 @@ ssize_t bgzf_raw_write(BGZF *fp, const void *data, size_t length)
     return ret;
 }
 
+int bgzf_raw_write_full_block(BGZF *fp, const void *data, size_t length)
+{
+    int need_flush;
+
+    if (!fp || !fp->is_write || !fp->is_compressed || fp->is_gzip ||
+        !data || length == 0 || fp->idx || fp->idx_build_otf) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    need_flush = fp->block_offset != 0;
+#ifdef BGZF_MT
+    if (fp->mt) {
+        pthread_mutex_lock(&fp->mt->job_pool_m);
+        need_flush = need_flush || fp->mt->jobs_pending != 0;
+        pthread_mutex_unlock(&fp->mt->job_pool_m);
+    }
+#endif
+
+    if (need_flush && bgzf_flush(fp) < 0)
+        return -1;
+
+    if (bgzf_raw_write(fp, data, length) != (ssize_t)length)
+        return -1;
+
+    fp->block_address += (int64_t)length;
+    fp->block_offset = 0;
+    fp->last_block_eof = 0;
+#ifdef BGZF_MT
+    if (fp->mt) {
+        pthread_mutex_lock(&fp->mt->idx_m);
+        fp->mt->block_address = fp->block_address;
+        pthread_mutex_unlock(&fp->mt->idx_m);
+    }
+#endif
+    return 0;
+}
+
 // Helper function for tidying up fp->mt and setting errcode
 static void bgzf_close_mt(BGZF *fp) {
     if (fp->mt) {
