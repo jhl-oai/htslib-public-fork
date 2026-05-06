@@ -1,0 +1,9 @@
+/data/
+/results/
+*.bam
+*.bai
+*.cram
+*.crai
+*.sam
+*.tmp
+*.out

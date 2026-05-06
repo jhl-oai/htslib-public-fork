@@ -1,0 +1,6 @@
+name	path	region	shape
+lowcov_chr20_1mb	../../data/HG00096.lowcov.chr20_1mb.bam	20:10000000-11000000	short_read_lowcov_smoke
+lowcov_chr20_10_20mb	../../data/HG00096.lowcov.chr20_10-20Mb.bam	20:10000000-20000000	short_read_lowcov_moderate
+highcov_chr20_10_11mb	../../data/HG00096.highcov.chr20_10-11Mb.bam	20:10000000-11000000	short_read_highcov_dense
+exome_chr20	../../data/HG00096.exome.chr20.bam	20	short_read_exome_sparse
+ont_ul_chr20_10_10_2mb	../../data/HG002.ont_ul.chr20_10-10.2Mb.bam	chr20:10000000-10200000	long_read_ont_ul
