@@ -423,20 +423,25 @@ SYNTHETIC_ONLY_NEW=1 \
   bench/format-shape/large/synthetic 2048
 ```
 
-The latest large run used this local output directory:
+The latest current-state large run used this tracked output directory:
 
 ```text
-bench/format-shape/large/results-prod-hardening2/timings.tsv
-bench/format-shape/large/results-prod-hardening2/checks.tsv
+bench/format-shape/large/results-current-20260507/summary.md
+bench/format-shape/large/results-current-20260507/summary.tsv
+bench/format-shape/large/results-current-20260507/timings.tsv
+bench/format-shape/large/results-current-20260507/checks.tsv
 ```
 
-Generated result files are ignored; the summary below is the portable record.
-All plan outputs in that run compared byte-identical to baseline.
+It was run on product commit `bd643182c8fa722abbc0cb89860263a90bb97020`, after
+the FORMAT planner executor simplification.  It records five sequential
+`test/test_view -b -l 0` repetitions for every `large/inputs.tsv` row.  All 50
+planned-vs-baseline BCF comparisons are `ok`.  The compact current table is in
+`summary.md`; the per-repetition raw rows are in `timings.tsv`.
 
-That run includes fallback reason diagnostics.  In the CCDG 10k slice, the
-planner hit 9,861 of 10,000 rows; the remaining 139 rows fell back for
-`string_width`, meaning their measured string field exceeded the current
-256-byte planned cap.
+That run includes planner counters.  In the CCDG 10k slice, the planner hit
+9,861 of 10,000 rows; the remaining 139 rows fell back after measuring a wide
+string field.  The two string/float negative controls deliberately had zero
+planned hits and stayed performance-neutral.
 
 One rejected optimization is recorded in
 `bench/format-shape/large/results-opt-nosubset-split`: splitting the all-samples

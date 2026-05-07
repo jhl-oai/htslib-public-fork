@@ -1,0 +1,8 @@
+key	value
+product_commit	bd643182c8fa722abbc0cb89860263a90bb97020
+corpus_base_commit	8af9f4fe07de233aebbaaec3d438c0455db61ccd
+run_started_utc	2026-05-07T16:50:01Z
+host	Darwin com-70138 25.4.0 arm64
+test_view	/Users/jeremiah.li/geneticoptims/inplace-htslib-refactor/htslib-vcf-avx-sanity/test/test_view
+repetitions	5
+runner	test_view -b -l 0 via run_bench.sh
