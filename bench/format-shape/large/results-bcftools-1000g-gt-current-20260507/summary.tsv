@@ -1,0 +1,17 @@
+name	command	threads	baseline_real_mean	baseline_real_se	plan_real_mean	plan_real_se	real_speedup	baseline_user_mean	baseline_user_se	plan_user_mean	plan_user_se	user_speedup
+1000g_chr22_full_genotypes	view_bcf	0	33.056	0.038	15.922	0.090	2.08	26.946	0.026	10.316	0.066	2.61
+1000g_chr22_full_genotypes	view_bcf	2	24.924	0.076	11.700	0.048	2.13	27.088	0.122	10.662	0.068	2.54
+1000g_chr22_full_genotypes	view_bcf	4	24.674	0.037	11.708	0.201	2.11	26.886	0.114	10.846	0.202	2.48
+1000g_chr22_full_genotypes	view_keep2_bcf	0	27.076	0.037	10.522	0.061	2.57	26.680	0.039	10.260	0.061	2.60
+1000g_chr22_full_genotypes	view_keep2_bcf	2	25.132	0.023	8.850	0.045	2.84	27.016	0.027	10.768	0.052	2.51
+1000g_chr22_full_genotypes	view_keep2_bcf	4	25.130	0.036	8.734	0.033	2.88	27.034	0.039	10.662	0.034	2.54
+1000g_chr22_full_genotypes	view_sites_bcf	0	26.262	0.029	9.984	0.058	2.63	25.894	0.025	9.704	0.056	2.67
+1000g_chr22_full_genotypes	view_sites_bcf	2	24.432	0.039	8.310	0.062	2.94	26.346	0.041	10.244	0.064	2.57
+1000g_chr22_full_genotypes	view_sites_bcf	4	24.418	0.049	8.242	0.040	2.96	26.410	0.125	10.150	0.040	2.60
+1000g_chr22_full_genotypes	query_sites	0	2.542	0.010	2.524	0.007	1.01	2.466	0.009	2.456	0.007	1.00
+1000g_chr22_full_genotypes	query_gt_keep2	0	5.836	0.027	2.998	0.016	1.95	5.728	0.031	2.888	0.010	1.98
+1000g_chr22_full_genotypes	query_gt_all	0	58.820	0.109	42.396	0.131	1.39	57.230	0.097	40.938	0.110	1.40
+1000g_chr22_full_genotypes	stats	0	2.970	0.014	2.970	0.004	1.00	2.876	0.009	2.872	0.004	1.00
+1000g_chr22_full_genotypes	filter_gt_keep2	0	49.376	0.096	33.010	0.219	1.50	48.782	0.080	32.420	0.155	1.50
+1000g_chr22_full_genotypes	filter_gt_keep2	2	48.132	0.283	31.410	0.055	1.53	49.516	0.101	33.116	0.062	1.50
+1000g_chr22_full_genotypes	filter_gt_keep2	4	49.984	1.023	33.958	1.817	1.47	51.412	0.948	35.188	1.583	1.46

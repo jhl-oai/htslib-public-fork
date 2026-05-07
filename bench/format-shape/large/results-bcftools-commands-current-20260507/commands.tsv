@@ -1,0 +1,8 @@
+command	description
+view_bcf	bcftools view --no-version -Ob -l 0
+view_sites	bcftools view --no-version -G -Ob -l 0
+query_sites	bcftools query fixed site fields
+query_format	bcftools query GT for first QUERY_SAMPLE_COUNT samples
+stats	bcftools stats
+filter_gt	bcftools view -i GT="alt" for first QUERY_SAMPLE_COUNT samples
+merge_self	bcftools merge --no-index --force-samples of the input with itself

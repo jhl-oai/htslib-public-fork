@@ -1,0 +1,13 @@
+key	value
+input	bench/format-shape/public/ccdg_chr22_10k.vcf.gz
+input_bytes	123431420
+samples_total	3202
+query_sample_count	2
+query_samples	HG00096,HG00097
+reps	5
+threads_list	0 2 4
+commands	view_bcf view_keep2_bcf view_sites_bcf query_sites query_gt_keep2 query_gt_all stats filter_gt_keep2
+bcftools	/Users/jeremiah.li/geneticoptims/inplace-htslib-refactor/bcftools-htslib-vcf-plan/bcftools
+bcftools_version_line_1	bcftools 1.23.1-63-gd9375776
+bcftools_version_line_2	Using htslib 1.23.1-58-gbd643182
+date	2026-05-07 20:57:45 +0200

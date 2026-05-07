@@ -1,0 +1,9 @@
+command	description
+view_bcf	bcftools view --no-version -Ob -l 0, all samples, streamed to cksum
+view_keep2_bcf	bcftools view --no-version -s first QUERY_SAMPLE_COUNT samples -Ob -l 0, streamed to cksum
+view_sites_bcf	bcftools view --no-version -G -Ob -l 0, streamed to cksum
+query_sites	bcftools query fixed site fields, streamed to cksum
+query_gt_keep2	bcftools query GT for first QUERY_SAMPLE_COUNT samples, streamed to cksum
+query_gt_all	bcftools query GT for all samples, streamed to cksum
+stats	bcftools stats, streamed to cksum
+filter_gt_keep2	bcftools view -s first QUERY_SAMPLE_COUNT samples -i GT="alt" -Ob -l 0, streamed to cksum

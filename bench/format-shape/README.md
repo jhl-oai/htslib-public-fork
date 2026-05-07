@@ -273,17 +273,38 @@ commands remain unthreaded and are recorded with `threads=0`.  If a long run is
 interrupted, rerun the same command with `RESUME=1`; completed mode rows are
 left intact and only missing rows are appended.
 
-The latest local threaded ad hoc runs are recorded in:
+The current local threaded ad hoc runs for product commit
+`bd643182c8fa722abbc0cb89860263a90bb97020` are recorded in:
+
+```text
+bench/format-shape/large/results-bcftools-ccdg10k-current-20260507/summary.md
+bench/format-shape/large/results-bcftools-1000g-gt-current-20260507/summary.md
+bench/format-shape/large/results-bcftools-float-string-current-20260507/summary.md
+```
+
+They use `bcftools 1.23.1-63-gd9375776` linked against
+`htslib 1.23.1-58-gbd643182`.  The CCDG and 1000G result sets cover full BCF
+conversion, two-sample conversion, site-only view/query, two-sample and
+all-sample GT queries, `bcftools stats`, and a two-sample GT-expression filter
+across `THREADS_LIST="0 2 4"` where threading applies.  Each has 80 streamed
+baseline-vs-plan checksum comparisons, all `ok`.  The float/string
+negative-control run is unthreaded and has 40 checksum comparisons, all `ok`.
+
+A single-pass broad command smoke run is recorded in:
+
+```text
+bench/format-shape/large/results-bcftools-commands-current-20260507/summary.md
+```
+
+It covers the representative command manifest and has only `ok` comparisons
+plus expected `skipped_no_samples` rows for the sites-only input.
+
+Older local threaded ad hoc runs are retained in:
 
 ```text
 bench/format-shape/large/results-bcftools-ccdg10k-ad-hoc-threaded/summary.md
 bench/format-shape/large/results-bcftools-1000g-gt-ad-hoc-threaded/summary.md
 ```
-
-They cover full BCF conversion, two-sample conversion, site-only view/query,
-two-sample and all-sample GT queries, `bcftools stats`, and a two-sample
-GT-expression filter.  Each threaded result set has 80 streamed
-baseline-vs-plan comparisons, all `ok`.
 
 The earlier unthreaded CCDG 10k run is retained in:
 
