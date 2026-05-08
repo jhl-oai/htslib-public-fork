@@ -36,6 +36,7 @@ DEALINGS IN THE SOFTWARE.  */
 #include <stdint.h>
 #include <inttypes.h>
 #include <errno.h>
+#include <stdlib.h>
 
 #ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
 #include "fuzz_settings.h"
@@ -112,11 +113,17 @@ static bcf_idinfo_t bcf_idinfo_def = { .info = { 15, 15, 15 }, .hrec = { NULL, N
 // Note that this preserving API and ABI requires that the first element is vdict_t struct
 // rather than a pointer, as user programs may (and in some cases do) access the dictionary
 // directly as (vdict_t*)hdr->dict.
+typedef struct vcf_format_plan_cache_t vcf_format_plan_cache_t;
+static void vcf_format_plan_cache_clear(vcf_format_plan_cache_t *cache);
+static void vcf_format_plan_cache_destroy(vcf_format_plan_cache_t *cache);
+
 typedef struct
 {
     vdict_t dict;   // bcf_hdr_t.dict[0] vdict_t dictionary which keeps bcf_idinfo_t for BCF_HL_FLT,BCF_HL_INFO,BCF_HL_FMT
     hdict_t *gen;   // hdict_t dictionary which keeps bcf_hrec_t* pointers for generic and structured fields
     size_t *key_len;// length of h->id[BCF_DT_ID] strings
+    vcf_format_plan_cache_t *format_plan_cache; // Header-local FORMAT planner cache
+    uint64_t format_plan_gen; // Incremented when header dictionaries are resynchronised
     int version;    //cached version
     uint32_t ref_count; // reference count, low bit indicates bcf_hdr_destroy() has been called
 }
@@ -343,6 +350,10 @@ int bcf_hdr_sync(bcf_hdr_t *h)
         free(aux->key_len);
         aux->key_len = NULL;
     }
+    if (aux && aux->format_plan_cache)
+        vcf_format_plan_cache_clear(aux->format_plan_cache);
+    if (aux)
+        aux->format_plan_gen++;
 
     h->dirty = 0;
     return 0;
@@ -1649,6 +1660,8 @@ bcf_hdr_t *bcf_hdr_init(const char *mode)
     if ( !aux ) goto fail;
     if ( (aux->gen = kh_init(hdict))==NULL ) { free(aux); goto fail; }
     aux->key_len = NULL;
+    aux->format_plan_cache = NULL;
+    aux->format_plan_gen = 0;
     aux->dict = *((vdict_t*)h->dict[0]);
     aux->version = 0;
     aux->ref_count = 1;
@@ -1693,6 +1706,7 @@ void bcf_hdr_destroy(bcf_hdr_t *h)
                 if ( kh_exist(aux->gen,k) ) free((char*)kh_key(aux->gen,k));
             kh_destroy(hdict, aux->gen);
             free(aux->key_len); // may exist for dict[0] only
+            vcf_format_plan_cache_destroy(aux->format_plan_cache);
         }
         kh_destroy(vdict, d);
         free(h->id[i]);
@@ -2921,6 +2935,76 @@ int bcf_enc_vint(kstring_t *s, int n, int32_t *a, int wsize)
     return 0;
 }
 
+static int bcf_enc_vint_known_range_special(kstring_t *s, int n, int32_t *a, int wsize,
+                                            int32_t min, int32_t max, int has_special)
+{
+    int i;
+    // min/max must match bcf_enc_vint()'s scan: missing and vector-end values
+    // may affect max, but are excluded from min.
+    if (n <= 0) {
+        return bcf_enc_size(s, 0, BCF_BT_NULL);
+    } else if (n == 1) {
+        return bcf_enc_int1(s, a[0]);
+    } else {
+        if (wsize <= 0) wsize = n;
+
+        if (max <= BCF_MAX_BT_INT8 && min >= BCF_MIN_BT_INT8) {
+            if (bcf_enc_size(s, wsize, BCF_BT_INT8) < 0 ||
+                ks_resize(s, s->l + n) < 0)
+                return -1;
+            uint8_t *p = (uint8_t *) s->s + s->l;
+            if (has_special) {
+                for (i = 0; i < n; ++i, p++) {
+                    if ( a[i]==bcf_int32_vector_end )   *p = bcf_int8_vector_end;
+                    else if ( a[i]==bcf_int32_missing ) *p = bcf_int8_missing;
+                    else *p = a[i];
+                }
+            } else {
+                for (i = 0; i < n; ++i, p++)
+                    *p = a[i];
+            }
+            s->l += n;
+        } else if (max <= BCF_MAX_BT_INT16 && min >= BCF_MIN_BT_INT16) {
+            uint8_t *p;
+            if (bcf_enc_size(s, wsize, BCF_BT_INT16) < 0 ||
+                ks_resize(s, s->l + n * sizeof(int16_t)) < 0)
+                return -1;
+            p = (uint8_t *) s->s + s->l;
+            if (has_special) {
+                for (i = 0; i < n; ++i)
+                {
+                    int16_t x;
+                    if ( a[i]==bcf_int32_vector_end ) x = bcf_int16_vector_end;
+                    else if ( a[i]==bcf_int32_missing ) x = bcf_int16_missing;
+                    else x = a[i];
+                    i16_to_le(x, p);
+                    p += sizeof(int16_t);
+                }
+            } else {
+                for (i = 0; i < n; ++i)
+                {
+                    i16_to_le((int16_t)a[i], p);
+                    p += sizeof(int16_t);
+                }
+            }
+            s->l += n * sizeof(int16_t);
+        } else {
+            uint8_t *p;
+            if (bcf_enc_size(s, wsize, BCF_BT_INT32) < 0 ||
+                ks_resize(s, s->l + n * sizeof(int32_t)) < 0)
+                return -1;
+            p = (uint8_t *) s->s + s->l;
+            for (i = 0; i < n; ++i) {
+                i32_to_le(a[i], p);
+                p += sizeof(int32_t);
+            }
+            s->l += n * sizeof(int32_t);
+        }
+    }
+
+    return 0;
+}
+
 #ifdef VCF_ALLOW_INT64
 static int bcf_enc_long1(kstring_t *s, int64_t x) {
     uint32_t e = 0;
@@ -3132,6 +3216,1469 @@ static inline int align_mem(kstring_t *s)
 }
 
 #define MAX_N_FMT 255   /* Limited by size of bcf1_t n_fmt field */
+
+static int vcf_parse_format_check7(const bcf_hdr_t *h, bcf1_t *v);
+
+/*
+ * Planned FORMAT parser.
+ *
+ * The generic FORMAT parser below is deliberately permissive: it can repair
+ * missing header declarations, handle sample subsetting, and recover from many
+ * irregular row shapes.  The planned parser only handles rows that can be
+ * described by existing FORMAT header metadata and parsed as a fixed list of
+ * per-tag operations.  If any compile-time or row-local invariant fails, it
+ * returns -3 so the generic parser handles the whole FORMAT column.
+ *
+ * The implementation is organized as:
+ *
+ *   - controls and diagnostics;
+ *   - cached FORMAT plan data structures;
+ *   - plan cache management and FORMAT-string compilation;
+ *   - small value parsers used by the sample loop;
+ *   - row-local layout and BCF encoding helpers;
+ *   - width measurement for variable row shapes;
+ *   - execution and the generic-parser fallback entry point.
+ */
+
+/*
+ * Planned FORMAT parser: controls and diagnostics.
+ *
+ * HTS_VCF_FORMAT_PLAN controls the feature:
+ *   unset/0        use the generic parser only
+ *   1              enable the planned per-tag parser, with generic fallback
+ *
+ * HTS_VCF_FORMAT_PLAN_STATS=1 emits aggregate plan counters at process exit.
+ * These counters are intentionally diagnostic; normal parsing avoids touching
+ * them unless the stats environment variable is enabled.
+ */
+typedef struct {
+    uint64_t attempts;
+    uint64_t hits;
+    uint64_t fallback;
+    uint64_t parsed_samples;
+} vcf_format_plan_stats_t;
+
+static vcf_format_plan_stats_t vcf_format_plan_stats;
+
+typedef enum {
+    VCF_FORMAT_PLAN_FB_UNSUPPORTED = 0,
+    VCF_FORMAT_PLAN_FB_NUMERIC_WIDTH,
+    VCF_FORMAT_PLAN_FB_STRING_WIDTH,
+    VCF_FORMAT_PLAN_FB_GT_SHAPE,
+    VCF_FORMAT_PLAN_FB_PARSE,
+    VCF_FORMAT_PLAN_FB_SEPARATOR,
+    VCF_FORMAT_PLAN_FB_SAMPLE_COUNT,
+    VCF_FORMAT_PLAN_FB_N
+} vcf_format_plan_fallback_reason_t;
+
+static uint64_t vcf_format_plan_fallback_reasons[VCF_FORMAT_PLAN_FB_N];
+
+static void vcf_format_plan_report_stats(void)
+{
+    fprintf(stderr,
+            "vcf-format-plan attempts=%llu hits=%llu fallback=%llu parsed_samples=%llu\n",
+            (unsigned long long) vcf_format_plan_stats.attempts,
+            (unsigned long long) vcf_format_plan_stats.hits,
+            (unsigned long long) vcf_format_plan_stats.fallback,
+            (unsigned long long) vcf_format_plan_stats.parsed_samples);
+    fprintf(stderr,
+            "vcf-format-plan-fallback unsupported=%llu numeric_width=%llu string_width=%llu gt_shape=%llu parse=%llu separator=%llu sample_count=%llu\n",
+            (unsigned long long) vcf_format_plan_fallback_reasons[VCF_FORMAT_PLAN_FB_UNSUPPORTED],
+            (unsigned long long) vcf_format_plan_fallback_reasons[VCF_FORMAT_PLAN_FB_NUMERIC_WIDTH],
+            (unsigned long long) vcf_format_plan_fallback_reasons[VCF_FORMAT_PLAN_FB_STRING_WIDTH],
+            (unsigned long long) vcf_format_plan_fallback_reasons[VCF_FORMAT_PLAN_FB_GT_SHAPE],
+            (unsigned long long) vcf_format_plan_fallback_reasons[VCF_FORMAT_PLAN_FB_PARSE],
+            (unsigned long long) vcf_format_plan_fallback_reasons[VCF_FORMAT_PLAN_FB_SEPARATOR],
+            (unsigned long long) vcf_format_plan_fallback_reasons[VCF_FORMAT_PLAN_FB_SAMPLE_COUNT]);
+}
+
+static int vcf_format_plan_stats_enabled(void)
+{
+    static int enabled = -1;
+    static int registered = 0;
+
+    if (enabled < 0) {
+        const char *env = getenv("HTS_VCF_FORMAT_PLAN_STATS");
+        enabled = env && strcmp(env, "1") == 0;
+        if (enabled && !registered) {
+            if (atexit(vcf_format_plan_report_stats) == 0)
+                registered = 1;
+        }
+    }
+    return enabled;
+}
+
+static int vcf_format_plan_enabled(void)
+{
+    static int enabled = -1;
+
+    if (enabled < 0) {
+        const char *env = getenv("HTS_VCF_FORMAT_PLAN");
+        enabled = env && strcmp(env, "1") == 0;
+    }
+    return enabled;
+}
+
+enum {
+    VCF_FORMAT_MAX_NUMERIC_WIDTH = 64,
+    VCF_FORMAT_MAX_STRING_WIDTH = 256
+};
+
+static inline void vcf_format_plan_note_fallback(vcf_format_plan_fallback_reason_t reason)
+{
+    if (vcf_format_plan_stats_enabled()) {
+        vcf_format_plan_stats.fallback++;
+        if ((unsigned)reason < VCF_FORMAT_PLAN_FB_N)
+            vcf_format_plan_fallback_reasons[reason]++;
+    }
+}
+
+static inline void vcf_format_plan_set_reason(vcf_format_plan_fallback_reason_t *dst,
+                                              vcf_format_plan_fallback_reason_t reason)
+{
+    if (dst)
+        *dst = reason;
+}
+
+/*
+ * Planned FORMAT parser: cached plan data model.
+ *
+ * A cached plan is the header-derived, record-independent description of the
+ * FORMAT string.  Row operations are derived later after allele-dependent and
+ * measured widths are known for the current record.
+ */
+typedef struct {
+    /*
+     * Header-derived operation for one FORMAT tag.  This is the reusable,
+     * record-independent part of the plan: the tag key, declared type, declared
+     * length model, and whether the row must measure the width before parsing.
+     */
+    int key;
+    int number;
+    uint8_t htype;
+    uint8_t is_gt;
+    uint8_t vl_type;
+    uint8_t measured_width;
+} vcf_format_op_t;
+
+typedef struct {
+    /*
+     * Cache key is the literal FORMAT string plus the private header
+     * generation.  FORMAT key ids/types are header-local, so plans are owned by
+     * the header aux block and invalidated whenever bcf_hdr_sync() rebuilds the
+     * dictionaries.  Unsupported FORMAT strings are cached too, so repeated
+     * fallback cases pay the compile cost once and then go directly to the
+     * generic parser.
+     */
+    char *format;
+    size_t format_len;
+    uint64_t format_hash;
+    uint64_t hdr_gen;
+    int supported;
+    vcf_format_plan_fallback_reason_t fallback_reason;
+    int n_ops;
+    uint8_t has_string_spans;
+    vcf_format_op_t ops[MAX_N_FMT];
+} vcf_format_general_plan_t;
+
+struct vcf_format_plan_cache_t {
+    vcf_format_general_plan_t *plans;
+    int n;
+    int m;
+    int next_evict;
+    uint64_t hdr_gen;
+};
+
+typedef enum {
+    VCF_FORMAT_ROW_GT2,
+    VCF_FORMAT_ROW_INT1,
+    VCF_FORMAT_ROW_INTVEC,
+    VCF_FORMAT_ROW_FLOAT1,
+    VCF_FORMAT_ROW_FLOATN,
+    VCF_FORMAT_ROW_STR
+} vcf_format_row_kind_t;
+
+typedef struct {
+    /*
+     * Row-local operation.  Header Number=A/R/G and measured Number=. fields
+     * depend on the current record, so width/size/offset are resolved per row.
+     */
+    int key;
+    int width;
+    int size;
+    int offset;
+    vcf_format_row_kind_t kind;
+    uint8_t can_compact;
+} vcf_format_row_op_t;
+
+typedef struct {
+    /*
+     * Measured string fields are scanned once up front to determine the row
+     * width.  Keep the span from that pass so execution can copy bytes without
+     * searching for the same ':' or tab delimiter again.
+     */
+    const char *ptr;
+    int len;
+} vcf_format_string_span_t;
+
+typedef struct {
+    int32_t min;
+    int32_t max;
+    int has_special;
+} vcf_plan_int_range_t;
+
+/*
+ * Planned FORMAT parser: cache management and plan compilation.
+ *
+ * Plans are owned by bcf_hdr_aux_t because FORMAT ids, types, and Number
+ * declarations are header-local.  The cache stores both supported and
+ * unsupported FORMAT strings; unsupported entries let repeated odd schemas
+ * fall through to the generic parser without repeatedly recompiling.
+ */
+static uint64_t vcf_format_plan_hash(const char *format, size_t len)
+{
+    size_t i;
+    uint64_t hash = 1469598103934665603ULL;
+
+    for (i = 0; i < len; i++) {
+        hash ^= (unsigned char) format[i];
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+static void vcf_format_general_plan_destroy(vcf_format_general_plan_t *plan)
+{
+    if (!plan)
+        return;
+    free(plan->format);
+    memset(plan, 0, sizeof(*plan));
+}
+
+static void vcf_format_plan_cache_clear(vcf_format_plan_cache_t *cache)
+{
+    int i;
+
+    if (!cache)
+        return;
+    for (i = 0; i < cache->n; i++)
+        vcf_format_general_plan_destroy(&cache->plans[i]);
+    cache->n = 0;
+    cache->next_evict = 0;
+}
+
+static void vcf_format_plan_cache_destroy(vcf_format_plan_cache_t *cache)
+{
+    if (!cache)
+        return;
+    vcf_format_plan_cache_clear(cache);
+    free(cache->plans);
+    free(cache);
+}
+
+static vcf_format_plan_cache_t *vcf_format_plan_cache_get(const bcf_hdr_t *h)
+{
+    bcf_hdr_aux_t *aux = get_hdr_aux(h);
+
+    if (!aux)
+        return NULL;
+    if (!aux->format_plan_cache) {
+        aux->format_plan_cache = (vcf_format_plan_cache_t *)
+            calloc(1, sizeof(*aux->format_plan_cache));
+        if (!aux->format_plan_cache)
+            return NULL;
+        aux->format_plan_cache->hdr_gen = aux->format_plan_gen;
+    }
+    if (aux->format_plan_cache->hdr_gen != aux->format_plan_gen) {
+        vcf_format_plan_cache_clear(aux->format_plan_cache);
+        aux->format_plan_cache->hdr_gen = aux->format_plan_gen;
+    }
+    return aux->format_plan_cache;
+}
+
+static int vcf_format_plan_cache_slot(vcf_format_plan_cache_t *cache)
+{
+    enum { VCF_FORMAT_PLAN_CACHE_INIT = 16, VCF_FORMAT_PLAN_CACHE_MAX = 128 };
+    int i, idx, new_m;
+    vcf_format_general_plan_t *plans;
+
+    if (cache->n < cache->m)
+        return cache->n++;
+
+    if (cache->m < VCF_FORMAT_PLAN_CACHE_MAX) {
+        new_m = cache->m ? cache->m * 2 : VCF_FORMAT_PLAN_CACHE_INIT;
+        if (new_m > VCF_FORMAT_PLAN_CACHE_MAX)
+            new_m = VCF_FORMAT_PLAN_CACHE_MAX;
+        if ((size_t) new_m > SIZE_MAX / sizeof(*cache->plans))
+            return -1;
+        plans = (vcf_format_general_plan_t *)
+            realloc(cache->plans, (size_t) new_m * sizeof(*cache->plans));
+        if (!plans)
+            return -1;
+        memset(plans + cache->m, 0,
+               (size_t) (new_m - cache->m) * sizeof(*plans));
+        cache->plans = plans;
+        cache->m = new_m;
+        return cache->n++;
+    }
+
+    for (i = 0; i < cache->n; i++) {
+        idx = (cache->next_evict + i) % cache->n;
+        if (!cache->plans[idx].supported)
+            goto found;
+    }
+    idx = cache->next_evict;
+
+found:
+    vcf_format_general_plan_destroy(&cache->plans[idx]);
+    cache->next_evict = (idx + 1) % cache->n;
+    return idx;
+}
+
+static inline int vcf_format_op_is_vector(const vcf_format_op_t *op)
+{
+    return op->vl_type != BCF_VL_FIXED || op->number != 1;
+}
+
+/*
+ * Return whether this FORMAT composition is within the planned executor's
+ * supported shape set.  Mixed measured-string plus float-vector rows require an
+ * extra measurement pass and stay on the generic parser unless the row also
+ * contains integer-vector work that benefits from the planned encoding path.
+ */
+static int vcf_format_general_plan_shape_supported(const vcf_format_general_plan_t *plan)
+{
+    int j, has_measured_string = 0, has_float_vector = 0, has_int_vector = 0;
+
+    for (j = 0; j < plan->n_ops; j++) {
+        const vcf_format_op_t *op = &plan->ops[j];
+        if (op->is_gt)
+            continue;
+        if (op->htype == BCF_HT_STR) {
+            has_measured_string = 1;
+        } else if (op->htype == BCF_HT_REAL && vcf_format_op_is_vector(op)) {
+            has_float_vector = 1;
+        } else if (op->htype == BCF_HT_INT && vcf_format_op_is_vector(op)) {
+            has_int_vector = 1;
+        }
+    }
+
+    if (has_measured_string && has_float_vector && !has_int_vector)
+        return 0;
+    return 1;
+}
+
+static int vcf_format_general_plan_compile(const bcf_hdr_t *h, const char *format,
+                                           size_t format_len, uint64_t format_hash,
+                                           uint64_t hdr_gen,
+                                           vcf_format_general_plan_t *plan)
+{
+    char *tmp, *tok, *format_end;
+    int i, ret = 0;
+
+    memset(plan, 0, sizeof(*plan));
+    plan->format = (char *) malloc(format_len + 1);
+    tmp = (char *) malloc(format_len + 1);
+    if (!plan->format || !tmp) {
+        free(tmp);
+        free(plan->format);
+        memset(plan, 0, sizeof(*plan));
+        return -1;
+    }
+    memcpy(plan->format, format, format_len + 1);
+    memcpy(tmp, format, format_len + 1);
+    plan->format_len = format_len;
+    plan->format_hash = format_hash;
+    plan->hdr_gen = hdr_gen;
+    plan->fallback_reason = VCF_FORMAT_PLAN_FB_UNSUPPORTED;
+
+    /*
+     * Compile at tag granularity, not full FORMAT-shape granularity.  This is
+     * what allows GT:AD, GT:AD:DP:PL, reordered fields, and supersets with
+     * additional header-described tags to share the same executor instead of
+     * needing exact string-specific kernels.
+     */
+    /*
+     * Keep empty FORMAT tokens visible.  strtok_r() would collapse GT::DP into
+     * GT:DP, but the generic parser treats the empty tag as malformed.
+     */
+    format_end = tmp + format_len;
+    for (tok = tmp; tok <= format_end; ) {
+        char *next = memchr(tok, ':', (size_t)(format_end - tok));
+        int key, htype;
+
+        if (!next)
+            next = format_end;
+        if (next == tok)
+            goto done;
+        *next = '\0';
+
+        if (plan->n_ops >= MAX_N_FMT)
+            goto done;
+        key = bcf_hdr_id2int(h, BCF_DT_ID, tok);
+        if (key < 0 || !bcf_hdr_idinfo_exists(h, BCF_HL_FMT, key))
+            goto done;
+        for (i = 0; i < plan->n_ops; i++)
+            if (plan->ops[i].key == key)
+                goto done;
+
+        htype = bcf_hdr_id2type(h, BCF_HL_FMT, key);
+        if (htype != BCF_HT_STR && htype != BCF_HT_INT && htype != BCF_HT_REAL)
+            goto done;
+
+        /*
+         * Only compile tags with enough header information to reproduce the
+         * generic parser's BCF layout.  Undefined tags and exotic types stay on
+         * the generic parser, which owns warning and header-repair behavior.
+         */
+        plan->ops[plan->n_ops].key = key;
+        plan->ops[plan->n_ops].number = bcf_hdr_id2number(h, BCF_HL_FMT, key);
+        plan->ops[plan->n_ops].htype = htype;
+        plan->ops[plan->n_ops].is_gt = strcmp(tok, "GT") == 0;
+        plan->ops[plan->n_ops].vl_type = bcf_hdr_id2length(h, BCF_HL_FMT, key);
+        plan->ops[plan->n_ops].measured_width = 0;
+        if (plan->ops[plan->n_ops].is_gt) {
+            if (htype != BCF_HT_STR || plan->ops[plan->n_ops].number != 1 ||
+                plan->ops[plan->n_ops].vl_type != BCF_VL_FIXED)
+                goto done;
+        } else {
+            int vl = plan->ops[plan->n_ops].vl_type;
+            if (htype == BCF_HT_STR) {
+                if (plan->ops[plan->n_ops].number != 1)
+                    goto done;
+                plan->ops[plan->n_ops].measured_width = 1;
+                plan->has_string_spans = 1;
+            } else if (vl != BCF_VL_FIXED && vl != BCF_VL_A &&
+                       vl != BCF_VL_R && vl != BCF_VL_G &&
+                       vl != BCF_VL_VAR) {
+                goto done;
+            } else if (vl == BCF_VL_VAR) {
+                plan->ops[plan->n_ops].measured_width = 1;
+            }
+        }
+        plan->n_ops++;
+
+        if (next == format_end)
+            break;
+        tok = next + 1;
+    }
+
+    if (!plan->n_ops)
+        goto done;
+    if (!vcf_format_general_plan_shape_supported(plan))
+        goto done;
+
+    plan->supported = 1;
+    ret = 1;
+
+done:
+    free(tmp);
+    return ret;
+}
+
+static vcf_format_general_plan_t *vcf_format_general_plan_get(const bcf_hdr_t *h,
+                                                              const char *format,
+                                                              vcf_format_plan_fallback_reason_t *reason)
+{
+    bcf_hdr_aux_t *aux;
+    vcf_format_plan_cache_t *cache;
+    vcf_format_general_plan_t *plan;
+    size_t format_len;
+    uint64_t format_hash, hdr_gen;
+    int i, idx, ret;
+
+    /*
+     * The compiler reads h->id[] and header metadata directly.  If a caller has
+     * mutated the header but not synced it yet, the generic parser is the
+     * only safe path because it already owns all header-repair semantics.
+     */
+    if (h->dirty)
+        return NULL;
+
+    aux = get_hdr_aux(h);
+    if (!aux)
+        return NULL;
+    cache = vcf_format_plan_cache_get(h);
+    if (!cache)
+        return NULL;
+
+    format_len = strlen(format);
+    format_hash = vcf_format_plan_hash(format, format_len);
+    hdr_gen = aux->format_plan_gen;
+    for (i = 0; i < cache->n; i++) {
+        plan = &cache->plans[i];
+        if (plan->format && plan->hdr_gen == hdr_gen &&
+            plan->format_len == format_len &&
+            plan->format_hash == format_hash &&
+            memcmp(plan->format, format, format_len) == 0) {
+            if (!plan->supported)
+                vcf_format_plan_set_reason(reason, plan->fallback_reason);
+            return plan->supported ? plan : NULL;
+        }
+    }
+
+    idx = vcf_format_plan_cache_slot(cache);
+    if (idx < 0)
+        return NULL;
+    plan = &cache->plans[idx];
+    ret = vcf_format_general_plan_compile(h, format, format_len, format_hash,
+                                          hdr_gen, plan);
+    if (ret < 0) {
+        vcf_format_general_plan_destroy(plan);
+        if (idx == cache->n - 1)
+            cache->n--;
+        return NULL;
+    }
+    if (!plan->supported)
+        vcf_format_plan_set_reason(reason, plan->fallback_reason);
+    return plan->supported ? plan : NULL;
+}
+
+/*
+ * Planned FORMAT parser: value parsers.
+ *
+ * These helpers consume one FORMAT subfield and leave the input pointer on the
+ * following ':' or tab.  They deliberately handle only the planned subset and
+ * report failure to the executor, which then rolls the whole row back to the
+ * generic parser.  Integer helpers maintain the observed min/max range while
+ * parsing so the final BCF encoder does not need a second range scan.
+ */
+#if defined(__GNUC__)
+#define VCF_PLAN_ALWAYS_INLINE static inline __attribute__((always_inline))
+#else
+#define VCF_PLAN_ALWAYS_INLINE static inline
+#endif
+
+VCF_PLAN_ALWAYS_INLINE int vcf_plan_gt2_u8(const char **sp, uint8_t out[2])
+{
+    const char *s = *sp;
+    int a0, a1, phased;
+
+    if (((s[0] != '.' && !(s[0] >= '0' && s[0] <= '9'))) ||
+        (s[1] != '/' && s[1] != '|') ||
+        ((s[2] != '.' && !(s[2] >= '0' && s[2] <= '9'))))
+        return -1;
+
+    phased = s[1] == '|';
+    a0 = s[0] == '.' ? -1 : s[0] - '0';
+    a1 = s[2] == '.' ? -1 : s[2] - '0';
+    out[0] = a0 < 0 ? (uint8_t) phased :
+                           (uint8_t)(((a0 + 1) << 1) | phased);
+    out[1] = a1 < 0 ? (uint8_t) phased :
+                           (uint8_t)(((a1 + 1) << 1) | phased);
+    *sp = s + 3;
+    return 0;
+}
+
+VCF_PLAN_ALWAYS_INLINE int vcf_plan_int_value(const char **sp, int32_t *out)
+{
+    const char *s = *sp;
+    int sign = 1;
+    uint32_t val = 0, limit, cutoff, cutlim;
+
+    if (*s == '.') {
+        *out = bcf_int32_missing;
+        *sp = s + 1;
+        return 0;
+    }
+    if (*s == '-') {
+        sign = -1;
+        s++;
+    }
+    if (!(*s >= '0' && *s <= '9'))
+        return -1;
+    limit = sign < 0 ? (uint32_t)(-(int64_t)BCF_MIN_BT_INT32) : (uint32_t)BCF_MAX_BT_INT32;
+    cutoff = limit / 10;
+    cutlim = limit % 10;
+    while (*s >= '0' && *s <= '9') {
+        uint32_t digit = *s - '0';
+        if (val > cutoff || (val == cutoff && digit > cutlim))
+            return -1;
+        val = val * 10 + digit;
+        s++;
+    }
+    if (sign < 0)
+        *out = -(int32_t)val;
+    else
+        *out = (int32_t)val;
+    *sp = s;
+    return 0;
+}
+
+VCF_PLAN_ALWAYS_INLINE void vcf_plan_int_range_init(vcf_plan_int_range_t *range)
+{
+    range->min = INT32_MAX;
+    range->max = INT32_MIN;
+    range->has_special = 0;
+}
+
+VCF_PLAN_ALWAYS_INLINE void vcf_plan_int_range_add(vcf_plan_int_range_t *range, int32_t val)
+{
+    if (val == bcf_int32_missing || val == bcf_int32_vector_end)
+        range->has_special = 1;
+    if (range->max < val)
+        range->max = val;
+    if (range->min > val && val > INT32_MIN + 1)
+        range->min = val;
+}
+
+VCF_PLAN_ALWAYS_INLINE void vcf_plan_int_range_add_regular(vcf_plan_int_range_t *range, int32_t val)
+{
+    if (range->max < val)
+        range->max = val;
+    if (range->min > val)
+        range->min = val;
+}
+
+VCF_PLAN_ALWAYS_INLINE int vcf_plan_float_value(const char **sp, float *out)
+{
+    const char *s = *sp;
+    char *end = NULL;
+    int failed = 0;
+
+    if (*s == '.') {
+        bcf_float_set_missing(*out);
+        *sp = s + 1;
+        return 0;
+    }
+    *out = hts_str2dbl(s, &end, &failed);
+    if (failed || end == s)
+        return -1;
+    *sp = end;
+    return 0;
+}
+
+VCF_PLAN_ALWAYS_INLINE int vcf_plan_int_value_range(const char **sp, int32_t *out,
+                                                    vcf_plan_int_range_t *range)
+{
+    const char *s = *sp;
+    uint32_t val = 0, cutoff = BCF_MAX_BT_INT32 / 10, cutlim = BCF_MAX_BT_INT32 % 10;
+
+    if (*s >= '0' && *s <= '9') {
+        do {
+            uint32_t digit = *s - '0';
+            if (val > cutoff || (val == cutoff && digit > cutlim))
+                return -1;
+            val = val * 10 + digit;
+            s++;
+        } while (*s >= '0' && *s <= '9');
+        *out = (int32_t)val;
+        *sp = s;
+        vcf_plan_int_range_add_regular(range, *out);
+        return 0;
+    }
+    if (vcf_plan_int_value(sp, out) < 0)
+        return -1;
+    vcf_plan_int_range_add(range, *out);
+    return 0;
+}
+
+static int vcf_plan_parse_int_vector_counted_range(const char **sp,
+                                                   int32_t *out,
+                                                   int width,
+                                                   int *nread,
+                                                   vcf_plan_int_range_t *range)
+{
+    const char *s = *sp;
+    int i = 0;
+
+    while (i < width) {
+        if (vcf_plan_int_value_range(&s, &out[i], range) < 0)
+            return -1;
+        i++;
+        if (*s != ',')
+            break;
+        /*
+         * Another comma after width values means the subfield has too many
+         * entries, including the trailing-comma form "1,2,".
+         */
+        if (i == width)
+            return -1;
+        s++;
+    }
+    *nread = i;
+    if (i < width)
+        range->has_special = 1;
+    for (; i < width; i++)
+        out[i] = bcf_int32_vector_end;
+    *sp = s;
+    return 0;
+}
+
+VCF_PLAN_ALWAYS_INLINE int vcf_plan_expect_sep(const char **sp, int sep)
+{
+    if (**sp != sep)
+        return -1;
+    (*sp)++;
+    return 0;
+}
+
+VCF_PLAN_ALWAYS_INLINE int vcf_plan_copy_string(const char **sp, char *out, int width)
+{
+    const char *s = *sp, *t = s;
+    int l;
+
+    while (*t && *t != ':' && *t != '\t')
+        t++;
+    l = t - s;
+    if (l > width)
+        return -1;
+    memcpy(out, s, l);
+    if (l < width)
+        memset(out + l, 0, width - l);
+    *sp = t;
+    return 0;
+}
+
+VCF_PLAN_ALWAYS_INLINE int vcf_plan_copy_string_span(const vcf_format_string_span_t *span,
+                                                     const char **sp,
+                                                     char *out, int width)
+{
+    int l = span->len;
+
+    if (*sp != span->ptr || l > width)
+        return -1;
+    memcpy(out, span->ptr, l);
+    if (l < width)
+        memset(out + l, 0, width - l);
+    *sp = span->ptr + l;
+    return 0;
+}
+
+/*
+ * Parse a dynamic-width float vector and report the number of values seen
+ * before padding the rest of the row with BCF vector-end markers.  Returning
+ * the count avoids a second pass over the encoded floats, which is also safer
+ * than inferring width from sentinel values after conversion.
+ */
+static int vcf_plan_parse_float_vector_dynamic_counted(const char **sp,
+                                                       float *out, int width,
+                                                       int *nread)
+{
+    const char *s = *sp;
+    int i = 0;
+
+    for (;;) {
+        if (i >= width || vcf_plan_float_value(&s, &out[i]) < 0)
+            return -1;
+        i++;
+        if (*s != ',')
+            break;
+        s++;
+    }
+    *nread = i;
+    for (; i < width; i++)
+        bcf_float_set_vector_end(out[i]);
+    *sp = s;
+    return 0;
+}
+
+VCF_PLAN_ALWAYS_INLINE int vcf_plan_int_scalar_flexible_range(const char **sp, int32_t *out,
+                                                              vcf_plan_int_range_t *range)
+{
+    if (**sp == ':' || **sp == '\t' || **sp == '\0') {
+        *out = bcf_int32_missing;
+        vcf_plan_int_range_add(range, *out);
+        return 0;
+    }
+    return vcf_plan_int_value_range(sp, out, range);
+}
+
+VCF_PLAN_ALWAYS_INLINE int vcf_plan_float_scalar_flexible(const char **sp, float *out)
+{
+    return vcf_plan_float_value(sp, out);
+}
+
+VCF_PLAN_ALWAYS_INLINE void vcf_plan_fill_missing_int_vector(int32_t *out,
+                                                            int width,
+                                                            int *nread,
+                                                            vcf_plan_int_range_t *range)
+{
+    int i;
+
+    out[0] = bcf_int32_missing;
+    vcf_plan_int_range_add(range, out[0]);
+    for (i = 1; i < width; i++)
+        out[i] = bcf_int32_vector_end;
+    range->has_special = 1;
+    *nread = 1;
+}
+
+static int vcf_plan_parse_int_vector_flexible_counted_range(const char **sp,
+                                                            int32_t *out,
+                                                            int width,
+                                                            int *nread,
+                                                            vcf_plan_int_range_t *range)
+{
+    if (**sp == ':' || **sp == '\t' || **sp == '\0') {
+        vcf_plan_fill_missing_int_vector(out, width, nread, range);
+        return 0;
+    }
+    return vcf_plan_parse_int_vector_counted_range(sp, out, width, nread, range);
+}
+
+/*
+ * Planned FORMAT parser: row-local layout and encoding helpers.
+ *
+ * Once all widths are known for the current record, these helpers turn cached
+ * plan operations into concrete row operations, allocate/stage transposed
+ * FORMAT buffers, compact underfilled vectors when the generic parser would do
+ * the same, and encode staged rows into the final packed BCF FORMAT layout.
+ */
+static int vcf_format_general_resolve_ops(const vcf_format_general_plan_t *plan,
+                                          bcf1_t *v, int *widths,
+                                          vcf_format_row_op_t *row_ops,
+                                          vcf_format_plan_fallback_reason_t *reason)
+{
+    int j;
+
+    for (j = 0; j < plan->n_ops; j++) {
+        const vcf_format_op_t *op = &plan->ops[j];
+        vcf_format_row_op_t *row = &row_ops[j];
+
+        row->key = op->key;
+        row->width = widths[j] > 0 ? widths[j] : 1;
+        row->offset = 0;
+        if (op->is_gt) {
+            if (row->width != 2 || v->n_allele > 10) {
+                vcf_format_plan_set_reason(reason, VCF_FORMAT_PLAN_FB_GT_SHAPE);
+                return -4;
+            }
+            row->kind = VCF_FORMAT_ROW_GT2;
+            row->size = 2;
+        } else if (op->htype == BCF_HT_INT) {
+            if (row->width == 1)
+                row->kind = VCF_FORMAT_ROW_INT1;
+            else
+                row->kind = VCF_FORMAT_ROW_INTVEC;
+            row->size = row->width * (int)sizeof(int32_t);
+        } else if (op->htype == BCF_HT_REAL) {
+            row->kind = row->width == 1 ? VCF_FORMAT_ROW_FLOAT1 : VCF_FORMAT_ROW_FLOATN;
+            row->size = row->width * (int)sizeof(float);
+        } else {
+            row->kind = VCF_FORMAT_ROW_STR;
+            row->size = row->width;
+        }
+        row->can_compact = row->kind == VCF_FORMAT_ROW_INTVEC ||
+                           row->kind == VCF_FORMAT_ROW_FLOATN;
+    }
+    return 0;
+}
+
+static const char *vcf_format_skip_sample_column(const char *cur, const char *end)
+{
+    while (cur < end && *cur && *cur != '\t')
+        cur++;
+    if (cur < end && *cur == '\t')
+        cur++;
+    return cur;
+}
+
+static int vcf_format_general_expected_width(const vcf_format_op_t *op, bcf1_t *v)
+{
+    if (op->is_gt)
+        return 2;
+    if (op->htype == BCF_HT_STR)
+        return 0;
+
+    switch (op->vl_type) {
+    case BCF_VL_FIXED:
+        return op->number > 0 ? op->number : 0;
+    case BCF_VL_A:
+        return v->n_allele > 1 ? v->n_allele - 1 : 0;
+    case BCF_VL_R:
+        return v->n_allele;
+    case BCF_VL_G: {
+        uint64_t n = (uint64_t) v->n_allele;
+        uint64_t width = n * (n + 1) / 2;
+
+        return width > INT_MAX ? INT_MAX : (int) width;
+    }
+    default:
+        return 0;
+    }
+}
+
+static int vcf_enc_gt2_u8(kstring_t *dst, int nsamples, const uint8_t *gt);
+
+static int vcf_format_general_encode_row_ops_from_ranges(kstring_t *dst, kstring_t *mem,
+                                                         int nsamples, int n_ops,
+                                                         const vcf_format_row_op_t *row_ops,
+                                                         const vcf_plan_int_range_t *ranges,
+                                                         int first_op)
+{
+    int j;
+
+    for (j = first_op; j < n_ops; j++) {
+        const vcf_format_row_op_t *op = &row_ops[j];
+        uint8_t *buf = (uint8_t*)mem->s + op->offset;
+
+        bcf_enc_int1(dst, op->key);
+        switch (op->kind) {
+        case VCF_FORMAT_ROW_GT2:
+            if (vcf_enc_gt2_u8(dst, nsamples, buf) < 0)
+                return -1;
+            break;
+        case VCF_FORMAT_ROW_STR:
+            if (bcf_enc_size(dst, op->width, BCF_BT_CHAR) < 0)
+                return -1;
+            if (kputsn((char *)buf, nsamples * (size_t)op->width, dst) < 0)
+                return -1;
+            break;
+        case VCF_FORMAT_ROW_FLOAT1:
+        case VCF_FORMAT_ROW_FLOATN:
+            if (bcf_enc_size(dst, op->width, BCF_BT_FLOAT) < 0)
+                return -1;
+            if (serialize_float_array(dst, nsamples * (size_t)op->width, (float *)buf) < 0)
+                return -1;
+            break;
+        case VCF_FORMAT_ROW_INT1:
+        case VCF_FORMAT_ROW_INTVEC:
+            if (bcf_enc_vint_known_range_special(dst, nsamples * op->width, (int32_t *)buf,
+                                                 op->width, ranges[j].min, ranges[j].max,
+                                                 ranges[j].has_special) < 0)
+                return -1;
+            break;
+        default:
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int vcf_enc_gt2_u8(kstring_t *dst, int nsamples, const uint8_t *gt)
+{
+    int n = nsamples * 2;
+
+    if (bcf_enc_size(dst, 2, BCF_BT_INT8) < 0)
+        return -1;
+    return kputsn((const char *)gt, n, dst) < 0 ? -1 : 0;
+}
+
+static int vcf_format_direct_prefix_len(const vcf_format_row_op_t *row_ops, int n_ops)
+{
+    int j;
+
+    for (j = 0; j < n_ops; j++) {
+        if (row_ops[j].kind != VCF_FORMAT_ROW_GT2 &&
+            row_ops[j].kind != VCF_FORMAT_ROW_FLOAT1)
+            break;
+    }
+    return j;
+}
+
+static int vcf_format_compact_row_op(kstring_t *mem, int nsamples,
+                                     vcf_format_row_op_t *op, int width)
+{
+    size_t elem_size;
+    size_t old_stride, new_stride;
+    char *base = mem->s + op->offset;
+    int sample;
+
+    switch (op->kind) {
+    case VCF_FORMAT_ROW_INTVEC:
+        elem_size = sizeof(int32_t);
+        break;
+    case VCF_FORMAT_ROW_FLOATN:
+        elem_size = sizeof(float);
+        break;
+    default:
+        return -1;
+    }
+    old_stride = (size_t) op->width * elem_size;
+    new_stride = (size_t) width * elem_size;
+    for (sample = 1; sample < nsamples; sample++)
+        memmove(base + sample * new_stride, base + sample * old_stride, new_stride);
+    op->width = width;
+    op->size = (int)new_stride;
+    return 0;
+}
+
+/*
+ * Planned FORMAT parser: row-local width measurement.
+ *
+ * Resolve FORMAT widths before execution.  Fixed widths come from the header
+ * and current allele count; Type=String and Number=. numeric rows require a
+ * sample scan.  Returns 0 for a usable plan, -4 for generic fallback, and -1
+ * for allocation failure.
+ */
+static int vcf_format_general_strict_widths(kstring_t *s, const bcf_hdr_t *h,
+                                            const vcf_format_general_plan_t *plan,
+                                            bcf1_t *v, char *q, int *widths,
+                                            size_t *string_span_offsets,
+                                            size_t *string_spans_end,
+                                            vcf_format_plan_fallback_reason_t *reason)
+{
+    kstring_t *mem = (kstring_t*)&h->mem;
+    const char *cur, *end;
+    int has_measured = 0, has_string_spans = 0, sample, kept = 0, j;
+    int nsamples = h->keep_samples ? h->nsamples_ori : bcf_hdr_nsamples(h);
+    int output_nsamples = bcf_hdr_nsamples(h);
+
+    if (string_spans_end)
+        *string_spans_end = 0;
+
+    /*
+     * With bcf_hdr_set_samples(), the text line still contains the original
+     * sample columns but BCF output must contain only the retained samples.  The
+     * measurement pass therefore scans original columns and updates row-local
+     * widths only for samples that will be emitted.
+     */
+    for (j = 0; j < plan->n_ops; j++) {
+        const vcf_format_op_t *op = &plan->ops[j];
+
+        if (string_span_offsets)
+            string_span_offsets[j] = (size_t)-1;
+        if (op->measured_width) {
+            /*
+             * Strings and Number=. numeric vectors need a first pass so the
+             * transposed FORMAT storage has one row-local stride.  Numeric
+             * vectors keep the conservative width cap because they multiply
+             * parsing, padding, and integer-width decisions.  Strings are allowed
+             * a larger bounded width because they are copied as bytes and are
+             * common in phase-set annotations.
+             */
+            widths[j] = 0;
+            has_measured = 1;
+            if (!op->is_gt && op->htype == BCF_HT_STR)
+                has_string_spans = 1;
+        } else {
+            widths[j] = vcf_format_general_expected_width(op, v);
+            if (widths[j] <= 0 || widths[j] > VCF_FORMAT_MAX_NUMERIC_WIDTH) {
+                vcf_format_plan_set_reason(reason, VCF_FORMAT_PLAN_FB_NUMERIC_WIDTH);
+                return -4;
+            }
+        }
+    }
+
+    if (!has_measured)
+        return 0;
+
+    if (has_string_spans && string_span_offsets) {
+        mem->l = 0;
+        for (j = 0; j < plan->n_ops; j++) {
+            const vcf_format_op_t *op = &plan->ops[j];
+            size_t bytes;
+
+            if (!op->measured_width || op->is_gt || op->htype != BCF_HT_STR)
+                continue;
+            if (align_mem(mem) < 0)
+                return -1;
+            string_span_offsets[j] = mem->l;
+            bytes = (size_t) output_nsamples * sizeof(vcf_format_string_span_t);
+            if (output_nsamples < 0 ||
+                output_nsamples > INT_MAX / (int)sizeof(vcf_format_string_span_t) ||
+                (uint64_t) mem->l + (uint64_t) bytes > INT_MAX ||
+                ks_resize(mem, mem->l + bytes) < 0)
+                return -1;
+            mem->l += bytes;
+        }
+        if (string_spans_end)
+            *string_spans_end = mem->l;
+    }
+
+    cur = q + 1;
+    end = s->s + s->l;
+    for (sample = 0; sample < nsamples && cur < end; sample++) {
+        if (h->keep_samples && !bit_array_test(h->keep_samples, sample)) {
+            cur = vcf_format_skip_sample_column(cur, end);
+            continue;
+        }
+        for (j = 0; j < plan->n_ops; j++) {
+            const vcf_format_op_t *op = &plan->ops[j];
+            const char *field = cur;
+            int w = 1;
+
+            /*
+             * This pass validates the sample field separators at the same time
+             * as measuring widths.  A single unexpected ':' or tab position is
+             * enough to reject the planned path, preserving generic-parser
+             * behavior for odd FORMAT/sample cardinality cases.
+             */
+            while (cur < end && *cur && *cur != ':' && *cur != '\t') {
+                if (op->measured_width &&
+                    (op->htype == BCF_HT_INT || op->htype == BCF_HT_REAL) &&
+                    *cur == ',') {
+                    w++;
+                    if (w > VCF_FORMAT_MAX_NUMERIC_WIDTH) {
+                        vcf_format_plan_set_reason(reason, VCF_FORMAT_PLAN_FB_NUMERIC_WIDTH);
+                        return -4;
+                    }
+                }
+                cur++;
+            }
+            if (op->measured_width && !op->is_gt && op->htype == BCF_HT_STR) {
+                w = cur - field;
+                if (string_span_offsets && string_span_offsets[j] != (size_t)-1) {
+                    vcf_format_string_span_t *spans =
+                        (vcf_format_string_span_t *)(mem->s + string_span_offsets[j]);
+                    spans[kept].ptr = field;
+                    spans[kept].len = w;
+                }
+                if (j > 0)
+                    w++;
+                if (w > VCF_FORMAT_MAX_STRING_WIDTH) {
+                    vcf_format_plan_set_reason(reason, VCF_FORMAT_PLAN_FB_STRING_WIDTH);
+                    return -4;
+                }
+            }
+            if (op->measured_width) {
+                if (widths[j] < w)
+                    widths[j] = w;
+            }
+
+            if (j + 1 < plan->n_ops) {
+                if (*cur != ':') {
+                    vcf_format_plan_set_reason(reason, VCF_FORMAT_PLAN_FB_SEPARATOR);
+                    return -4;
+                }
+                cur++;
+            } else {
+                if (*cur == '\t')
+                    cur++;
+                else if (*cur == '\0' || cur >= end)
+                    ;
+                else {
+                    vcf_format_plan_set_reason(reason, VCF_FORMAT_PLAN_FB_SEPARATOR);
+                    return -4;
+                }
+            }
+        }
+        if (++kept == output_nsamples)
+            break;
+    }
+    if (kept != output_nsamples) {
+        vcf_format_plan_set_reason(reason, VCF_FORMAT_PLAN_FB_SAMPLE_COUNT);
+        return -4;
+    }
+    for (j = 0; j < plan->n_ops; j++)
+        if (plan->ops[j].measured_width) {
+            if (plan->ops[j].htype == BCF_HT_STR) {
+                if (widths[j] <= 0) {
+                    vcf_format_plan_set_reason(reason, VCF_FORMAT_PLAN_FB_STRING_WIDTH);
+                    return -4;
+                }
+                if (widths[j] > VCF_FORMAT_MAX_STRING_WIDTH) {
+                    vcf_format_plan_set_reason(reason, VCF_FORMAT_PLAN_FB_STRING_WIDTH);
+                    return -4;
+                }
+            } else {
+                if (widths[j] <= 0)
+                    widths[j] = 1;
+                if (widths[j] > VCF_FORMAT_MAX_NUMERIC_WIDTH) {
+                    vcf_format_plan_set_reason(reason, VCF_FORMAT_PLAN_FB_NUMERIC_WIDTH);
+                    return -4;
+                }
+            }
+        }
+
+    return 0;
+}
+
+/*
+ * Planned FORMAT parser: execution.
+ *
+ * Execute a row-local FORMAT plan.  Parsing proceeds sample-major because that
+ * matches the VCF text, then staged rows are encoded op-major to match BCF
+ * FORMAT layout.  Returns 0 on success, -4 for generic fallback, and -1 on hard
+ * errors after rolling back any direct writes to v->indiv.
+ */
+static int vcf_parse_format_general_composable(kstring_t *s, const bcf_hdr_t *h,
+                                               bcf1_t *v,
+                                               const vcf_format_general_plan_t *plan,
+                                               char *q,
+                                               vcf_format_row_op_t *row_ops,
+                                               const size_t *string_span_offsets,
+                                               size_t string_spans_end,
+                                               vcf_format_plan_fallback_reason_t *reason)
+{
+    kstring_t *mem = (kstring_t*)&h->mem;
+    int nsamples = h->keep_samples ? h->nsamples_ori : bcf_hdr_nsamples(h);
+    int output_nsamples = bcf_hdr_nsamples(h), sample, kept = 0, j;
+    int direct_ops = vcf_format_direct_prefix_len(row_ops, plan->n_ops);
+    int max_counts[MAX_N_FMT];
+    vcf_plan_int_range_t ranges[MAX_N_FMT];
+    size_t indiv_l0 = v->indiv.l;
+    size_t direct_offsets[MAX_N_FMT];
+    uint8_t *op_base[MAX_N_FMT];
+    size_t op_stride[MAX_N_FMT];
+    const char *cur = q + 1, *end = s->s + s->l;
+
+    /*
+     * The executor writes data in BCF's transposed FORMAT layout: all samples
+     * for FORMAT op 0, then all samples for op 1, etc.  Leading fixed-width
+     * GT2/FLOAT1 rows can be written directly to v->indiv; the remaining rows
+     * are staged in h->mem so they can be parsed sample-major and encoded
+     * op-major once row-local ranges and widths are known.
+     *
+     * If keep_samples is active, nsamples is the number of columns to scan in
+     * the input line and output_nsamples is the dense BCF sample count.  This
+     * mirrors the generic parser: unselected sample columns may influence
+     * neither emitted widths nor output cardinality.
+     */
+    for (j = 0; j < plan->n_ops; j++) {
+        max_counts[j] = row_ops[j].can_compact ? 0 : row_ops[j].width;
+        direct_offsets[j] = 0;
+        vcf_plan_int_range_init(&ranges[j]);
+    }
+
+    for (j = 0; j < direct_ops; j++) {
+        vcf_format_row_op_t *op = &row_ops[j];
+
+        bcf_enc_int1(&v->indiv, op->key);
+        if (op->kind == VCF_FORMAT_ROW_GT2) {
+            if (bcf_enc_size(&v->indiv, 2, BCF_BT_INT8) < 0 ||
+                ks_resize(&v->indiv, v->indiv.l + (size_t)output_nsamples * 2) < 0)
+                goto error;
+            direct_offsets[j] = v->indiv.l;
+            v->indiv.l += (size_t)output_nsamples * 2;
+        } else {
+            if (bcf_enc_size(&v->indiv, 1, BCF_BT_FLOAT) < 0 ||
+                ks_resize(&v->indiv, v->indiv.l + (size_t)output_nsamples * sizeof(float)) < 0)
+                goto error;
+            direct_offsets[j] = v->indiv.l;
+            v->indiv.l += (size_t)output_nsamples * sizeof(float);
+        }
+    }
+
+    mem->l = string_spans_end;
+    for (j = direct_ops; j < plan->n_ops; j++) {
+        vcf_format_row_op_t *op = &row_ops[j];
+
+        if ((uint64_t) mem->l + output_nsamples * (uint64_t) op->size > INT_MAX)
+            goto error;
+        if (align_mem(mem) < 0)
+            goto error;
+        op->offset = mem->l;
+        if (ks_resize(mem, mem->l + output_nsamples * (size_t) op->size) < 0)
+            goto error;
+        mem->l += output_nsamples * (size_t) op->size;
+    }
+    for (j = 0; j < plan->n_ops; j++) {
+        vcf_format_row_op_t *op = &row_ops[j];
+        if (j < direct_ops) {
+            op_base[j] = (uint8_t *)v->indiv.s + direct_offsets[j];
+            op_stride[j] = op->kind == VCF_FORMAT_ROW_GT2 ? 2 : (size_t)op->size;
+        } else {
+            op_base[j] = (uint8_t *)mem->s + op->offset;
+            op_stride[j] = (size_t)op->size;
+        }
+    }
+
+    for (sample = 0; sample < nsamples && cur < end; sample++) {
+        if (h->keep_samples && !bit_array_test(h->keep_samples, sample)) {
+            cur = vcf_format_skip_sample_column(cur, end);
+            continue;
+        }
+        for (j = 0; j < plan->n_ops; j++) {
+            vcf_format_row_op_t *op = &row_ops[j];
+            uint8_t *buf = op_base[j] + kept * op_stride[j];
+            int n = op->width;
+
+            /*
+             * Each op parser consumes exactly one sample subfield and leaves cur
+             * on the following ':' or tab.  Values outside this executor's
+             * supported subset, such as non-simple GT encodings, trigger
+             * generic fallback.
+             */
+            switch (op->kind) {
+            case VCF_FORMAT_ROW_GT2:
+                if (vcf_plan_gt2_u8(&cur, buf) < 0) {
+                    vcf_format_plan_set_reason(reason, VCF_FORMAT_PLAN_FB_GT_SHAPE);
+                    goto fallback;
+                }
+                break;
+            case VCF_FORMAT_ROW_INT1:
+                if (vcf_plan_int_scalar_flexible_range(&cur, (int32_t *)buf, &ranges[j]) < 0) {
+                    vcf_format_plan_set_reason(reason, VCF_FORMAT_PLAN_FB_PARSE);
+                    goto fallback;
+                }
+                break;
+            case VCF_FORMAT_ROW_INTVEC:
+                if (vcf_plan_parse_int_vector_flexible_counted_range(&cur, (int32_t *)buf,
+                                                                     op->width, &n, &ranges[j]) < 0) {
+                    vcf_format_plan_set_reason(reason, VCF_FORMAT_PLAN_FB_PARSE);
+                    goto fallback;
+                }
+                break;
+            case VCF_FORMAT_ROW_FLOAT1:
+                if (j < direct_ops) {
+                    float f;
+                    if (vcf_plan_float_scalar_flexible(&cur, &f) < 0) {
+                        vcf_format_plan_set_reason(reason, VCF_FORMAT_PLAN_FB_PARSE);
+                        goto fallback;
+                    }
+                    float_to_le(f, buf);
+                } else if (vcf_plan_float_scalar_flexible(&cur, (float *)buf) < 0) {
+                    vcf_format_plan_set_reason(reason, VCF_FORMAT_PLAN_FB_PARSE);
+                    goto fallback;
+                }
+                break;
+            case VCF_FORMAT_ROW_FLOATN:
+                if (vcf_plan_parse_float_vector_dynamic_counted(&cur, (float *)buf,
+                                                                op->width, &n) < 0) {
+                    vcf_format_plan_set_reason(reason, VCF_FORMAT_PLAN_FB_PARSE);
+                    goto fallback;
+                }
+                break;
+            case VCF_FORMAT_ROW_STR:
+                if (string_span_offsets && string_span_offsets[j] != (size_t)-1) {
+                    vcf_format_string_span_t *spans =
+                        (vcf_format_string_span_t *)(mem->s + string_span_offsets[j]);
+                    if (vcf_plan_copy_string_span(&spans[kept], &cur,
+                                                  (char *)buf, op->width) < 0) {
+                        vcf_format_plan_set_reason(reason, VCF_FORMAT_PLAN_FB_STRING_WIDTH);
+                        goto fallback;
+                    }
+                } else if (vcf_plan_copy_string(&cur, (char *)buf, op->width) < 0) {
+                    vcf_format_plan_set_reason(reason, VCF_FORMAT_PLAN_FB_STRING_WIDTH);
+                    goto fallback;
+                }
+                break;
+            default:
+                vcf_format_plan_set_reason(reason, VCF_FORMAT_PLAN_FB_PARSE);
+                goto fallback;
+            }
+            if (row_ops[j].can_compact && max_counts[j] < n)
+                max_counts[j] = n;
+
+            if (j + 1 < plan->n_ops) {
+                if (vcf_plan_expect_sep(&cur, ':') < 0) {
+                    vcf_format_plan_set_reason(reason, VCF_FORMAT_PLAN_FB_SEPARATOR);
+                    goto fallback;
+                }
+            } else {
+                if (*cur == '\t')
+                    cur++;
+                else if (*cur == '\0' || cur >= end)
+                    ;
+                else {
+                    vcf_format_plan_set_reason(reason, VCF_FORMAT_PLAN_FB_SEPARATOR);
+                    goto fallback;
+                }
+            }
+        }
+        if (++kept == output_nsamples)
+            break;
+    }
+    if (kept != output_nsamples) {
+        vcf_format_plan_set_reason(reason, VCF_FORMAT_PLAN_FB_SAMPLE_COUNT);
+        goto fallback;
+    }
+    for (j = 0; j < plan->n_ops; j++) {
+        if (!row_ops[j].can_compact)
+            continue;
+        if (max_counts[j] <= 0 || max_counts[j] > row_ops[j].width) {
+            vcf_format_plan_set_reason(reason, VCF_FORMAT_PLAN_FB_NUMERIC_WIDTH);
+            goto fallback;
+        }
+        if (max_counts[j] < row_ops[j].width) {
+            /*
+             * The generic parser encodes fixed-width vector rows at the
+             * observed row maximum, not necessarily the conservative
+             * header-derived width.  Compacting here avoids unnecessary
+             * whole-row fallback while keeping byte-identical BCF output.
+             */
+            if (vcf_format_compact_row_op(mem, output_nsamples, &row_ops[j], max_counts[j]) < 0)
+                goto error;
+        }
+    }
+
+    v->n_fmt = plan->n_ops;
+    v->n_sample = output_nsamples;
+    if (vcf_format_general_encode_row_ops_from_ranges(&v->indiv, mem, output_nsamples,
+                                                      plan->n_ops, row_ops,
+                                                      ranges, direct_ops) < 0)
+        goto error;
+    if (vcf_parse_format_check7(h, v) < 0)
+        goto error;
+    if (vcf_format_plan_stats_enabled()) {
+        vcf_format_plan_stats.hits++;
+        vcf_format_plan_stats.parsed_samples += output_nsamples;
+    }
+    return 0;
+
+fallback:
+    /*
+     * Only v->indiv is mutated by this executor before success is known.  All
+     * scratch data lives in h->mem and can be overwritten by the fallback parse.
+     */
+    v->indiv.l = indiv_l0;
+    return -4;
+error:
+    v->indiv.l = indiv_l0;
+    return -1;
+}
+
+/*
+ * Planned FORMAT parser: entry points and fallback contract.
+ *
+ * vcf_parse_format_planned() is called before the generic FORMAT pipeline.  It
+ * returns 0 after a successful planned parse, -3 when the caller should run the
+ * generic parser, and a hard error for allocation or consistency failures.
+ */
+static int vcf_parse_format_general_strict(kstring_t *s, const bcf_hdr_t *h,
+                                           bcf1_t *v,
+                                           const vcf_format_general_plan_t *plan,
+                                           char *q,
+                                           vcf_format_plan_fallback_reason_t *reason)
+{
+    int widths[MAX_N_FMT];
+    vcf_format_row_op_t row_ops[MAX_N_FMT];
+    size_t string_span_offsets_buf[MAX_N_FMT];
+    size_t *string_span_offsets = plan->has_string_spans ? string_span_offsets_buf : NULL;
+    size_t string_spans_end = 0;
+    int ret;
+
+    ret = vcf_format_general_strict_widths(s, h, plan, v, q, widths,
+                                           string_span_offsets,
+                                           &string_spans_end, reason);
+    if (ret < 0)
+        return ret;
+    if (vcf_format_general_resolve_ops(plan, v, widths, row_ops, reason) < 0)
+        return -4;
+    return vcf_parse_format_general_composable(s, h, v, plan, q, row_ops,
+                                               string_span_offsets,
+                                               string_spans_end, reason);
+}
+
+static int vcf_parse_format_general_planned(kstring_t *s, const bcf_hdr_t *h,
+                                            bcf1_t *v, char *p, char *q)
+{
+    vcf_format_general_plan_t *plan;
+    vcf_format_plan_fallback_reason_t reason = VCF_FORMAT_PLAN_FB_PARSE;
+    int nsamples, ret;
+
+    plan = vcf_format_general_plan_get(h, p, &reason);
+    if (!plan) {
+        reason = VCF_FORMAT_PLAN_FB_UNSUPPORTED;
+        goto fallback;
+    }
+
+    nsamples = bcf_hdr_nsamples(h);
+    if (!nsamples)
+        return 0;
+    ret = vcf_parse_format_general_strict(s, h, v, plan, q, &reason);
+    if (ret == 0)
+        return ret;
+    if (ret != -4)
+        return ret;
+
+fallback:
+    vcf_format_plan_note_fallback(reason);
+    return -3;
+}
+
+static int vcf_parse_format_planned(kstring_t *s, const bcf_hdr_t *h, bcf1_t *v,
+                                    char *p, char *q)
+{
+    if (!vcf_format_plan_enabled())
+        return -3;
+    if (vcf_format_plan_stats_enabled())
+        vcf_format_plan_stats.attempts++;
+
+    return vcf_parse_format_general_planned(s, h, v, p, q);
+}
 
 // detect FORMAT "."
 static int vcf_parse_format_empty1(kstring_t *s, const bcf_hdr_t *h, bcf1_t *v,
@@ -3686,7 +5233,13 @@ static int vcf_parse_format_check7(const bcf_hdr_t *h, bcf1_t *v) {
 static int vcf_parse_format(kstring_t *s, const bcf_hdr_t *h, bcf1_t *v,
                             char *p, char *q)
 {
+    int pret;
     if ( !bcf_hdr_nsamples(h) ) return 0;
+
+    pret = vcf_parse_format_planned(s, h, v, p, q);
+    if (pret != -3)
+        return pret;
+
     kstring_t *mem = (kstring_t*)&h->mem;
     mem->l = 0;
 
