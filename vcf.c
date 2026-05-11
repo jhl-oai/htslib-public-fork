@@ -3682,6 +3682,145 @@ static int vcf_parse_format_check7(const bcf_hdr_t *h, bcf1_t *v) {
     return 0;
 }
 
+#define VCF_GT_FAST_MAX_PLOIDY 8
+
+static int vcf_gt_fast_parse_sample(const char *p, const char *end, int ver,
+                                    int32_t *dst, int max_ploidy,
+                                    int *ploidy_out, const char **next_out)
+{
+    int32_t is_phased = 0;
+    int anyunphased = 0, l = 0, phasingprfx = 0, unknown1 = 0;
+
+    if (p >= end || *p == '\t') return 1;
+    if (ver >= VCF44 && (*p == '|' || *p == '/')) {
+        is_phased = *p++ == '|';
+        phasingprfx = 1;
+        if (p >= end || *p == '\t') return 1;
+    }
+
+    for (;;) {
+        if (l == max_ploidy) return 1;
+        if (*p == '.') {
+            dst[l] = is_phased;
+            if (l == 0) unknown1 = 1;
+            p++;
+        } else if (*p >= '0' && *p <= '9'
+                   && (p + 1 == end || p[1] < '0' || p[1] > '9')) {
+            int val = *p++ - '0';
+            dst[l] = (val + 1) << 1 | is_phased;
+        } else {
+            return 1;
+        }
+
+        l++;
+        anyunphased |= (l != 1) && !is_phased;
+        if (p == end || *p == '\t') break;
+        if (*p != '|' && *p != '/') return 1;
+        is_phased = *p++ == '|';
+        if (p == end || *p == '\t') return 1;
+    }
+
+    if (!phasingprfx) {
+        if (l == 1) {
+            if (!unknown1) dst[0] |= 1;
+        } else if (!anyunphased) {
+            dst[0] |= 1;
+        }
+    }
+
+    *ploidy_out = l;
+    *next_out = p < end ? p + 1 : end;
+    return 0;
+}
+
+static const char *vcf_gt_fast_skip_sample(const char *p, const char *end)
+{
+    const char *tab = memchr(p, '\t', end - p);
+    return tab ? tab + 1 : end;
+}
+
+// Return 0 on success, 1 to use the generic parser, -1 on allocation failure.
+static int vcf_parse_format_gt_fast(kstring_t *s, const bcf_hdr_t *h,
+                                    bcf1_t *v, const char *p, const char *q)
+{
+    kstring_t *mem = (kstring_t*)&h->mem;
+    const char *end = s->s + s->l;
+    const char *t = q + 1, *next = NULL;
+    int gt_id, i, nret, nori, nsamples, ploidy, ver;
+    int32_t first_gt[VCF_GT_FAST_MAX_PLOIDY];
+    size_t total, bytes;
+    int32_t *gt;
+
+    if (p[0] != 'G' || p[1] != 'T' || p[2] != '\0') return 1;
+    if (v->n_allele > 10) return 1;
+
+    gt_id = bcf_hdr_id2int(h, BCF_DT_ID, "GT");
+    if (gt_id < 0 || !bcf_hdr_idinfo_exists(h, BCF_HL_FMT, gt_id)) return 1;
+
+    nsamples = bcf_hdr_nsamples(h);
+    nret = 0;
+    nori = h->keep_samples ? h->nsamples_ori : nsamples;
+    ver = bcf_get_version(h, NULL);
+
+    for (i = 0; i < nori && t < end; i++) {
+        if (!h->keep_samples || bit_array_test(h->keep_samples, i)) {
+            if (vcf_gt_fast_parse_sample(t, end, ver, first_gt,
+                                         VCF_GT_FAST_MAX_PLOIDY, &ploidy,
+                                         &next))
+                return 1;
+            nret = 1;
+            break;
+        }
+
+        t = vcf_gt_fast_skip_sample(t, end);
+    }
+    if (nret != 1) return 1;
+    if (nsamples > INT_MAX / ploidy) return -1;
+
+    total = (size_t)nsamples * ploidy;
+    bytes = total * sizeof(*gt);
+    if (bytes / sizeof(*gt) != total) return -1;
+
+    if (align_mem(mem) < 0 || ks_resize(mem, mem->l + bytes) < 0) {
+        hts_log_error("Memory allocation failure at %s:%"PRIhts_pos,
+                      bcf_seqname_safe(h,v), v->pos+1);
+        v->errcode |= BCF_ERR_LIMITS;
+        return -1;
+    }
+    gt = (int32_t *)(mem->s + mem->l);
+    mem->l += bytes;
+    memcpy(gt, first_gt, ploidy * sizeof(*gt));
+
+    t = next;
+    for (i++; i < nori && t < end && nret < nsamples; i++) {
+        if (!h->keep_samples || bit_array_test(h->keep_samples, i)) {
+            int sample_ploidy;
+            if (vcf_gt_fast_parse_sample(t, end, ver,
+                                         &gt[(size_t)nret * ploidy], ploidy,
+                                         &sample_ploidy, &next) ||
+                sample_ploidy != ploidy)
+                return 1;
+            nret++;
+            t = next;
+        } else {
+            t = vcf_gt_fast_skip_sample(t, end);
+        }
+    }
+    if (nret != nsamples) return 1;
+
+    v->n_sample = nsamples;
+    v->n_fmt = 1;
+    if (bcf_enc_int1(&v->indiv, gt_id) < 0 ||
+        bcf_enc_vint(&v->indiv, (int)total, gt, ploidy) < 0) {
+        hts_log_error("Memory allocation failure at %s:%"PRIhts_pos,
+                      bcf_seqname_safe(h,v), v->pos+1);
+        v->errcode |= BCF_ERR_LIMITS;
+        return -1;
+    }
+
+    return 0;
+}
+
 // p,q is the start and the end of the FORMAT field
 static int vcf_parse_format(kstring_t *s, const bcf_hdr_t *h, bcf1_t *v,
                             char *p, char *q)
@@ -3696,6 +3835,14 @@ static int vcf_parse_format(kstring_t *s, const bcf_hdr_t *h, bcf1_t *v,
     int ret; // +ve = ok, -ve = err
     if ((ret = vcf_parse_format_empty1(s, h, v, p, q)))
         return ret ? 0 : -1;
+
+    ret = vcf_parse_format_gt_fast(s, h, v, p, q);
+    if (ret <= 0)
+        return ret;
+    mem->l = 0;
+    v->indiv.l = 0;
+    v->n_sample = 0;
+    v->n_fmt = 0;
 
     // get format information from the dictionary
     if (vcf_parse_format_dict2(s, h, v, p, q, fmt) < 0)
